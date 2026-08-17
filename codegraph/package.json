@@ -1,11 +1,48 @@
 {
-  "name": "codegraph",
+  "name": "@mcps/codegraph",
   "version": "1.0.0",
-  "private": true,
+  "description": "Ultra-fast, zero-overhead type-resolved symbol and call graph engine for TypeScript/JavaScript codebases. Model Context Protocol (MCP) server & CLI with memory-mapped query views and incremental kernel watching.",
   "type": "module",
-  "description": "Type-resolved symbol graph for TypeScript repos. CLI + MCP server. Repo-agnostic: target a checkout with --root or CODEGRAPH_ROOT.",
+  "main": "query-client.mjs",
   "bin": {
     "codegraph": "./cli.mjs"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "mcp-server",
+    "codegraph",
+    "code-intelligence",
+    "symbol-graph",
+    "call-graph",
+    "ast",
+    "typescript",
+    "javascript",
+    "codebase-indexing",
+    "dependency-graph",
+    "dead-code-detection",
+    "developer-tools",
+    "ai-agent",
+    "llm-tools",
+    "claude-mcp",
+    "gemini-mcp",
+    "mmap",
+    "fsevents",
+    "inotify"
+  ],
+  "author": "Robert Wlaschin <raw77_m@yahoo.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rwlaschin/mcps.git",
+    "directory": "codegraph"
+  },
+  "bugs": {
+    "url": "https://github.com/rwlaschin/mcps/issues"
+  },
+  "homepage": "https://github.com/rwlaschin/mcps/tree/main/codegraph#readme",
+  "engines": {
+    "node": ">=18.0.0"
   },
   "scripts": {
     "install": "node native/build-optional.mjs",
