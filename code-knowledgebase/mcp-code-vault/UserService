@@ -1,0 +1,5 @@
+export class UserService {
+  getUser(id: string) {
+    return { id, name: 'Test User' };
+  }
+}

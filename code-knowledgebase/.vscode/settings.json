@@ -1,0 +1,11 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "npm install": true,
+        "npx tsc": true,
+        "/^npm test$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "npm test": true
+    }
+}

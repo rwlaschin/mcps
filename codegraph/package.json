@@ -1,0 +1,26 @@
+{
+  "name": "codegraph",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Type-resolved symbol graph for TypeScript repos. CLI + MCP server. Repo-agnostic: target a checkout with --root or CODEGRAPH_ROOT.",
+  "bin": {
+    "codegraph": "./cli.mjs"
+  },
+  "scripts": {
+    "install": "node native/build-optional.mjs",
+    "build:native": "node-gyp rebuild",
+    "index": "node build.mjs",
+    "mcp": "node mcp.mjs",
+    "index:v2": "node tool.mjs build",
+    "watch": "node mcp.mjs",
+    "visualize": "node visualizer.mjs",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@ts-morph/common": "^0.29.0",
+    "chokidar": "^4.0.3",
+    "minimatch": "^10.2.6",
+    "ts-morph": "^28.0.0"
+  }
+}

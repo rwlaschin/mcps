@@ -1,0 +1,68 @@
+---
+description: Coverage gates — full collect scope; no file at 0% on any axis (Jest + Vitest native thresholds)
+globs:
+  - mcp-code-vault/jest.config.js
+  - mcp-code-vault/platform-ui/vitest.config.mts
+  - mcp-code-vault/platform-ui/scripts/assert-coverage-min-one-line-per-file.mjs
+  - mcp-code-vault/**/__tests__/**/*
+alwaysApply: false
+---
+
+# Test coverage (statements, branches, functions, lines)
+
+## Do not shrink coverage scope
+
+- **Never** remove paths from `collectCoverageFrom` (Jest) or `coverage.include` (Vitest), and **never** add production sources to `coverage.exclude`, just to make thresholds pass.
+- If coverage fails, **add or extend tests** (or refactor for testability). Do not “fix” numbers by narrowing what gets instrumented.
+
+## Minimum thresholds in config
+
+In `jest.config.js` (`coverageThreshold.global`) and `platform-ui/vitest.config.mts` (`coverage.thresholds`), **all four** keys MUST be present and numeric:
+
+- `statements` ≥ **1**
+- `branches` ≥ **1**
+- `functions` ≥ **1**
+- `lines` ≥ **1**
+
+Never omit **`lines`** (treat it as mandatory alongside the other three).
+
+## Jest (`mcp-code-vault`)
+
+Use **`coverageThreshold.global`** with all four keys (`statements`, `branches`, `functions`, `lines`) for **project-wide** minimums on the combined coverage map.
+
+**`global` alone is not enough:** one file can show **0%** on statements, branches, functions, or lines in the text table while the **aggregate** still passes. To forbid that, add a **second** `coverageThreshold` entry using Jest’s built-in **glob** (path relative to `rootDir`), with **all four** keys set to **1** (meaning ≥1% on that axis for each file that matches `collectCoverageFrom`):
+
+```js
+coverageThreshold: {
+  global: { statements: 50, branches: 50, functions: 70, lines: 50 },
+  './src/**/*.ts': { statements: 1, branches: 1, functions: 1, lines: 1 }
+}
+```
+
+Use **only** Jest’s documented **`coverageThreshold`** for `mcp-code-vault` — **do not** add custom Node coverage gate scripts for Jest.
+
+Keep **`global`** for the aggregate CI bar you want on the full `collectCoverageFrom` set, and **`./src/**/*.ts`** with **1** on each axis so no single file can sit at **0%** on statements, branches, functions, or lines while the run still passes.
+
+## Vitest (`platform-ui`)
+
+`platform-ui` is not Jest; use **Vitest’s** native **`coverage.thresholds`** only (see [Vitest coverage thresholds](https://vitest.dev/config/coverage.html)).
+
+1. Keep **global** thresholds (`statements`, `branches`, `functions`, `lines`) for the **whole** project (same “all four keys” rule as above).
+2. Add **glob** keys so **every** instrumented `.ts` and `.vue` file has a **≥1%** floor on **each** axis (mirrors Jest’s `./src/**/*.ts` pattern):
+
+```ts
+thresholds: {
+  statements: 70,
+  branches: 60,
+  lines: 70,
+  functions: 55,
+  '**/*.ts': { statements: 1, branches: 1, lines: 1, functions: 1 },
+  '**/*.vue': { statements: 1, branches: 1, lines: 1, functions: 1 }
+}
+```
+
+Per Vitest’s docs, glob thresholds sit alongside the global totals; keep both configured as above.
+
+### Post-step script (platform-ui only)
+
+After `vitest run --coverage`, **`platform-ui/scripts/assert-coverage-min-one-line-per-file.mjs`** reads `coverage-summary.json` and fails if any file has `total > 0` but `covered < 1` on **lines, statements, branches, or functions**. This duplicates the “no 0% axis” intent as a safety net; it is **not** used for `mcp-code-vault` Jest.

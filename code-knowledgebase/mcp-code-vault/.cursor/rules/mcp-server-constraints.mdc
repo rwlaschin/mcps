@@ -1,0 +1,33 @@
+---
+description: MCP server constraints — never assume CLI, terminal, or interactive stdin
+alwaysApply: true
+---
+
+# This Project Is an MCP Server
+
+**mcp-code-vault** is a **Model Context Protocol (MCP) server**. Every design and implementation choice must respect that.
+
+## Transport: stdin/stdout are the protocol
+
+- When run by Cursor (or any MCP client), **stdin** is the **JSON-RPC input** channel and **stdout** is the **JSON-RPC output** channel.
+- **Never** use stdin for: interactive prompts, readline, "type your answer", or any CLI input in this process.
+- **Never** use stdout for: free-form prompts or messages that are not valid JSON-RPC. Logging to stderr or a log file is fine.
+- Suggesting "prompt the user on stdin" or "run from terminal and type X" in this process is **wrong** and breaks the protocol.
+
+## Where "user input" and setup belong
+
+- **First-time setup**, configuration, secrets (e.g. MONGO_URL): must be driven by one of:
+  - **Platform UI** (dashboard form, settings page)
+  - **Another agent** that calls this server's MCP tools or HTTP APIs with the user's answers
+  - **Pre-existing config** (.env, env vars) created outside this process (e.g. user edits .env, or another process writes it)
+- This MCP process **reads** config; it does **not** block on stdin to collect it. If config is missing, fail with a clear message or run in a degraded mode; do not prompt on stdin.
+
+## Before suggesting any feature
+
+- Ask: does this assume a **terminal**, **interactive stdin**, or **single-user CLI** in this process? If yes, **reject or redirect**: use UI, MCP tools, or HTTP APIs instead.
+- New tools (e.g. `register_project`, setup) must use **MCP tool semantics** (inputs via JSON-RPC arguments, outputs via tool result). No readline, no TTY checks for "prompt here".
+
+## Summary
+
+- **MCP = stdin/stdout are JSON-RPC.** No CLI prompts in this process.
+- **Setup and config = UI, another agent, or external .env.** This server never blocks on stdin for user input.

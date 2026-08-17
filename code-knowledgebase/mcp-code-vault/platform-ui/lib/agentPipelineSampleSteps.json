@@ -1,0 +1,140 @@
+[
+  {
+    "instructions": "Create an algorithm in pseudo code that searches a string and counts the occurrences of letter combination 'ae', the a and e need to be in the same word, where a word is any alphabetic letters. The algorithm should be memory efficient O(n) and single pass o(n), faster if possible. **Pass criteria: The pseudo code must be a valid algorithm. Fail criteria: The pseudo code is incomplete, illogical, or not memory efficient O(n) or single pass O(n).**",
+    "avatars": ["Linux"],
+    "tools": ["Get Webpage Content"],
+    "contexts": [],
+    "includeInResults": true,
+    "failureStep": null,
+    "successStep": 1,
+    "model": "gemini-2.5-flash"
+  },
+  {
+    "instructions": "Write code for the algorithm provided. Pass criteria: The code must be syntactically correct and implement the algorithm. Fail criteria: The code has syntax errors or does not correctly implement the algorithm.",
+    "avatars": ["Cheeky"],
+    "tools": [],
+    "contexts": [0],
+    "failureStep": 0,
+    "successStep": 2,
+    "model": "gemini-2.5-pro"
+  },
+  {
+    "instructions": "Verify the syntax of the code is correct, response should be terse and concise. **Pass criteria: No syntax errors are found. Fail criteria: Syntax errors are found.**",
+    "avatars": ["Linux"],
+    "tools": [],
+    "contexts": [1],
+    "includeInResults": false,
+    "failureStep": 1,
+    "successStep": 3,
+    "model": "gemini-2.5-flash"
+  },
+  {
+    "instructions": "Execute the code and verify its output matches the expected result. **Pass criteria: The code executes without runtime errors and its output precisely matches the specified expected output (e.g., '1\\n2\\n3\\n4\\n5\\n'). Fail criteria: The code produces runtime errors or its output does not match the expected output.**",
+    "avatars": ["Linux"],
+    "tools": ["Python Code Executor", "Run Code"],
+    "contexts": [1],
+    "includeInResults": false,
+    "failureStep": 1,
+    "successStep": 4,
+    "model": "gemini-2.5-flash"
+  },
+  {
+    "instructions": "Verify there are no comments in the code, response should be terse and concise. **Pass criteria: No comments are found in the code. Fail criteria: Comments are found in the code.**",
+    "avatars": ["Cheeky"],
+    "tools": [],
+    "contexts": [1],
+    "includeInResults": false,
+    "failureStep": 1,
+    "successStep": 5,
+    "model": "gemini-2.0-flash-lite-001"
+  },
+  {
+    "instructions": "Write unit tests for the code. **Pass criteria: The unit tests are syntactically correct and comprehensively cover the specified test and edge cases. Fail criteria: The unit tests have syntax errors or inadequate test coverage.**",
+    "avatars": ["Cheeky"],
+    "tools": ["Python Code Executor", "Run Code"],
+    "contexts": [1],
+    "includeInResults": true,
+    "failureStep": 1,
+    "successStep": 6,
+    "model": "gemini-2.5-pro"
+  },
+  {
+    "instructions": "Verify the syntax of the unit test code is correct, response should be terse and concise. **Pass criteria: No syntax errors are found in the unit test code. Fail criteria: Syntax errors are found in the unit test code.**",
+    "avatars": ["Linux"],
+    "tools": [],
+    "contexts": [5],
+    "includeInResults": false,
+    "failureStep": 5,
+    "successStep": 7,
+    "model": "gemini-2.5-flash"
+  },
+  {
+    "instructions": "Verify the unit tests cover all of the expected test and edge cases for the code, response should be terse and concise. **Pass criteria: All expected test and edge cases are covered by the unit tests. Fail criteria: Inadequate test coverage is detected.**",
+    "avatars": ["Linux"],
+    "tools": [],
+    "contexts": [1, 5],
+    "includeInResults": false,
+    "failureStep": 5,
+    "successStep": 8,
+    "model": "gemini-2.5-flash"
+  },
+  {
+    "instructions": "Verify there are no comments in the unit test code, response should be terse and concise. **Pass criteria: No comments are found in the unit test code. Fail criteria: Comments are found in the code.**",
+    "avatars": ["Cheeky"],
+    "tools": [],
+    "contexts": [5],
+    "includeInResults": false,
+    "failureStep": 5,
+    "successStep": 9,
+    "model": "gemini-2.0-flash-lite-001"
+  },
+  {
+    "instructions": "Add comments for code that is not clear. **Pass criteria: All unclear sections of the code are sufficiently commented. Fail criteria: Unclear sections remain without adequate comments.**",
+    "avatars": ["Cheeky"],
+    "tools": [],
+    "contexts": [1],
+    "includeInResults": true,
+    "failureStep": 1,
+    "successStep": 10,
+    "model": "gemini-2.0-flash-lite-001"
+  },
+  {
+    "instructions": "Add comments for unit test code that is not clear. **Pass criteria: All unclear sections of the unit test code are sufficiently commented. Fail criteria: Unclear sections remain without adequate comments.**",
+    "avatars": ["Cheeky"],
+    "tools": [],
+    "contexts": [5],
+    "includeInResults": true,
+    "failureStep": 5,
+    "successStep": 11,
+    "model": "gemini-2.0-flash-lite-001"
+  },
+  {
+    "instructions": "Search web for information about how to solve algorithm. **Pass criteria: Relevant web sites are identified and listed. Fail criteria: No relevant web sites are found or listed.**",
+    "avatars": [],
+    "tools": [],
+    "contexts": [0],
+    "failureStep": null,
+    "successStep": 12,
+    "model": "gemini-2.0-flash-lite-001"
+  },
+  {
+    "instructions": "Review web sites to ensure they actually are relevant and list. **Pass criteria: The listed web sites are confirmed to be relevant. Fail criteria: Irrelevant web sites are listed.**",
+    "avatars": ["Linux"],
+    "tools": ["Get webpage Content"],
+    "contexts": [11],
+    "includeInResults": true,
+    "failureStep": null,
+    "successStep": 13,
+    "model": "gemini-2.0-flash-lite-001"
+  },
+  {
+    "instructions": "Add explanation and reasoning for all code and tests. **Pass criteria: Comprehensive explanation and reasoning are provided for all code and tests. Fail criteria: Explanation and reasoning are incomplete or inaccurate.**",
+    "avatars": ["Cheeky", "Linux"],
+    "tools": [],
+    "contexts": [0, 1, 5, 9, 10],
+    "includeInResults": true,
+    "failureStep": null,
+    "successStep": null,
+    "model": "gemini-2.0-flash-lite-001"
+  }
+]

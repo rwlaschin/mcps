@@ -1,0 +1,122 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Reference dashboard palette - use everywhere for consistency */
+:root {
+  --surface: #100B1A;
+  --surface-card: #1A1726;
+  --surface-sidebar: #0f0b14;
+  --accent: #8B5CF6;
+  --accent-hover: #7C3AED;
+  --chart-pink: #EC4899;
+  --chart-purple: #8B5CF6;
+  --chart-orange: #F97316;
+  --chart-blue: #3B82F6;
+  /* Mouse tracking for glass specular (set by plugins/mouse-tracking.client.ts) */
+  --mouse-x: 0.5;
+  --mouse-y: 0.5;
+}
+
+html {
+  /* Dark native controls (select, etc.) — avoids white system chrome after route changes */
+  color-scheme: dark;
+}
+
+html,
+main {
+  scroll-behavior: smooth;
+}
+
+/* Page transitions: use Tailwind-compatible timing (ease-out), no custom cubic-bezier mix */
+.page-enter-active,
+.page-leave-active {
+  /* Avoid `transition: all` — it can break compositing of native <select> over backdrop-blur parents */
+  transition:
+    opacity 0.4s ease-out,
+    transform 0.4s ease-out;
+}
+.page-enter-from {
+  opacity: 0;
+  transform: translateY(20px) scale(0.98);
+}
+.page-leave-to {
+  opacity: 0;
+  transform: translateY(-10px);
+}
+
+/* Config /config#… subsection swap: same route + hash only — Nuxt pageTransition does not run */
+.config-section-enter-active,
+.config-section-leave-active {
+  transition:
+    opacity 0.28s ease-out,
+    transform 0.28s ease-out;
+}
+.config-section-enter-from {
+  opacity: 0;
+  transform: translateY(14px);
+}
+.config-section-leave-to {
+  opacity: 0;
+  transform: translateY(-8px);
+}
+
+/* Glow pulse for active neon elements – uses accent purple, not cyan */
+@keyframes glow-pulse {
+  from {
+    box-shadow: 0 0 10px rgba(139, 92, 246, 0.25);
+  }
+  to {
+    box-shadow: 0 0 20px rgba(139, 92, 246, 0.5);
+  }
+}
+.animate-glow-pulse {
+  animation: glow-pulse 2s ease-in-out infinite alternate;
+}
+
+/* Docs page: clear subsection hierarchy */
+.docs-subsection {
+  margin-top: 1.5rem;
+  padding-left: 1rem;
+  border-left: 3px solid rgba(139, 92, 246, 0.5);
+}
+.docs-subsection-title {
+  font-size: 1rem;
+  font-weight: 600;
+  color: white;
+  margin-top: 0;
+  margin-bottom: 0.5rem;
+}
+
+/* Button micro-interactions: Tailwind only (ease-in-out) */
+@layer components {
+  button {
+    @apply transition-transform duration-300 ease-in-out;
+  }
+  button:hover {
+    @apply scale-[1.02];
+  }
+  button:active {
+    @apply scale-[0.99];
+  }
+
+  /* Project pickers: solid fill + option colors (semi-transparent + page transitions → white “blank” bug in WebKit) */
+  .platform-project-select {
+    background-color: var(--surface-card);
+    color: #f3f4f6;
+    -webkit-text-fill-color: #f3f4f6;
+  }
+
+  .platform-project-select option {
+    background-color: var(--surface-card);
+    color: #f3f4f6;
+  }
+
+  /**
+   * Native <select> (browser caret): symmetric px-* trims trailing padding and jams the caret.
+   * Use pl-* + pe-10 (2.5rem) or appearance-none + custom chevron inset with right-2 (8px).
+   */
+  .select-native-trailing-pad {
+    padding-inline-end: 2.5rem;
+  }
+}

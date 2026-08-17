@@ -1,0 +1,36 @@
+{
+  "name": "platform-ui",
+  "private": true,
+  "type": "module",
+  "imports": {
+    "#internal/nuxt/paths": "./nuxt-internal-paths.mjs"
+  },
+  "scripts": {
+    "build": "npx nuxt build",
+    "dev": "NUXT_PORT=2999 npx nuxt dev --host ::",
+    "preview": "npx nuxt preview",
+    "tsc": "npx tsc --noEmit",
+    "tsc:watch": "npx tsc --noEmit --watch",
+    "typecheck": "npx tsc --noEmit && npx vue-tsc --noEmit",
+    "test:unit": "vitest run --coverage && node scripts/assert-coverage-min-one-line-per-file.mjs",
+    "test:unit:watch": "vitest --coverage"
+  },
+  "dependencies": {
+    "@nuxt/icon": "^1.0.0",
+    "@vueuse/motion": "^3.0.3",
+    "apexcharts": "^5.4.0",
+    "nuxt": "^3.17.0",
+    "socket.io-client": "^4.8.0",
+    "vue": "latest",
+    "vue3-apexcharts": "^1.10.0"
+  },
+  "devDependencies": {
+    "@nuxtjs/tailwindcss": "^6.14.0",
+    "@vitejs/plugin-vue": "^6.0.4",
+    "@vitest/coverage-v8": "^2.1.9",
+    "@vue/test-utils": "^2.4.6",
+    "happy-dom": "^20.6.1",
+    "typescript": "latest",
+    "vitest": "^2.1.9"
+  }
+}

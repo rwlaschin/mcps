@@ -1,0 +1,10 @@
+{
+  "compilerOptions": {
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "target": "ESNext",
+    "allowJs": true,
+    "checkJs": false
+  },
+  "include": ["*.mjs", "native/*.mjs"]
+}

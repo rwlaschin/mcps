@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "mcp-code-vault": {
+      "command": "npx",
+      "args": ["tsx", "src/index.ts"],
+      "cwd": "/Users/mac/Documents/Projects/mcps/code-knowledgebase/mcp-code-vault",
+      "env": {
+        "PORT": "3000",
+        "MCP_PROJECT_NAME": "DefaultProject",
+        "WORKING_DIRECTORY": "/path/to/codebase-to-index"
+      }
+    }
+  }
+}

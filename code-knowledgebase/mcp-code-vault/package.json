@@ -1,0 +1,53 @@
+{
+  "name": "mcp-code-vault",
+  "version": "0.1.0",
+  "main": "dist/index.js",
+  "scripts": {
+    "seed": "tsx src/db/seed-run.ts",
+    "build": "npm run test:integration && tsc",
+    "start": "node dist/index.js",
+    "dev": "NODE_ENV=development tsx watch src/run.ts",
+    "dev:ui": "cd platform-ui && npm run dev",
+    "tsc": "tsc --noEmit",
+    "tsc:watch": "tsc --noEmit --watch",
+    "test:platform-ui": "cd platform-ui && npm run test:unit",
+    "test:unit": "tsc --noEmit && jest --testPathIgnorePatterns=integration --testTimeout=1000 --verbose --runInBand --coverage",
+    "test:unit:watch": "jest --testPathIgnorePatterns=integration --testTimeout=1000 --verbose --runInBand --coverage --watchAll",
+    "test:integration": "jest --testPathPatterns=integration --testPathIgnorePatterns=node_modules --testTimeout=30000 --verbose"
+  },
+  "dependencies": {
+    "@fastify/compress": "^8.3.1",
+    "@fastify/cors": "^10.1.0",
+    "@fastify/static": "^9.0.0",
+    "@langchain/anthropic": "^1.0.0",
+    "@langchain/google-genai": "^2.1.13",
+    "@langchain/openai": "^1.0.0",
+    "@modelcontextprotocol/sdk": "latest",
+    "chokidar": "latest",
+    "dotenv": "latest",
+    "fastify": "^5.7.2",
+    "fastify-sse-v2": "^4.2.2",
+    "google-auth-library": "^10.5.0",
+    "ignore": "latest",
+    "langchain": "^1.2.15",
+    "mongodb": "latest",
+    "mongodb-connection-string-url": "^7.0.1",
+    "mongoose": "^9.2.1",
+    "node-fetch": "^2.7.0",
+    "p-limit": "^3.1.0",
+    "pino": "^10.3.1",
+    "socket.io": "^4.8.0"
+  },
+  "devDependencies": {
+    "@types/dotenv": "latest",
+    "@types/jest": "^30.0.0",
+    "@types/mongodb": "latest",
+    "@types/node-fetch": "^2.6.13",
+    "jest": "latest",
+    "socket.io-client": "^4.8.0",
+    "ts-jest": "^29.4.6",
+    "ts-node": "latest",
+    "tsx": "^4.21.0",
+    "typescript": "latest"
+  }
+}
