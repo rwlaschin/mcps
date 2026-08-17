@@ -19,7 +19,7 @@
     "@nuxt/icon": "^1.0.0",
     "@vueuse/motion": "^3.0.3",
     "apexcharts": "^5.4.0",
-    "nuxt": "^3.17.0",
+    "nuxt": "^3.21.10",
     "socket.io-client": "^4.8.0",
     "vue": "latest",
     "vue3-apexcharts": "^1.10.0"
