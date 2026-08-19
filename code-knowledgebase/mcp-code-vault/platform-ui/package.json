@@ -19,7 +19,7 @@
     "@nuxt/icon": "^1.0.0",
     "@vueuse/motion": "^3.0.3",
     "apexcharts": "^5.4.0",
-    "nuxt": "^3.17.0",
+    "nuxt": "^4.5.2",
     "socket.io-client": "^4.8.0",
     "vue": "latest",
     "vue3-apexcharts": "^1.10.0"
@@ -27,10 +27,10 @@
   "devDependencies": {
     "@nuxtjs/tailwindcss": "^6.14.0",
     "@vitejs/plugin-vue": "^6.0.4",
-    "@vitest/coverage-v8": "^2.1.9",
+    "@vitest/coverage-v8": "^4.1.11",
     "@vue/test-utils": "^2.4.6",
     "happy-dom": "^20.6.1",
     "typescript": "latest",
-    "vitest": "^2.1.9"
+    "vitest": "^4.1.11"
   }
 }
