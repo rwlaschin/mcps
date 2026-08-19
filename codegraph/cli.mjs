@@ -11,8 +11,8 @@ const argRoot = (() => {
   return i >= 0 ? process.argv[i + 1] : null
 })()
 const ROOT = path.resolve(argRoot ?? process.env.CODEGRAPH_ROOT ?? process.cwd())
-if (!fs.existsSync(path.join(ROOT, 'tsconfig.json'))) {
-  console.error(`codegraph: no tsconfig.json in ${ROOT} — pass --root <repo> or set CODEGRAPH_ROOT`)
+if (!fs.existsSync(ROOT) || !fs.statSync(ROOT).isDirectory()) {
+  console.error(`codegraph: "${ROOT}" is not a directory — pass --root <repo> or set CODEGRAPH_ROOT`)
   process.exit(1)
 }
 const OUT = path.join(ROOT, '.codegraph')
@@ -89,7 +89,7 @@ const edges = (csr, id, callsOnly = false) => {
 
 // `name`, `file.ts:name`, or `file.ts` for every symbol declared in it.
 function resolve(query) {
-  if (/\.tsx?$/.test(query)) {
+  if (/\.(tsx?|jsx?|mjs|cjs|mts|cts)$/.test(query)) {
     const fileIdx = g.meta.files.findIndex((f) => f.endsWith(query))
     if (fileIdx === -1) return []
     return g.meta.symbols.flatMap((s, id) => (s.file === fileIdx && s.kind !== 'module' ? [id] : []))

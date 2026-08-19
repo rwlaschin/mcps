@@ -24,14 +24,25 @@ const write = (record) => {
   return writeTail
 }
 
-if (command === 'build') await write(await engine.build())
-else if (command === 'incremental') {
-  const events = JSON.parse(args[1] ?? '[]'); await write(await engine.incremental(events))
-} else if (command === 'reconcile') await write(await engine.reconcile())
-else if (command === 'query') {
+if (command === 'build') {
+  await write(await engine.build())
+  await engine.dispose()
+  process.exit(0)
+} else if (command === 'incremental') {
+  const events = JSON.parse(args[1] ?? '[]')
+  await write(await engine.incremental(events))
+  await engine.dispose()
+  process.exit(0)
+} else if (command === 'reconcile') {
+  await write(await engine.reconcile())
+  await engine.dispose()
+  process.exit(0)
+} else if (command === 'query') {
   const controller = new AbortController()
   process.once('SIGINT', () => controller.abort())
   for await (const row of engine.query(JSON.parse(args[1] ?? '{}'), { signal: controller.signal })) await write(row)
+  await engine.dispose()
+  process.exit(0)
 } else if (command === 'daemon') {
   const { QueryDaemon } = await import('./query-daemon.mjs')
   const daemon = new QueryDaemon(root)

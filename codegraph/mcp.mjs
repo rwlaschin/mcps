@@ -22,7 +22,7 @@ const SCOPE =
 const ROOT_PARAM = {
   type: 'string',
   description:
-    'Absolute path to the repository to analyze (must contain tsconfig.json). Use the workspace you are currently working in. Omit only if the server has a configured default.',
+    'Absolute path to the repository to analyze (JS or TS project). Use the workspace you are currently working in. Omit only if the server has a configured default.',
 }
 
 const TOOLS = [
@@ -124,8 +124,8 @@ const resolveRoot = (a) => {
     throw new Error('missing required argument "root": absolute path of the repository to analyze.')
   }
   const root = path.resolve(raw)
-  if (!fs.existsSync(path.join(root, 'tsconfig.json')) && !fs.existsSync(path.join(root, 'jsconfig.json'))) {
-    throw new Error(`"${root}" has no tsconfig.json or jsconfig.json — pass the repository root you are working in.`)
+  if (!fs.existsSync(root) || !fs.statSync(root).isDirectory()) {
+    throw new Error(`"${root}" is not a valid directory — pass the repository root you are working in.`)
   }
   return root
 }

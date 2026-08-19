@@ -4,25 +4,18 @@
 import { Project, Node, SyntaxKind } from 'ts-morph'
 import fs from 'node:fs'
 import path from 'node:path'
+import { createSourcePolicy } from './source-policy.mjs'
 
 const argRoot = (() => {
   const i = process.argv.indexOf('--root')
   return i >= 0 ? process.argv[i + 1] : null
 })()
 const ROOT = path.resolve(argRoot ?? process.env.CODEGRAPH_ROOT ?? process.cwd())
-if (!fs.existsSync(path.join(ROOT, 'tsconfig.json'))) {
-  console.error(`codegraph: no tsconfig.json in ${ROOT} — pass --root <repo> or set CODEGRAPH_ROOT`)
+if (!fs.existsSync(ROOT) || !fs.statSync(ROOT).isDirectory()) {
+  console.error(`codegraph: "${ROOT}" is not a directory — pass --root <repo> or set CODEGRAPH_ROOT`)
   process.exit(1)
 }
 const OUT = path.join(ROOT, '.codegraph')
-const GLOBS = [
-  'app/**/*.{ts,tsx}',
-  'lib/**/*.{ts,tsx}',
-  'src/**/*.{ts,tsx}',
-  'tests/**/*.{ts,tsx}',
-  'e2e/**/*.{ts,tsx}',
-  'middleware.ts',
-]
 
 const DECL_KINDS = [
   SyntaxKind.FunctionDeclaration,
@@ -47,11 +40,15 @@ function kindOf(node) {
 }
 
 let a = t()
+const config = ['tsconfig.json', 'jsconfig.json'].map((name) => path.join(ROOT, name)).find((file) => fs.existsSync(file))
 const project = new Project({
-  tsConfigFilePath: path.join(ROOT, 'tsconfig.json'),
+  ...(config ? { tsConfigFilePath: config } : {}),
   skipAddingFilesFromTsConfig: true,
+  compilerOptions: { allowJs: true },
 })
-project.addSourceFilesAtPaths(GLOBS.map((g) => path.join(ROOT, g)))
+const policy = createSourcePolicy(ROOT)
+const sourcePaths = policy.scan()
+sourcePaths.forEach((rel) => project.addSourceFileAtPath(path.join(ROOT, rel)))
 const sourceFiles = project.getSourceFiles()
 step(`parse ${sourceFiles.length} files`, a)
 
