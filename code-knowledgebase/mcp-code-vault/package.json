@@ -47,7 +47,7 @@
     "socket.io-client": "^4.8.0",
     "ts-jest": "^29.4.6",
     "ts-node": "latest",
-    "tsx": "^4.21.0",
+    "tsx": "^4.23.12",
     "typescript": "latest"
   }
 }
