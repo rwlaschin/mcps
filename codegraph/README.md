@@ -17,7 +17,11 @@ Instead of parsing entire files or reconstructing graph heaps on every prompt, C
 - **Dependency Maps (`codegraph_deps`)**: Discover in-repo outgoing calls and imports for any function or file without noisy `node_modules` pollution.
 - **Dead Export Analysis (`codegraph_dead`)**: Identify unreferenced exports across your project while respecting framework conventions.
 - **Multi-Consistency Queries (`codegraph_query`)**: Switch seamlessly between instantaneous provisional syntax updates and checker-validated generation snapshots.
-- **Interactive Visualizer**: Built-in streaming query visualizer UI for exploring your graph in the browser.
+- **Interactive Multi-View Visualizer**: Built-in interactive browser visualizer with 4 analysis modes and debounced live reloading:
+  - 🌊 **Layered Call Flow**: Top-down execution graph stratifying UI controllers, Hooks, API endpoints, Domain Services, and DB persistence with directional arrow paths and architectural violation highlights.
+  - 🔥 **Codebase Heat Map**: Call density and caller centrality matrix highlighting high-traffic core modules vs leaf utilities.
+  - ☀️ **Sunburst Partition**: Recursive multi-tier radial directory partition tree radiating from Codebase Root $\rightarrow$ Packages $\rightarrow$ Subdirectories $\rightarrow$ Files $\rightarrow$ Functions.
+  - 🔄 **Module Coupling Chord**: Circular dependency diagram visualizing bidirectional interactions and call volume between packages.
 
 ---
 
@@ -106,18 +110,30 @@ Add CodeGraph to your Model Context Protocol configuration (e.g. `claude_desktop
 # Build / index current repository
 npx codegraph index
 
-# Find callers of a function
-npx codegraph callers --symbol myFunction
+# Find callers of a function (inverted call tree)
+npx codegraph callers myFunction --depth 3
 
-# Find dependencies of a file
-npx codegraph deps --target src/server.ts
+# Find incoming references across files
+npx codegraph refs myFunction
+
+# Find dependencies of a symbol or file
+npx codegraph deps src/server.ts
 
 # Detect dead exports
-npx codegraph dead --prefix src/
+npx codegraph dead src/
 
-# Launch streaming visualizer UI
-npx codegraph visualize
+# Launch interactive visualizer UI
+npx codegraph visualize --port 7331
 ```
+
+### 4. NPM Scripts
+| Script | Command | Purpose |
+| :--- | :--- | :--- |
+| `npm run visualize` | `node visualizer.mjs` | Launch visualizer web server on port 7331 |
+| `npm run dev` | `node --watch-path=... visualizer.mjs` | Launch visualizer in live-reload dev mode |
+| `npm run index` | `node tool.mjs build` | Force full re-index of the repository |
+| `npm run mcp` | `node mcp.mjs` | Start Model Context Protocol server over stdio |
+| `npm test` | `node --test` | Execute full unit and E2E test suite |
 
 ---
 
@@ -125,7 +141,7 @@ npx codegraph visualize
 
 | Tool | Purpose | Key Arguments |
 | :--- | :--- | :--- |
-| `codegraph_index` | Force a full v3 symbol-graph build with call coverage | `root` (optional) |
+| `codegraph_index` | Force a full symbol-graph build with call coverage | `root` (optional) |
 | `codegraph_refs` | Find all incoming references to a symbol with caller locations | `symbol`, `root` |
 | `codegraph_callers` | Inverted call-tree walking upward to root entry points | `symbol`, `depth`, `root` |
 | `codegraph_deps` | In-repo outgoing dependencies and function calls | `target`, `root` |

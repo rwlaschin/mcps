@@ -26,7 +26,7 @@ const VERBOSE = process.argv.includes('--verbose')
 const rebuild = (why) => {
   process.stderr.write(`# ${why} — rebuilding index for ${path.basename(ROOT)}…\n`)
   try {
-    execFileSync(process.execPath, [path.join(import.meta.dirname, 'build.mjs'), '--root', ROOT], {
+    execFileSync(process.execPath, [path.join(import.meta.dirname, 'tool.mjs'), 'build', '--root', ROOT], {
       stdio: VERBOSE ? 'inherit' : ['ignore', 'ignore', 'pipe'],
     })
   } catch (err) {
@@ -194,13 +194,22 @@ if (!cmd || cmd === 'help') {
   refs <name|file.ts:name>       every reference, type-resolved (grep, but correct)
   deps <name|file.ts>            what a symbol or file calls, in-repo only
   callers <name> [--depth N]     inverted call tree upward (default depth 3)
-  dead [path/prefix]             exports with no reference outside their own file`)
+  dead [path/prefix]             exports with no reference outside their own file
+  visualize [--port N]           launch interactive web visualizer`)
   process.exit(0)
 }
 
 if (cmd === 'index') {
-  // Must forward --root: build.mjs would otherwise index cwd, not the repo being queried.
-  execFileSync(process.execPath, [path.join(import.meta.dirname, 'build.mjs'), '--root', ROOT], { stdio: 'inherit' })
+  // Must forward --root: tool.mjs would otherwise index cwd, not the repo being queried.
+  execFileSync(process.execPath, [path.join(import.meta.dirname, 'tool.mjs'), 'build', '--root', ROOT], { stdio: 'inherit' })
+  process.exit(0)
+}
+
+if (cmd === 'visualize') {
+  const forwardedArgs = [path.join(import.meta.dirname, 'visualizer.mjs'), '--root', ROOT]
+  if (arg) forwardedArgs.push(arg)
+  forwardedArgs.push(...rest)
+  execFileSync(process.execPath, forwardedArgs, { stdio: 'inherit' })
   process.exit(0)
 }
 

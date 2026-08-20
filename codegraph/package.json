@@ -47,11 +47,12 @@
   "scripts": {
     "install": "node native/build-optional.mjs",
     "build:native": "node-gyp rebuild",
-    "index": "node build.mjs",
+    "index": "node tool.mjs build",
     "mcp": "node mcp.mjs",
-    "index:v2": "node tool.mjs build",
     "watch": "node mcp.mjs",
     "visualize": "node visualizer.mjs",
+    "visualize:watch": "node --watch-path=visualizer.mjs --watch-path=visualizer-graph.mjs --watch-path=indexer.mjs --watch-path=query-client.mjs --watch-path=tool.mjs visualizer.mjs",
+    "dev": "node --watch-path=visualizer.mjs --watch-path=visualizer-graph.mjs --watch-path=indexer.mjs --watch-path=query-client.mjs --watch-path=tool.mjs visualizer.mjs",
     "test": "node --test"
   },
   "dependencies": {

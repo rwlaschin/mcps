@@ -8,8 +8,8 @@ import { spawn } from 'node:child_process'
 import { once } from 'node:events'
 
 const startupBySocket = new Map()
-const CONNECT_TIMEOUT_MS = 250
-const STARTUP_TIMEOUT_MS = 3000
+const CONNECT_TIMEOUT_MS = 500
+const STARTUP_TIMEOUT_MS = 15000
 const STARTUP_POLL_MIN_MS = 10
 const STARTUP_POLL_MAX_MS = 50
 

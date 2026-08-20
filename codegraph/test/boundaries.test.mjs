@@ -10,8 +10,8 @@ test('visualizer only consumes the streaming query client', () => {
   assert.match(source, /query-client/)
 })
 
-test('legacy entry points and MCP tool names remain available', () => {
-  for (const file of ['build.mjs', 'cli.mjs', 'mcp.mjs']) assert.equal(fs.existsSync(path.join(import.meta.dirname, '..', file)), true)
+test('entry points and MCP tool names remain available', () => {
+  for (const file of ['cli.mjs', 'mcp.mjs']) assert.equal(fs.existsSync(path.join(import.meta.dirname, '..', file)), true)
   const source = fs.readFileSync(path.join(import.meta.dirname, '..', 'mcp.mjs'), 'utf8')
   for (const name of ['codegraph_refs', 'codegraph_callers', 'codegraph_deps', 'codegraph_dead', 'codegraph_index']) assert.match(source, new RegExp(name))
 })
