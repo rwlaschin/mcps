@@ -1,5 +1,5 @@
 import path from 'node:path'
-import { createSourcePolicy } from './source-policy.mjs'
+import { controlFileHashes, createSourcePolicy } from './source-policy.mjs'
 import { contentHash, createSemanticProject, parsePartition, prepareSemanticProject } from './parser.mjs'
 import { GraphStore } from './store.mjs'
 import { createTraceProfiler } from './trace-profile.mjs'
@@ -79,6 +79,7 @@ export class CodeGraphEngine {
   reconcile() { return this.#enqueueOperation(() => this.#reconcile()) }
   async #build() {
     this.#discardWorkspace()
+    this.policy = createSourcePolicy(this.root)
     const profile = this.#beginOperation('build')
     try {
     const scan = this.profiler?.begin('scan', undefined, { memory: true })
@@ -96,7 +97,7 @@ export class CodeGraphEngine {
     if (parseIndex) this.profiler.end(parseIndex)
     const publish = this.profiler?.begin('publish', undefined, { memory: true })
     const sourceBlobs = Object.fromEntries([...sources].map(([file, source]) => [file, this.store.writeSource(source)]))
-    const generation = this.store.publish({ version: 3, root: this.root, edgeCoverage: 'calls', sources: sourceBlobs, partitions, partitionHashes: partitions })
+    const generation = this.store.publish({ version: 3, root: this.root, edgeCoverage: 'calls', controlHashes: controlFileHashes(this.root), sources: sourceBlobs, partitions, partitionHashes: partitions })
     workspace.generation = generation.generation
     this.workspace = workspace
     this.resolver = new FileLocalResolver(this.root, sources, { parserPool: this.parserPool })
@@ -110,6 +111,8 @@ export class CodeGraphEngine {
   }
   async #incremental(events, prefetched = null) {
     {
+    const normalizedEvents = uniqueEvents(events)
+    if (normalizedEvents.some((event) => this.policy.isControlRelative(this.policy.normalize(path.resolve(this.root, event.path))))) return this.#build()
     const previous = this.store.readGeneration()
     if (!this.validatedGeneration || this.validatedGeneration !== previous.generation || !this.resolver.sourceEntries().length) {
       this.resolver = new FileLocalResolver(this.root, new Map(Object.entries(previous.sources ?? {}).map(([file, id]) => [file, this.store.readSource(id)])), { parserPool: this.parserPool })
@@ -119,7 +122,7 @@ export class CodeGraphEngine {
       this.validationEpoch += 1
     }
     const accepted = []
-    for (const event of uniqueEvents(events)) {
+    for (const event of normalizedEvents) {
       const rel = this.policy.normalize(path.resolve(this.root, event.path))
       if (!this.policy.isSourceRelative(rel) || this.policy.isIgnoredRelative(rel)) continue
       if (event.type === 'unlink') accepted.push({ type: 'unlink', path: rel })
@@ -147,6 +150,11 @@ export class CodeGraphEngine {
     const profile = this.#beginOperation('reconcile')
     try {
       const generation = this.store.readGeneration()
+      const controls = controlFileHashes(this.root)
+      if (!generation.controlHashes || JSON.stringify(generation.controlHashes) !== JSON.stringify(controls)) {
+        if (profile) this.profiler.end(profile.operation)
+        return this.#build()
+      }
       const scan = this.profiler?.begin('scan', undefined, { memory: true })
       const fileList = this.policy.scan()
       this.#synchronizeFileIds(fileList)
@@ -212,7 +220,11 @@ export class CodeGraphEngine {
     const validation = this.#scheduleValidation(snapshot.revision)
     return { ...snapshot, validatedGeneration, validation }
   }
-  registeredFiles() { return new Set(this.workspace?.sources.keys() ?? Object.keys(this.store.readGeneration().partitions)) }
+  registeredFiles() {
+    const files = new Set(this.workspace?.sources.keys() ?? Object.keys(this.store.readGeneration().partitions))
+    for (const [file, hash] of Object.entries(controlFileHashes(this.root))) if (hash) files.add(file)
+    return files
+  }
   async dispose() {
     this.disposed = true
     this.validationEpoch += 1
@@ -511,7 +523,7 @@ export class CodeGraphEngine {
       const partitionIds = {}; for (const [file, partition] of Object.entries(partitionsByFile)) partitionIds[file] = this.store.writePartition(partition, this.profiler)
       if (epoch !== this.validationEpoch || revision !== this.resolver.revision || this.disposed) return null
       const sourceIds = productionBlobs ?? Object.fromEntries([...sources].map(([file, source]) => [file, this.store.writeSource(source)]))
-      const generation = this.store.publish({ version: 3, root: this.root, edgeCoverage: 'calls', sources: sourceIds, partitions: partitionIds, partitionHashes: partitionIds })
+      const generation = this.store.publish({ version: 3, root: this.root, edgeCoverage: 'calls', controlHashes: controlFileHashes(this.root), sources: sourceIds, partitions: partitionIds, partitionHashes: partitionIds })
       this.validatedGeneration = generation.generation
       this.validatedSourceBlobs = sourceIds
       this.validationChanges.clear()

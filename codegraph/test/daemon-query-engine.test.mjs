@@ -295,6 +295,111 @@ process.stdout.write(JSON.stringify(rows))
   assert.deepEqual({ status: result.status, stdout: result.stdout, forbiddenLoads: result.stderr.split('\n').filter((line) => line.includes('/tool-engine.mjs') || line.includes('/parser.mjs') || line.includes('/typescript') || line.includes('/ts-morph')) }, { status: 0, stdout: '[{"name":"primed"}]', forbiddenLoads: [] })
 })
 
+test('architecture boundary: a primed MCP deps call returns mapped results without loading the heavy engine parser TypeScript or ts-morph', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-mcp-mapped-deps-'))
+  const loaderRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-mcp-mapped-loader-'))
+  temporaryRoots.add(root)
+  temporaryRoots.add(loaderRoot)
+  fs.mkdirSync(path.join(root, 'src'))
+  fs.writeFileSync(path.join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { module: 'ESNext' }, include: ['src'] }))
+  fs.writeFileSync(path.join(root, 'src', 'calls.ts'), 'export function target() { return 1 }\nexport function caller() { return target() }\n')
+  const indexed = spawnSync(process.execPath, ['cli.mjs', 'index', '--root', root], { cwd: path.resolve(import.meta.dirname, '..'), encoding: 'utf8' })
+  const primed = spawnSync(process.execPath, ['tool.mjs', 'query', JSON.stringify({ type: 'deps', name: 'caller', limit: 200 }), '--root', root], { cwd: path.resolve(import.meta.dirname, '..'), encoding: 'utf8' })
+  const loaderPath = path.join(loaderRoot, 'record-loader.mjs')
+  fs.writeFileSync(loaderPath, `
+export async function load(url, context, nextLoad) {
+  if (url.includes('/tool-engine.mjs') || url.includes('/parser.mjs') || url.includes('/typescript') || url.includes('/ts-morph')) process.stderr.write('FORBIDDEN ' + url + '\\n')
+  return nextLoad(url, context)
+}
+`)
+  const request = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'codegraph_deps', arguments: { root, target: 'caller' } } }) + '\n'
+
+  const result = spawnSync(process.execPath, ['--experimental-loader', loaderPath, 'mcp.mjs'], { cwd: path.resolve(import.meta.dirname, '..'), encoding: 'utf8', input: request, timeout: 10_000 })
+  const response = JSON.parse(result.stdout.trim())
+
+  assert.deepEqual(
+    { indexedStatus: indexed.status, primedStatus: primed.status, status: result.status, isError: response.result?.isError, hasMappedCall: response.result?.content?.[0]?.text.includes('src/calls.ts:2 -> src/calls.ts:1 call'), forbiddenLoads: result.stderr.split('\n').filter((line) => line.startsWith('FORBIDDEN ')) },
+    { indexedStatus: 0, primedStatus: 0, status: 0, isError: undefined, hasMappedCall: true, forbiddenLoads: [] },
+  )
+})
+
+test('architecture boundary: configured CODEGRAPH_ROOT serves a primed MCP deps call without loading heavy modules', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-mcp-default-root-'))
+  const loaderRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-mcp-default-loader-'))
+  temporaryRoots.add(root)
+  temporaryRoots.add(loaderRoot)
+  fs.mkdirSync(path.join(root, 'src'))
+  fs.writeFileSync(path.join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { module: 'ESNext' }, include: ['src'] }))
+  fs.writeFileSync(path.join(root, 'src', 'calls.ts'), 'export function target() { return 1 }\nexport function caller() { return target() }\n')
+  const indexed = spawnSync(process.execPath, ['cli.mjs', 'index', '--root', root], { cwd: path.resolve(import.meta.dirname, '..'), encoding: 'utf8' })
+  const primed = spawnSync(process.execPath, ['tool.mjs', 'query', JSON.stringify({ type: 'deps', name: 'caller', limit: 200 }), '--root', root], { cwd: path.resolve(import.meta.dirname, '..'), encoding: 'utf8' })
+  const loaderPath = path.join(loaderRoot, 'record-loader.mjs')
+  fs.writeFileSync(loaderPath, `
+export async function load(url, context, nextLoad) {
+  if (url.includes('/tool-engine.mjs') || url.includes('/parser.mjs') || url.includes('/typescript') || url.includes('/ts-morph')) process.stderr.write('FORBIDDEN ' + url + '\\n')
+  return nextLoad(url, context)
+}
+`)
+  const request = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'codegraph_deps', arguments: { target: 'caller' } } }) + '\n'
+
+  const result = spawnSync(process.execPath, ['--experimental-loader', loaderPath, 'mcp.mjs'], { cwd: path.resolve(import.meta.dirname, '..'), encoding: 'utf8', input: request, timeout: 10_000, env: { ...process.env, CODEGRAPH_ROOT: root } })
+  const response = JSON.parse(result.stdout.trim())
+
+  assert.deepEqual(
+    { indexedStatus: indexed.status, primedStatus: primed.status, status: result.status, isError: response.result?.isError, hasMappedCall: response.result?.content?.[0]?.text.includes('src/calls.ts:2 -> src/calls.ts:1 call'), forbiddenLoads: result.stderr.split('\n').filter((line) => line.startsWith('FORBIDDEN ')) },
+    { indexedStatus: 0, primedStatus: 0, status: 0, isError: undefined, hasMappedCall: true, forbiddenLoads: [] },
+  )
+})
+
+test('domain analysis: a source changed before the first MCP read never returns the stale primed dependency', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-mcp-stale-before-read-'))
+  temporaryRoots.add(root)
+  fs.mkdirSync(path.join(root, 'src'))
+  fs.writeFileSync(path.join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { module: 'ESNext' }, include: ['src'] }))
+  fs.writeFileSync(path.join(root, 'src', 'calls.ts'), 'export function target() { return 1 }\nexport function caller() { return target() }\n')
+  const indexed = spawnSync(process.execPath, ['cli.mjs', 'index', '--root', root], { cwd: path.resolve(import.meta.dirname, '..'), encoding: 'utf8' })
+  const primed = spawnSync(process.execPath, ['tool.mjs', 'query', JSON.stringify({ type: 'deps', name: 'caller', limit: 200 }), '--root', root], { cwd: path.resolve(import.meta.dirname, '..'), encoding: 'utf8' })
+  fs.writeFileSync(path.join(root, 'src', 'calls.ts'), 'export function target() { return 1 }\nexport function caller() { return 0 }\n')
+  const request = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'codegraph_deps', arguments: { root, target: 'caller' } } }) + '\n'
+
+  const result = spawnSync(process.execPath, ['mcp.mjs'], { cwd: path.resolve(import.meta.dirname, '..'), encoding: 'utf8', input: request, timeout: 10_000 })
+  const response = JSON.parse(result.stdout.trim())
+
+  assert.deepEqual(
+    { indexedStatus: indexed.status, primedStatus: primed.status, status: result.status, isError: response.result?.isError, text: response.result?.content?.[0]?.text.split('\n').at(-1) },
+    { indexedStatus: 0, primedStatus: 0, status: 0, isError: undefined, text: '(no results)' },
+  )
+})
+
+test('domain analysis: tsconfig content changed before the first MCP read forces heavy reconciliation instead of trusting mmap', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-mcp-stale-config-'))
+  const loaderRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-mcp-config-loader-'))
+  temporaryRoots.add(root)
+  temporaryRoots.add(loaderRoot)
+  fs.mkdirSync(path.join(root, 'src'))
+  fs.writeFileSync(path.join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { module: 'ESNext' }, include: ['src'] }))
+  fs.writeFileSync(path.join(root, 'src', 'calls.ts'), 'export function target() { return 1 }\nexport function caller() { return target() }\n')
+  const indexed = spawnSync(process.execPath, ['cli.mjs', 'index', '--root', root], { cwd: path.resolve(import.meta.dirname, '..'), encoding: 'utf8' })
+  const primed = spawnSync(process.execPath, ['tool.mjs', 'query', JSON.stringify({ type: 'deps', name: 'caller', limit: 200 }), '--root', root], { cwd: path.resolve(import.meta.dirname, '..'), encoding: 'utf8' })
+  fs.writeFileSync(path.join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { module: 'ESNext', target: 'ES2022' }, include: ['src'] }))
+  const loaderPath = path.join(loaderRoot, 'record-loader.mjs')
+  fs.writeFileSync(loaderPath, `
+export async function load(url, context, nextLoad) {
+  if (url.includes('/tool-engine.mjs')) process.stderr.write('HEAVY ' + url + '\\n')
+  return nextLoad(url, context)
+}
+`)
+  const request = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'codegraph_deps', arguments: { root, target: 'caller' } } }) + '\n'
+
+  const result = spawnSync(process.execPath, ['--experimental-loader', loaderPath, 'mcp.mjs'], { cwd: path.resolve(import.meta.dirname, '..'), encoding: 'utf8', input: request, timeout: 10_000 })
+  const response = JSON.parse(result.stdout.trim())
+
+  assert.deepEqual(
+    { indexedStatus: indexed.status, primedStatus: primed.status, status: result.status, isError: response.result?.isError, hasMappedCall: response.result?.content?.[0]?.text.includes('src/calls.ts:2 -> src/calls.ts:1 call'), loadedHeavyEngine: result.stderr.split('\n').some((line) => line.startsWith('HEAVY ')) },
+    { indexedStatus: 0, primedStatus: 0, status: 0, isError: undefined, hasMappedCall: true, loadedHeavyEngine: true },
+  )
+})
+
 test('domain analysis: daemon does not accept a socket connection until its async query engine is ready', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-light-ready-before-listen-'))
   temporaryRoots.add(root)

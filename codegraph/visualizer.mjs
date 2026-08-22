@@ -2,7 +2,6 @@
 import fs from 'node:fs'
 import http from 'node:http'
 import path from 'node:path'
-import chokidar from 'chokidar'
 import { streamQuery } from './query-client.mjs'
 import { buildLayeredGraph, buildHeatmapData, buildSunburstData, buildChordData } from './visualizer-graph.mjs'
 
@@ -2476,22 +2475,54 @@ export function createVisualizerServer(rootPath = root, options = {}) {
   const sseClients = new Set()
 
   let inFlightGraphQuery = null
+  let inFlightController = null
+  let inFlightWaiters = 0
   let cachedRawGraph = null
 
-  function fetchRawGraph(forceFresh = false) {
+  function fetchRawGraph(forceFresh = false, signal = null) {
     if (cachedRawGraph && !forceFresh) return Promise.resolve(cachedRawGraph)
-    if (inFlightGraphQuery) return inFlightGraphQuery
-    inFlightGraphQuery = (async () => {
-      let rawGraph = { symbols: [], edges: [] }
-      for await (const row of queryStreamFn(rootPath, { type: 'graph' })) {
-        rawGraph = row
-      }
-      cachedRawGraph = rawGraph
-      return rawGraph
-    })().finally(() => {
-      inFlightGraphQuery = null
-    })
-    return inFlightGraphQuery
+    if (!inFlightGraphQuery) {
+      const controller = new AbortController()
+      inFlightController = controller
+      inFlightGraphQuery = (async () => {
+        let rawGraph = { symbols: [], edges: [] }
+        for await (const row of queryStreamFn(rootPath, { type: 'graph' }, { signal: controller.signal })) {
+          rawGraph = row
+        }
+        cachedRawGraph = rawGraph
+        return rawGraph
+      })().finally(() => {
+        inFlightGraphQuery = null
+        inFlightController = null
+        inFlightWaiters = 0
+      })
+    }
+    const query = inFlightGraphQuery
+    if (!signal) return query
+    // One graph query is SHARED by every concurrent request, so a single disconnect must not
+    // cancel it out from under the others — only the last waiter leaving cancels the child query.
+    const owner = inFlightController
+    inFlightWaiters += 1
+    let released = false
+    const drop = (cancel) => {
+      if (released) return
+      released = true
+      inFlightWaiters -= 1
+      if (cancel && inFlightWaiters === 0) owner?.abort()
+    }
+    const onAbort = () => drop(true)
+    signal.addEventListener('abort', onAbort, { once: true })
+    return query.finally(() => { drop(false); signal.removeEventListener('abort', onAbort) })
+  }
+
+  // Client disconnect (request aborted or response closed) releases this request's claim on the
+  // shared graph query; the child query is cancelled once no request is waiting on it.
+  function graphForRequest(req, res) {
+    const controller = new AbortController()
+    const abort = () => controller.abort()
+    req.once('aborted', abort)
+    res.once('close', abort)
+    return fetchRawGraph(false, controller.signal)
   }
 
   const resolvedRoot = (() => {
@@ -2525,32 +2556,26 @@ export function createVisualizerServer(rootPath = root, options = {}) {
     }, debounceMs)
   }
 
+  const isIgnoredWatchPath = (candidate) => {
+    const p = candidate.split(path.sep).join('/')
+    if (p.includes('/node_modules/') || p.includes('/.git/') || p.includes('/dist/') || p.includes('/build/') || p.includes('/coverage/')) return true
+    if (p.endsWith('/node_modules') || p.endsWith('/.git') || p.endsWith('/dist') || p.endsWith('/build') || p.endsWith('/coverage')) return true
+    if (p.includes('/.codegraph/generations') || p.includes('/.codegraph/partitions') || p.includes('/.codegraph/overlays')) return true
+    if (p.endsWith('.tmp') || p.includes('.tmp.') || p.includes('query-view-cache.bin')) return true
+    return false
+  }
+
   let watcher = null
   try {
-    const currentFile = path.join(codegraphDir, 'CURRENT')
-    const watchPaths = [currentFile, codegraphDir, resolvedRoot]
-    watcher = chokidar.watch(watchPaths, {
-      ignoreInitial: true,
-      persistent: true,
-      dot: true,
-      usePolling: options.usePolling ?? false,
-      ignored: (candidate) => {
-        const p = candidate.split(path.sep).join('/')
-        if (p.includes('/node_modules/') || p.includes('/.git/') || p.includes('/dist/') || p.includes('/build/') || p.includes('/coverage/')) return true
-        if (p.endsWith('/node_modules') || p.endsWith('/.git') || p.endsWith('/dist') || p.endsWith('/build') || p.endsWith('/coverage')) return true
-        if (p.includes('/.codegraph/generations') || p.includes('/.codegraph/partitions') || p.includes('/.codegraph/overlays')) return true
-        if (p.endsWith('.tmp') || p.includes('.tmp.') || p.includes('query-view-cache.bin')) return true
-        return false
-      }
-    })
-    watcher.on('all', (evt, file) => {
-      const base = path.basename(file)
-      const ext = path.extname(file).toLowerCase()
-      const isCurrent = base === 'CURRENT'
-      const isSource = ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.mts', '.cts'].includes(ext)
-      if (isCurrent || isSource) {
-        handleFileChange(evt, file)
-      }
+    // ONE recursive watch on the root — it already contains .codegraph/CURRENT, so the three
+    // former watch paths collapse into a single handle instead of an fd per watched file.
+    watcher = fs.watch(resolvedRoot, { recursive: true, persistent: true }, (evt, name) => {
+      if (!name) return
+      const file = path.join(resolvedRoot, name)
+      if (isIgnoredWatchPath(file)) return
+      const isCurrent = path.basename(file) === 'CURRENT'
+      const isSource = ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.mts', '.cts'].includes(path.extname(file).toLowerCase())
+      if (isCurrent || isSource) handleFileChange(evt, file)
     })
     console.log(`[CodeGraph Server] Watching for code & index changes in: ${resolvedRoot}`)
   } catch (err) {
@@ -2595,7 +2620,7 @@ export function createVisualizerServer(rootPath = root, options = {}) {
     if (parsedUrl.pathname === '/graph') {
       const includeTests = parsedUrl.searchParams.get('includeTests') === '1'
       try {
-        const rawGraph = await fetchRawGraph()
+        const rawGraph = await graphForRequest(req, res)
         const layered = buildLayeredGraph(rawGraph, { includeTests })
         layered.project = {
           name: path.basename(rootPath),
@@ -2612,7 +2637,7 @@ export function createVisualizerServer(rootPath = root, options = {}) {
     if (parsedUrl.pathname === '/heatmap') {
       const includeTests = parsedUrl.searchParams.get('includeTests') === '1'
       try {
-        const rawGraph = await fetchRawGraph()
+        const rawGraph = await graphForRequest(req, res)
         const heatmap = buildHeatmapData(rawGraph, { includeTests, width: 1400 })
         heatmap.project = {
           name: path.basename(rootPath),
@@ -2629,7 +2654,7 @@ export function createVisualizerServer(rootPath = root, options = {}) {
     if (parsedUrl.pathname === '/sunburst') {
       const includeTests = parsedUrl.searchParams.get('includeTests') === '1'
       try {
-        const rawGraph = await fetchRawGraph()
+        const rawGraph = await graphForRequest(req, res)
         const sunburst = buildSunburstData(rawGraph, { includeTests, cx: 500, cy: 500, radius: 440 })
         sunburst.project = {
           name: path.basename(rootPath),
@@ -2646,7 +2671,7 @@ export function createVisualizerServer(rootPath = root, options = {}) {
     if (parsedUrl.pathname === '/chord') {
       const includeTests = parsedUrl.searchParams.get('includeTests') === '1'
       try {
-        const rawGraph = await fetchRawGraph()
+        const rawGraph = await graphForRequest(req, res)
         const chord = buildChordData(rawGraph, { includeTests, cx: 500, cy: 500, radius: 360 })
         chord.project = {
           name: path.basename(rootPath),

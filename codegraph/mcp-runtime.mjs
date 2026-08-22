@@ -1,5 +1,6 @@
 import path from 'node:path'
-import chokidar from 'chokidar'
+import fs from 'node:fs'
+import { watch as chokidarWatch } from 'chokidar'
 import { CodeGraphEngine } from './tool-engine.mjs'
 
 export class DebouncedBuildQueue {
@@ -28,7 +29,7 @@ export class DebouncedBuildQueue {
 }
 
 export class McpProjectRuntime {
-  constructor(root, options = {}) { this.root = path.resolve(root); this.engine = options.engine ?? new CodeGraphEngine(this.root); this.debounceMs = options.debounceMs ?? 150; this.onError = options.onError; this.watcher = null; this.queue = null; this.registered = new Set() }
+  constructor(root, options = {}) { this.root = path.resolve(root); this.engine = options.engine ?? new CodeGraphEngine(this.root); this.debounceMs = options.debounceMs ?? 150; this.onError = options.onError; this.nativeWatch = options.nativeWatch ?? fs.watch; this.fallbackWatch = options.fallbackWatch ?? chokidarWatch; this.watcher = null; this.queue = null; this.registered = new Set(); this.fallbackStarted = false }
   async start() {
     await this.engine.reconcile()
     this.registered = new Set(this.engine.registeredFiles?.() ?? [])
@@ -39,28 +40,59 @@ export class McpProjectRuntime {
         else this.registered.add(event.path)
       }
     }, { debounceMs: this.debounceMs, onError: this.onError })
-    const policy = this.engine.policy
-    this.watcher = chokidar.watch(this.root, {
-      persistent: true,
-      ignoreInitial: true,
-      followSymlinks: false,
-      useFsEvents: true,
-      usePolling: false,
-      ignored: (candidate, stats) => {
-        const rel = policy.normalize(candidate)
-        if (rel === '') return false
-        if (policy.isIgnoredRelative(rel)) return true
-        if (stats?.isDirectory()) return false
-        if (stats?.isFile()) return !policy.acceptWatchPath(candidate)
-        return false
-      },
-    })
-    const enqueue = (type, file) => {
-      const relative = policy.normalize(file)
-      if (type === 'unlink' ? (this.registered.has(relative) || this.queue.hasPending(relative)) : policy.acceptWatchPath(file)) this.queue.push({ type, path: relative })
+    // ONE recursive watch for the whole tree. Per-path watching costs an open fd per file on
+    // macOS (kqueue), which leaked ~900 handles per indexed repo and starved the network stack.
+    try {
+      const watcher = this.nativeWatch(this.root, { recursive: true, persistent: true }, (_event, name) => {
+        if (name) this.enqueue(null, path.join(this.root, name))
+      })
+      this.watcher = watcher
+      watcher.on('error', (error) => { this.#report(error); this.#startFallback(watcher) })
+    } catch (error) {
+      this.#report(error)
+      this.#startFallback()
     }
-    this.watcher.on('add', (f) => enqueue('add', f)).on('change', (f) => enqueue('change', f)).on('unlink', (f) => enqueue('unlink', f))
     return this
   }
-  async close() { if (this.watcher) await this.watcher.close(); if (this.queue) await this.queue.close(); await this.engine.dispose?.() }
+  #report(error) { Promise.resolve(this.onError?.(error)).catch(() => {}) }
+  #startFallback(nativeWatcher) {
+    if (this.fallbackStarted) return
+    this.fallbackStarted = true
+    nativeWatcher?.close()
+    this.watcher = null
+    // Chokidar normally delegates to fs.watch too. Polling deliberately bypasses exhausted macOS
+    // FSEvents/watch resources, trading that failure mode for periodic stat scans and extra CPU.
+    const policy = this.engine.policy
+    try {
+      const watcher = this.fallbackWatch(this.root, {
+        persistent: true,
+        ignoreInitial: true,
+        followSymlinks: false,
+        usePolling: true,
+        ignored: (candidate, stats) => {
+          const relative = policy.normalize(candidate)
+          if (relative === '') return false
+          if (policy.isIgnoredRelative(relative)) return true
+          if (stats?.isDirectory()) return false
+          if (stats?.isFile()) return !policy.acceptWatchPath(candidate)
+          return false
+        },
+      })
+      this.watcher = watcher
+      watcher.on('add', (file) => this.enqueue('add', file))
+      watcher.on('change', (file) => this.enqueue('change', file))
+      watcher.on('unlink', (file) => this.enqueue('unlink', file))
+      watcher.on('error', (error) => this.#report(error))
+    } catch (error) { this.#report(error) }
+  }
+  // fs.watch only reports 'rename' | 'change', so add/change/unlink is derived from disk plus the
+  // registered set. Pass an explicit type to enqueue a known transition without touching disk.
+  enqueue(type, file) {
+    const policy = this.engine.policy
+    const relative = policy.normalize(file)
+    if (relative === '' || policy.isIgnoredRelative(relative)) return
+    const resolved = type ?? (!fs.existsSync(file) ? 'unlink' : this.registered.has(relative) ? 'change' : 'add')
+    if (resolved === 'unlink' ? (this.registered.has(relative) || this.queue.hasPending(relative)) : policy.acceptWatchPath(file)) this.queue.push({ type: resolved, path: relative })
+  }
+  async close() { await this.watcher?.close(); if (this.queue) await this.queue.close(); await this.engine.dispose?.() }
 }

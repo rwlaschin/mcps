@@ -826,7 +826,40 @@ test('domain analysis: numeric file IDs do not alter persisted partition symbol 
   const manifest = engine.readGeneration()
   const aPartition = engine.store.readPartition(manifest.partitions['src/a.ts'])
 
-  assert.deepEqual({ manifestKeys: Object.keys(manifest).sort(), partitionFile: aPartition.file, symbolFile: aPartition.symbols[0].file, edgeKeys: Object.keys(engine.store.readPartition(manifest.partitions['src/b.ts']).edges[0]).sort() }, { manifestKeys: ['createdAt', 'edgeCoverage', 'generation', 'partitionHashes', 'partitions', 'root', 'sources', 'version'], partitionFile: 'src/a.ts', symbolFile: 'src/a.ts', edgeKeys: ['call', 'from', 'line', 'to'] })
+  assert.deepEqual({ manifestKeys: Object.keys(manifest).sort(), partitionFile: aPartition.file, symbolFile: aPartition.symbols[0].file, edgeKeys: Object.keys(engine.store.readPartition(manifest.partitions['src/b.ts']).edges[0]).sort() }, { manifestKeys: ['controlHashes', 'createdAt', 'edgeCoverage', 'generation', 'partitionHashes', 'partitions', 'root', 'sources', 'version'], partitionFile: 'src/a.ts', symbolFile: 'src/a.ts', edgeKeys: ['call', 'from', 'line', 'to'] })
+})
+
+test('domain analysis: incremental tsconfig change rebuilds and publishes the changed control hash', async () => {
+  const root = fixture()
+  const engine = trackedEngine(root)
+  const built = await engine.build()
+  fs.writeFileSync(path.join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { module: 'ESNext', target: 'ES2022' }, include: ['src'] }))
+
+  const incremented = await engine.incremental([{ type: 'change', path: 'tsconfig.json' }])
+  const manifest = engine.readGeneration(incremented.generation)
+
+  assert.deepEqual(
+    { generationChanged: incremented.generation !== built.generation, tsconfigHash: manifest.controlHashes['tsconfig.json'], parsedFiles: incremented.parsedFiles },
+    { generationChanged: true, tsconfigHash: 'aa704494dcde9431b2c044497ef8983aa284e5add1fb9b7f729730d9b93e796b', parsedFiles: ['src/a.ts', 'src/b.ts'] },
+  )
+})
+
+test('error guessing: reconcile upgrades a legacy current manifest without control hashes', async () => {
+  const root = fixture()
+  const engine = trackedEngine(root)
+  const built = await engine.build()
+  const manifestPath = path.join(root, '.codegraph', 'generations', `${built.generation}.json`)
+  const legacy = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
+  delete legacy.controlHashes
+  fs.writeFileSync(manifestPath, JSON.stringify(legacy))
+
+  const reconciled = await engine.reconcile()
+  const current = engine.readGeneration(reconciled.generation)
+
+  assert.deepEqual(
+    { generationChanged: reconciled.generation !== built.generation, tsconfigHash: current.controlHashes['tsconfig.json'], edgeCoverage: reconciled.edgeCoverage },
+    { generationChanged: true, tsconfigHash: 'b6074ef1d796c9bacd315a7d8933e7aedb7ebe1922532d6e5dec666d7e8573c5', edgeCoverage: 'calls' },
+  )
 })
 
 test('equivalence partition: a v3 build persists an exact source snapshot and only call-complete base edges', async () => {

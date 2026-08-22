@@ -16,12 +16,14 @@ test('entry points and MCP tool names remain available', () => {
   for (const name of ['codegraph_refs', 'codegraph_callers', 'codegraph_deps', 'codegraph_dead', 'codegraph_index']) assert.match(source, new RegExp(name))
 })
 
-test('standard MCP graph tools execute through the v2 runtime instead of the legacy CLI', () => {
+test('architectural boundary: MCP reads use the lightweight query path while index and refresh retain the watched v2 runtime', () => {
   const source = fs.readFileSync(path.join(import.meta.dirname, '..', 'mcp.mjs'), 'utf8')
-  const standardCalls = source.slice(source.indexOf('call.codegraph_refs'), source.indexOf('call.codegraph_index'))
+  const reads = source.slice(source.indexOf('call.codegraph_refs'), source.indexOf('call.codegraph_index'))
+  const mutations = source.slice(source.indexOf('call.codegraph_index'), source.indexOf('call.codegraph_query'))
 
-  assert.match(standardCalls, /runtime\.engine\.(snapshot|query)/)
-  assert.doesNotMatch(standardCalls, /runCli\s*\(/)
+  assert.doesNotMatch(reads, /runtimeFor\s*\(/)
+  assert.doesNotMatch(reads, /runCli\s*\(/)
+  assert.match(mutations, /runtimeFor\s*\(/)
 })
 
 test('legacy query shapes retain file qualifiers', () => {
@@ -78,4 +80,41 @@ test('architectural boundary: MCP deps pins graph locations rows and metadata th
   assert.match(deps, /metadata/)
   assert.doesNotMatch(deps, /engine\.snapshot\(\)/)
   assert.doesNotMatch(deps, /engine\.query\(/)
+})
+
+test('error guessing: configured root startup remains lightweight and stdin end closes runtimes query engines and light watchers', () => {
+  const source = fs.readFileSync(path.join(import.meta.dirname, '..', 'mcp.mjs'), 'utf8')
+  const startup = source.slice(source.lastIndexOf('if (DEFAULT_ROOT)'))
+  const shutdown = source.slice(source.indexOf("process.stdin.on('end'"), source.lastIndexOf('if (DEFAULT_ROOT)'))
+
+  assert.deepEqual(
+    { startupUsesHeavyRuntime: /runtimeFor\s*\(DEFAULT_ROOT\)/.test(startup), startupUsesLightQuery: /queryEngineFor\s*\(DEFAULT_ROOT\)/.test(startup), closesRuntimes: /runtimes/.test(shutdown), closesQueryEngines: /queryEngines/.test(shutdown), closesLightWatchers: /lightWatchers|stopLightWatcher/.test(shutdown) },
+    { startupUsesHeavyRuntime: false, startupUsesLightQuery: true, closesRuntimes: true, closesQueryEngines: true, closesLightWatchers: true },
+  )
+})
+
+test('error guessing: terminal polling watcher errors fail closed by promoting the watched root', () => {
+  const source = fs.readFileSync(path.join(import.meta.dirname, '..', 'mcp.mjs'), 'utf8')
+  const polling = source.slice(source.indexOf('async function startPollingWatcher'), source.indexOf('function watchForChanges'))
+
+  assert.match(polling, /watcher\.on\(['"]error['"],[\s\S]*promoteRuntime\s*\(root\)/)
+})
+
+test('domain analysis: mapped reads wait for an in-flight runtime promotion before answering', () => {
+  const source = fs.readFileSync(path.join(import.meta.dirname, '..', 'mcp.mjs'), 'utf8')
+  const queryEngine = source.slice(source.indexOf('function queryEngineFor'), source.indexOf('const MAX_MCP_RESULTS'))
+
+  assert.match(queryEngine, /runtimes\.get\(root\)|promotion/)
+})
+
+test('architectural boundary: first-read freshness hashes disk source content directly against generation source ids', () => {
+  const mcp = fs.readFileSync(path.join(import.meta.dirname, '..', 'mcp.mjs'), 'utf8')
+  const policy = fs.readFileSync(path.join(import.meta.dirname, '..', 'source-policy.mjs'), 'utf8')
+  const freshness = mcp.slice(mcp.indexOf('diskMatchesGeneration'), mcp.indexOf('async function queryEngineFor'))
+  const hashing = policy.slice(policy.indexOf('fileContentHash'), policy.indexOf('controlFileHashes'))
+
+  assert.deepEqual(
+    { hashesSha256: /createHash\(['"]sha256['"]\)[\s\S]*readFileSync|readFileSync[\s\S]*createHash\(['"]sha256['"]\)/.test(hashing), comparesGenerationSources: /generation\.sources|manifest\.sources/.test(freshness), rereadsStoredSourceBlob: /readSource\s*\(/.test(freshness) },
+    { hashesSha256: true, comparesGenerationSources: true, rereadsStoredSourceBlob: false },
+  )
 })

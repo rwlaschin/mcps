@@ -7,8 +7,10 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { execFileSync } from 'node:child_process'
-import { McpProjectRuntime } from './mcp-runtime.mjs'
+import { DaemonQueryEngine } from './daemon-query-engine.mjs'
 import { qualifiedQuery } from './query-target.mjs'
+import { controlFileHashes, createSourcePolicy, fileContentHash } from './source-policy.mjs'
+import { GraphStore } from './store.mjs'
 
 const HERE = import.meta.dirname
 const DEFAULT_ROOT = process.env.CODEGRAPH_ROOT ? path.resolve(process.env.CODEGRAPH_ROOT) : null
@@ -136,11 +138,90 @@ const runtimes = new Map()
 async function runtimeFor(root) {
   let pending = runtimes.get(root)
   if (!pending) {
-    pending = new McpProjectRuntime(root).start()
+    stopLightWatcher(root)
+    pending = import('./mcp-runtime.mjs').then(({ McpProjectRuntime }) => new McpProjectRuntime(root).start())
     runtimes.set(root, pending)
     try { await pending } catch (error) { runtimes.delete(root); throw error }
   }
   return pending
+}
+
+const queryEngines = new Map()
+const lightWatchers = new Map()
+const freshnessChecks = new Map()
+const stopLightWatcher = (root) => { lightWatchers.get(root)?.close(); lightWatchers.delete(root) }
+const promoteRuntime = (root) => { stopLightWatcher(root); runtimeFor(root).catch((error) => process.stderr.write(`codegraph-mcp: ${error.message}\n`)) }
+const isWatchedChange = (policy, file) => {
+  const relative = policy.normalize(file)
+  return policy.acceptWatchPath(file) || (!fs.existsSync(file) && policy.isSourceRelative(relative))
+}
+async function startPollingWatcher(root, policy) {
+  if (runtimes.has(root)) return
+  try {
+    // Native watch exhaustion must not load the parser just to remain fresh. Poll only accepted
+    // sources here; the first real change promotes this lightweight guard to the full runtime.
+    const { watch } = await import('chokidar')
+    const watcher = watch(root, {
+      persistent: false,
+      ignoreInitial: true,
+      followSymlinks: false,
+      usePolling: true,
+      ignored: (candidate, stats) => {
+        const relative = policy.normalize(candidate)
+        if (relative === '') return false
+        if (policy.isIgnoredRelative(relative)) return true
+        if (stats?.isDirectory()) return false
+        if (stats?.isFile()) return !policy.acceptWatchPath(candidate)
+        return false
+      },
+    })
+    lightWatchers.set(root, watcher)
+    watcher.on('all', (_event, file) => { if (isWatchedChange(policy, file)) promoteRuntime(root) })
+    watcher.on('error', () => promoteRuntime(root))
+  } catch { promoteRuntime(root) }
+}
+function watchForChanges(root) {
+  if (lightWatchers.has(root) || runtimes.has(root)) return
+  const policy = createSourcePolicy(root)
+  try {
+    const watcher = fs.watch(root, { recursive: true, persistent: false }, (_event, name) => {
+      if (!name) return
+      const file = path.join(root, String(name))
+      if (isWatchedChange(policy, file)) promoteRuntime(root)
+    })
+    lightWatchers.set(root, watcher)
+    watcher.on('error', () => { stopLightWatcher(root); void startPollingWatcher(root, policy) })
+  } catch { void startPollingWatcher(root, policy) }
+}
+const diskMatchesGeneration = (root, policy) => {
+  try {
+    const store = new GraphStore(root)
+    const generation = store.readGeneration()
+    const files = policy.scan()
+    const indexed = Object.keys(generation.sources ?? {}).sort()
+    return generation.controlHashes && JSON.stringify(generation.controlHashes) === JSON.stringify(controlFileHashes(root)) && files.length === indexed.length && files.every((file, index) => file === indexed[index] && fileContentHash(path.join(root, file)) === generation.sources[file])
+  } catch { return false }
+}
+async function queryEngineFor(root) {
+  let engine = queryEngines.get(root)
+  if (!engine) {
+    const policy = createSourcePolicy(root)
+    engine = new DaemonQueryEngine(root, {
+      engineFactory: async () => (await runtimeFor(root)).engine,
+      beforeQuery: async () => { const promotion = runtimes.get(root); if (promotion) await promotion },
+      disposeFallback: false,
+    })
+    queryEngines.set(root, engine)
+    watchForChanges(root)
+    const freshness = Promise.resolve()
+      .then(async () => { if (!diskMatchesGeneration(root, policy)) await runtimeFor(root) })
+      .catch(async (error) => { queryEngines.delete(root); freshnessChecks.delete(root); await engine.dispose(); throw error })
+    freshnessChecks.set(root, freshness)
+  }
+  await freshnessChecks.get(root)
+  const promotion = runtimes.get(root)
+  if (promotion) await promotion
+  return engine
 }
 
 const MAX_MCP_RESULTS = 2_000
@@ -155,19 +236,18 @@ const cappedRows = async (iterator, signal) => {
 }
 const loc = (graph, id) => { const symbol = graph.symbols.find((item) => item.id === id); return symbol ? `${symbol.file}:${symbol.line}` : id }
 call.codegraph_refs = async (a, { signal } = {}) => {
-  const runtime = await runtimeFor(resolveRoot(a)); const target = qualifiedQuery(required(a, 'symbol'))
-  const generation = runtime.engine.readGeneration().generation
-  const graph = await runtime.engine.snapshotComplete(generation, { signal }); const rows = await cappedRows(runtime.engine.query({ type: 'refs', generation, ...target }, { signal }), signal)
-  return rows.map((edge) => `${loc(graph, edge.from)} -> ${loc(graph, edge.to)}${edge.call ? ' call' : ''}`).join('\n') || '(no results)'
+  const engine = await queryEngineFor(resolveRoot(a)); const target = qualifiedQuery(required(a, 'symbol'))
+  const pinned = await engine.pinQuery({ type: 'refs', edgeCoverage: 'complete', resolved: true, ...target }, { signal }); const rows = await cappedRows(pinned.rows, signal)
+  return rows.map((edge) => `${edge.fromSymbol.file}:${edge.fromSymbol.line} -> ${edge.toSymbol.file}:${edge.toSymbol.line}${edge.call ? ' call' : ''}`).join('\n') || '(no results)'
 }
 call.codegraph_deps = async (a, { signal } = {}) => {
-  const runtime = await runtimeFor(resolveRoot(a)); const target = required(a, 'target')
-  const request = { type: 'deps', ...qualifiedQuery(target) }
-  const pinned = runtime.engine.pinQuery(request, { signal }); const { graph, metadata } = pinned; const rows = await cappedRows(pinned.rows, signal)
-  return `${JSON.stringify(metadata)}\n${rows.map((edge) => `${loc(graph, edge.from)} -> ${loc(graph, edge.to)}${edge.call ? ' call' : ''}`).join('\n') || '(no results)'}`
+  const engine = await queryEngineFor(resolveRoot(a)); const target = required(a, 'target')
+  const request = { type: 'deps', resolved: true, ...qualifiedQuery(target) }
+  const pinned = await engine.pinQuery(request, { signal }); const { metadata } = pinned; const rows = await cappedRows(pinned.rows, signal)
+  return `${JSON.stringify(metadata)}\n${rows.map((edge) => `${edge.fromSymbol.file}:${edge.fromSymbol.line} -> ${edge.toSymbol.file}:${edge.toSymbol.line}${edge.call ? ' call' : ''}`).join('\n') || '(no results)'}`
 }
 call.codegraph_callers = async (a, { signal } = {}) => {
-  const runtime = await runtimeFor(resolveRoot(a)); const graph = runtime.engine.snapshot(); const depth = Math.max(0, Number(a.depth ?? 3))
+  const engine = await queryEngineFor(resolveRoot(a)); const pinned = await engine.pinQuery({ type: 'graph', edgeCoverage: 'calls', limit: 1 }, { signal }); const graph = pinned.graph; const depth = Math.max(0, Number(a.depth ?? 3))
   const target = qualifiedQuery(required(a, 'symbol'))
   const roots = graph.symbols.filter((symbol) => (!target.name || symbol.name === target.name) && (!target.file || symbol.file === target.file || symbol.file.endsWith(target.file))); const reverse = new Map()
   for (const edge of graph.edges) if (edge.call) { if (!reverse.has(edge.to)) reverse.set(edge.to, new Set()); reverse.get(edge.to).add(edge.from) }
@@ -181,7 +261,7 @@ call.codegraph_callers = async (a, { signal } = {}) => {
   return output.join('\n') || '(no results)'
 }
 call.codegraph_dead = async (a, { signal } = {}) => {
-  const runtime = await runtimeFor(resolveRoot(a)); const graph = await runtime.engine.snapshotComplete(undefined, { signal }); const referenced = new Set(graph.edges.map((edge) => edge.to))
+  const engine = await queryEngineFor(resolveRoot(a)); const pinned = await engine.pinQuery({ type: 'graph', edgeCoverage: 'complete', limit: 1 }, { signal }); const graph = pinned.graph; const referenced = new Set(graph.edges.map((edge) => edge.to))
   const rows = graph.symbols.filter((symbol) => symbol.exported && !referenced.has(symbol.id) && (!a?.prefix || symbol.file.startsWith(a.prefix)))
   if (signal?.aborted) throw new Error('request cancelled')
   if (rows.length > MAX_MCP_RESULTS) throw new Error(`result exceeds MCP cap of ${MAX_MCP_RESULTS}; pass a path prefix`)
@@ -194,11 +274,11 @@ call.codegraph_refresh = async (a) => {
   return JSON.stringify(await runtime.engine.reconcile())
 }
 call.codegraph_query = async (a, { signal } = {}) => {
-  const runtime = await runtimeFor(resolveRoot(a))
+  const engine = await queryEngineFor(resolveRoot(a))
   if (!a?.query || typeof a.query !== 'object') throw new Error('missing required argument "query"')
   const consistency = a.query.generation ? 'validated' : (a.query.consistency ?? 'validated')
   if (a.query.generation && a.query.consistency === 'latest') throw new Error('explicit generation is validated and cannot be combined with latest consistency')
-  const pinned = runtime.engine.pinQuery({ ...a.query, consistency, limit: Math.min(a.query.limit ?? MAX_MCP_RESULTS, MAX_MCP_RESULTS) }, { signal })
+  const pinned = await engine.pinQuery({ ...a.query, consistency, limit: Math.min(a.query.limit ?? MAX_MCP_RESULTS, MAX_MCP_RESULTS) }, { signal })
   const rows = await cappedRows(pinned.rows, signal)
   const { freshness, coverage, revision, validatedGeneration } = pinned.metadata
   const metadata = { freshness, coverage, revision, validatedGeneration }
@@ -263,7 +343,9 @@ process.stdin.on('data', (chunk) => {
   }
 })
 process.stdin.on('end', async () => {
+  for (const root of lightWatchers.keys()) stopLightWatcher(root)
   await Promise.allSettled([...runtimes.values()].map(async (runtime) => (await runtime).close()))
+  await Promise.allSettled([...queryEngines.values()].map((engine) => engine.dispose()))
 })
 
-if (DEFAULT_ROOT) runtimeFor(DEFAULT_ROOT).catch((error) => process.stderr.write(`codegraph-mcp startup: ${error.message}\n`))
+if (DEFAULT_ROOT) queryEngineFor(DEFAULT_ROOT).catch((error) => process.stderr.write(`codegraph-mcp startup: ${error.message}\n`))
