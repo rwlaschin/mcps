@@ -6,7 +6,7 @@ import path from 'node:path'
 import net from 'node:net'
 import { once } from 'node:events'
 import { performance } from 'node:perf_hooks'
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { DaemonQueryEngine } from '../daemon-query-engine.mjs'
 import { QueryDaemon, daemonSocketPath } from '../query-daemon.mjs'
 
@@ -295,7 +295,7 @@ process.stdout.write(JSON.stringify(rows))
   assert.deepEqual({ status: result.status, stdout: result.stdout, forbiddenLoads: result.stderr.split('\n').filter((line) => line.includes('/tool-engine.mjs') || line.includes('/parser.mjs') || line.includes('/typescript') || line.includes('/ts-morph')) }, { status: 0, stdout: '[{"name":"primed"}]', forbiddenLoads: [] })
 })
 
-test('architecture boundary: a primed MCP deps call returns mapped results without loading the heavy engine parser TypeScript or ts-morph', () => {
+test('architecture boundary: an explicit-root primed MCP reply is unchanged before semantic hydration starts', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-mcp-mapped-deps-'))
   const loaderRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-mcp-mapped-loader-'))
   temporaryRoots.add(root)
@@ -306,24 +306,40 @@ test('architecture boundary: a primed MCP deps call returns mapped results witho
   const indexed = spawnSync(process.execPath, ['cli.mjs', 'index', '--root', root], { cwd: path.resolve(import.meta.dirname, '..'), encoding: 'utf8' })
   const primed = spawnSync(process.execPath, ['tool.mjs', 'query', JSON.stringify({ type: 'deps', name: 'caller', limit: 200 }), '--root', root], { cwd: path.resolve(import.meta.dirname, '..'), encoding: 'utf8' })
   const loaderPath = path.join(loaderRoot, 'record-loader.mjs')
+  const entryPath = path.join(loaderRoot, 'ordered-mcp.mjs')
   fs.writeFileSync(loaderPath, `
 export async function load(url, context, nextLoad) {
-  if (url.includes('/tool-engine.mjs') || url.includes('/parser.mjs') || url.includes('/typescript') || url.includes('/ts-morph')) process.stderr.write('FORBIDDEN ' + url + '\\n')
-  return nextLoad(url, context)
+  if (!url.endsWith('/mcp-runtime.mjs')) return nextLoad(url, context)
+  return { format: 'module', shortCircuit: true, source: \`
+    export class McpProjectRuntime {
+      constructor() { this.engine = {} }
+      async start() { process.stderr.write('HYDRATION_AFTER_REPLY ' + Boolean(globalThis.__mappedReplyWritten) + '\\\\n'); return this }
+      async close() {}
+    }
+  \` }
 }
+`)
+  fs.writeFileSync(entryPath, `
+const write = process.stdout.write.bind(process.stdout)
+process.stdout.write = (chunk, ...args) => {
+  if (String(chunk).includes('"id":1')) globalThis.__mappedReplyWritten = true
+  return write(chunk, ...args)
+}
+await import(${JSON.stringify(path.resolve(import.meta.dirname, '..', 'mcp-server.mjs'))})
 `)
   const request = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'codegraph_deps', arguments: { root, target: 'caller' } } }) + '\n'
 
-  const result = spawnSync(process.execPath, ['--experimental-loader', loaderPath, 'mcp.mjs'], { cwd: path.resolve(import.meta.dirname, '..'), encoding: 'utf8', input: request, timeout: 10_000 })
+  const result = spawnSync(process.execPath, ['--no-warnings', '--experimental-loader', loaderPath, entryPath], { cwd: path.resolve(import.meta.dirname, '..'), encoding: 'utf8', input: request, timeout: 10_000 })
   const response = JSON.parse(result.stdout.trim())
+  const expectedText = `${JSON.stringify({ revision: null, freshness: 'validated', coverage: 'calls', validatedGeneration: fs.readFileSync(path.join(root, '.codegraph', 'CURRENT'), 'utf8').trim() })}\nsrc/calls.ts:2 -> src/calls.ts:1 call`
 
   assert.deepEqual(
-    { indexedStatus: indexed.status, primedStatus: primed.status, status: result.status, isError: response.result?.isError, hasMappedCall: response.result?.content?.[0]?.text.includes('src/calls.ts:2 -> src/calls.ts:1 call'), forbiddenLoads: result.stderr.split('\n').filter((line) => line.startsWith('FORBIDDEN ')) },
-    { indexedStatus: 0, primedStatus: 0, status: 0, isError: undefined, hasMappedCall: true, forbiddenLoads: [] },
+    { indexedStatus: indexed.status, primedStatus: primed.status, status: result.status, isError: response.result?.isError, text: response.result?.content?.[0]?.text, hydrationOrder: result.stderr.trim() },
+    { indexedStatus: 0, primedStatus: 0, status: 0, isError: undefined, text: expectedText, hydrationOrder: 'HYDRATION_AFTER_REPLY true' },
   )
 })
 
-test('architecture boundary: configured CODEGRAPH_ROOT serves a primed MCP deps call without loading heavy modules', () => {
+test('architecture boundary: a CODEGRAPH_ROOT primed MCP reply is unchanged before semantic hydration starts', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-mcp-default-root-'))
   const loaderRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-mcp-default-loader-'))
   temporaryRoots.add(root)
@@ -334,24 +350,129 @@ test('architecture boundary: configured CODEGRAPH_ROOT serves a primed MCP deps 
   const indexed = spawnSync(process.execPath, ['cli.mjs', 'index', '--root', root], { cwd: path.resolve(import.meta.dirname, '..'), encoding: 'utf8' })
   const primed = spawnSync(process.execPath, ['tool.mjs', 'query', JSON.stringify({ type: 'deps', name: 'caller', limit: 200 }), '--root', root], { cwd: path.resolve(import.meta.dirname, '..'), encoding: 'utf8' })
   const loaderPath = path.join(loaderRoot, 'record-loader.mjs')
+  const entryPath = path.join(loaderRoot, 'ordered-mcp.mjs')
   fs.writeFileSync(loaderPath, `
 export async function load(url, context, nextLoad) {
-  if (url.includes('/tool-engine.mjs') || url.includes('/parser.mjs') || url.includes('/typescript') || url.includes('/ts-morph')) process.stderr.write('FORBIDDEN ' + url + '\\n')
-  return nextLoad(url, context)
+  if (!url.endsWith('/mcp-runtime.mjs')) return nextLoad(url, context)
+  return { format: 'module', shortCircuit: true, source: \`
+    export class McpProjectRuntime {
+      constructor() { this.engine = {} }
+      async start() { process.stderr.write('HYDRATION_AFTER_REPLY ' + Boolean(globalThis.__mappedReplyWritten) + '\\\\n'); return this }
+      async close() {}
+    }
+  \` }
 }
+`)
+  fs.writeFileSync(entryPath, `
+const write = process.stdout.write.bind(process.stdout)
+process.stdout.write = (chunk, ...args) => {
+  if (String(chunk).includes('"id":1')) globalThis.__mappedReplyWritten = true
+  return write(chunk, ...args)
+}
+await import(${JSON.stringify(path.resolve(import.meta.dirname, '..', 'mcp-server.mjs'))})
 `)
   const request = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'codegraph_deps', arguments: { target: 'caller' } } }) + '\n'
 
-  const result = spawnSync(process.execPath, ['--experimental-loader', loaderPath, 'mcp.mjs'], { cwd: path.resolve(import.meta.dirname, '..'), encoding: 'utf8', input: request, timeout: 10_000, env: { ...process.env, CODEGRAPH_ROOT: root } })
+  const result = spawnSync(process.execPath, ['--no-warnings', '--experimental-loader', loaderPath, entryPath], { cwd: path.resolve(import.meta.dirname, '..'), encoding: 'utf8', input: request, timeout: 10_000, env: { ...process.env, CODEGRAPH_ROOT: root } })
   const response = JSON.parse(result.stdout.trim())
+  const expectedText = `${JSON.stringify({ revision: null, freshness: 'validated', coverage: 'calls', validatedGeneration: fs.readFileSync(path.join(root, '.codegraph', 'CURRENT'), 'utf8').trim() })}\nsrc/calls.ts:2 -> src/calls.ts:1 call`
 
   assert.deepEqual(
-    { indexedStatus: indexed.status, primedStatus: primed.status, status: result.status, isError: response.result?.isError, hasMappedCall: response.result?.content?.[0]?.text.includes('src/calls.ts:2 -> src/calls.ts:1 call'), forbiddenLoads: result.stderr.split('\n').filter((line) => line.startsWith('FORBIDDEN ')) },
-    { indexedStatus: 0, primedStatus: 0, status: 0, isError: undefined, hasMappedCall: true, forbiddenLoads: [] },
+    { indexedStatus: indexed.status, primedStatus: primed.status, status: result.status, isError: response.result?.isError, text: response.result?.content?.[0]?.text, hydrationOrder: result.stderr.trim() },
+    { indexedStatus: 0, primedStatus: 0, status: 0, isError: undefined, text: expectedText, hydrationOrder: 'HYDRATION_AFTER_REPLY true' },
   )
 })
 
-test('domain analysis: a source changed before the first MCP read never returns the stale primed dependency', () => {
+test('equivalence partitioning: codegraph_query diagnostics adds a nonnegative server timing receipt without forwarding the control key', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-mcp-query-diagnostics-'))
+  const loaderRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-mcp-query-diagnostics-loader-'))
+  temporaryRoots.add(root)
+  temporaryRoots.add(loaderRoot)
+  const loaderPath = path.join(loaderRoot, 'query-diagnostics-loader.mjs')
+  fs.writeFileSync(loaderPath, `
+export async function load(url, context, nextLoad) {
+  if (url.endsWith('/source-policy.mjs')) return { format: 'module', shortCircuit: true, source: \`
+    export const controlFileHashes = () => ({})
+    export const fileContentHash = () => ''
+    export const createSourcePolicy = () => ({ scan: () => [], normalize: () => '', acceptWatchPath: () => false, isSourceRelative: () => false })
+  \` }
+  if (url.endsWith('/store.mjs')) return { format: 'module', shortCircuit: true, source: \`
+    export class GraphStore { readGeneration() { return { sources: {}, controlHashes: {} } } }
+  \` }
+  if (url.endsWith('/daemon-query-engine.mjs')) return { format: 'module', shortCircuit: true, source: \`
+    export class DaemonQueryEngine {
+      constructor() {}
+      async pinQuery(request) {
+        if ('diagnostics' in request) throw new Error('diagnostics leaked into engine query')
+        return {
+          metadata: { freshness: 'validated', coverage: 'calls', revision: null, validatedGeneration: 'generation-1' },
+          rows: (async function* () { yield { name: 'value' } })(),
+        }
+      }
+      async dispose() {}
+    }
+  \` }
+  return nextLoad(url, context)
+}
+`)
+  const request = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'codegraph_query', arguments: { root, query: { type: 'symbols', name: 'value', diagnostics: true } } } }) + '\n'
+
+  const result = spawnSync(process.execPath, ['--no-warnings', '--experimental-loader', loaderPath, 'mcp-server.mjs'], { cwd: path.resolve(import.meta.dirname, '..'), encoding: 'utf8', input: request, timeout: 10_000 })
+  const response = JSON.parse(result.stdout.trim())
+  const [metadataLine, row] = response.result?.content?.[0]?.text.split('\n') ?? []
+  const metadata = JSON.parse(metadataLine)
+
+  assert.deepEqual(
+    { status: result.status, isError: response.result?.isError, metadata: { freshness: metadata.freshness, coverage: metadata.coverage, revision: metadata.revision, validatedGeneration: metadata.validatedGeneration, serverPidIsPositiveInteger: Number.isInteger(metadata.serverPid) && metadata.serverPid > 0, serverDurationIsNonnegative: Number.isFinite(metadata.serverDurationMs) && metadata.serverDurationMs >= 0 }, row },
+    { status: 0, isError: undefined, metadata: { freshness: 'validated', coverage: 'calls', revision: null, validatedGeneration: 'generation-1', serverPidIsPositiveInteger: true, serverDurationIsNonnegative: true }, row: '{"name":"value"}' },
+  )
+})
+
+test('equivalence partitioning: codegraph_query without diagnostics preserves the existing response bytes', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-mcp-query-no-diagnostics-'))
+  const loaderRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-mcp-query-no-diagnostics-loader-'))
+  temporaryRoots.add(root)
+  temporaryRoots.add(loaderRoot)
+  const loaderPath = path.join(loaderRoot, 'query-no-diagnostics-loader.mjs')
+  fs.writeFileSync(loaderPath, `
+export async function load(url, context, nextLoad) {
+  if (url.endsWith('/source-policy.mjs')) return { format: 'module', shortCircuit: true, source: \`
+    export const controlFileHashes = () => ({})
+    export const fileContentHash = () => ''
+    export const createSourcePolicy = () => ({ scan: () => [], normalize: () => '', acceptWatchPath: () => false, isSourceRelative: () => false })
+  \` }
+  if (url.endsWith('/store.mjs')) return { format: 'module', shortCircuit: true, source: \`
+    export class GraphStore { readGeneration() { return { sources: {}, controlHashes: {} } } }
+  \` }
+  if (url.endsWith('/daemon-query-engine.mjs')) return { format: 'module', shortCircuit: true, source: \`
+    export class DaemonQueryEngine {
+      constructor() {}
+      async pinQuery() {
+        return {
+          metadata: { freshness: 'validated', coverage: 'calls', revision: null, validatedGeneration: 'generation-1' },
+          rows: (async function* () { yield { name: 'value' } })(),
+        }
+      }
+      async dispose() {}
+    }
+  \` }
+  return nextLoad(url, context)
+}
+`)
+  const request = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'codegraph_query', arguments: { root, query: { type: 'symbols', name: 'value' } } } }) + '\n'
+
+  const result = spawnSync(process.execPath, ['--no-warnings', '--experimental-loader', loaderPath, 'mcp-server.mjs'], { cwd: path.resolve(import.meta.dirname, '..'), encoding: 'utf8', input: request, timeout: 10_000 })
+  const response = JSON.parse(result.stdout.trim())
+  const text = response.result?.content?.[0]?.text
+  const expectedText = '{"freshness":"validated","coverage":"calls","revision":null,"validatedGeneration":"generation-1"}\n{"name":"value"}'
+
+  assert.deepEqual(
+    { status: result.status, isError: response.result?.isError, text },
+    { status: 0, isError: undefined, text: expectedText },
+  )
+})
+
+test('domain analysis: a source changed before the first MCP read labels the cached dependency with its validated generation', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-mcp-stale-before-read-'))
   temporaryRoots.add(root)
   fs.mkdirSync(path.join(root, 'src'))
@@ -359,21 +480,23 @@ test('domain analysis: a source changed before the first MCP read never returns 
   fs.writeFileSync(path.join(root, 'src', 'calls.ts'), 'export function target() { return 1 }\nexport function caller() { return target() }\n')
   const indexed = spawnSync(process.execPath, ['cli.mjs', 'index', '--root', root], { cwd: path.resolve(import.meta.dirname, '..'), encoding: 'utf8' })
   const primed = spawnSync(process.execPath, ['tool.mjs', 'query', JSON.stringify({ type: 'deps', name: 'caller', limit: 200 }), '--root', root], { cwd: path.resolve(import.meta.dirname, '..'), encoding: 'utf8' })
+  const validatedGeneration = fs.readFileSync(path.join(root, '.codegraph', 'CURRENT'), 'utf8').trim()
   fs.writeFileSync(path.join(root, 'src', 'calls.ts'), 'export function target() { return 1 }\nexport function caller() { return 0 }\n')
   const request = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'codegraph_deps', arguments: { root, target: 'caller' } } }) + '\n'
 
   const result = spawnSync(process.execPath, ['mcp.mjs'], { cwd: path.resolve(import.meta.dirname, '..'), encoding: 'utf8', input: request, timeout: 10_000 })
   const response = JSON.parse(result.stdout.trim())
+  const [metadata, row] = response.result?.content?.[0]?.text.split('\n') ?? []
 
   assert.deepEqual(
-    { indexedStatus: indexed.status, primedStatus: primed.status, status: result.status, isError: response.result?.isError, text: response.result?.content?.[0]?.text.split('\n').at(-1) },
-    { indexedStatus: 0, primedStatus: 0, status: 0, isError: undefined, text: '(no results)' },
+    { indexedStatus: indexed.status, primedStatus: primed.status, status: result.status, isError: response.result?.isError, metadata: JSON.parse(metadata), row },
+    { indexedStatus: 0, primedStatus: 0, status: 0, isError: undefined, metadata: { revision: null, freshness: 'validated', coverage: 'calls', validatedGeneration }, row: 'src/calls.ts:2 -> src/calls.ts:1 call' },
   )
 })
 
-test('domain analysis: tsconfig content changed before the first MCP read forces heavy reconciliation instead of trusting mmap', () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-mcp-stale-config-'))
-  const loaderRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-mcp-config-loader-'))
+test('error guessing: a stale primed MCP query returns the validated cache while background promotion is stalled', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-mcp-stalled-promotion-'))
+  const loaderRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-mcp-stalled-loader-'))
   temporaryRoots.add(root)
   temporaryRoots.add(loaderRoot)
   fs.mkdirSync(path.join(root, 'src'))
@@ -381,22 +504,139 @@ test('domain analysis: tsconfig content changed before the first MCP read forces
   fs.writeFileSync(path.join(root, 'src', 'calls.ts'), 'export function target() { return 1 }\nexport function caller() { return target() }\n')
   const indexed = spawnSync(process.execPath, ['cli.mjs', 'index', '--root', root], { cwd: path.resolve(import.meta.dirname, '..'), encoding: 'utf8' })
   const primed = spawnSync(process.execPath, ['tool.mjs', 'query', JSON.stringify({ type: 'deps', name: 'caller', limit: 200 }), '--root', root], { cwd: path.resolve(import.meta.dirname, '..'), encoding: 'utf8' })
-  fs.writeFileSync(path.join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { module: 'ESNext', target: 'ES2022' }, include: ['src'] }))
-  const loaderPath = path.join(loaderRoot, 'record-loader.mjs')
+  const validatedGeneration = fs.readFileSync(path.join(root, '.codegraph', 'CURRENT'), 'utf8').trim()
+  fs.writeFileSync(path.join(root, 'src', 'calls.ts'), 'export function target() { return 1 }\nexport function caller() { return 0 }\n')
+  const loaderPath = path.join(loaderRoot, 'stall-runtime-loader.mjs')
   fs.writeFileSync(loaderPath, `
 export async function load(url, context, nextLoad) {
-  if (url.includes('/tool-engine.mjs')) process.stderr.write('HEAVY ' + url + '\\n')
-  return nextLoad(url, context)
+  if (!url.endsWith('/mcp-runtime.mjs')) return nextLoad(url, context)
+  return { format: 'module', shortCircuit: true, source: \`
+    export class McpProjectRuntime {
+      constructor() { this.engine = {} }
+      async start() { process.stderr.write('PROMOTION_STARTED\\\\n'); await new Promise(() => {}) }
+      async close() {}
+    }
+  \` }
 }
 `)
+  const child = spawn(process.execPath, ['--no-warnings', '--experimental-loader', loaderPath, 'mcp-server.mjs'], {
+    cwd: path.resolve(import.meta.dirname, '..'),
+    env: { ...process.env, CODEGRAPH_ROOT: root },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  })
+  const request = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'codegraph_deps', arguments: { root, target: 'caller' } } }) + '\n'
+  let stdout = ''
+  child.stdout.setEncoding('utf8')
+  child.stdout.on('data', (chunk) => { stdout += chunk })
+  const responseData = once(child.stdout, 'data')
+
+  try {
+    child.stdin.write(request)
+    const [promotion] = await Promise.race([
+      once(child.stderr, 'data'),
+      new Promise((resolve) => setTimeout(() => resolve(['promotion did not start']), 2_000)),
+    ])
+    const response = await Promise.race([
+      responseData.then(() => JSON.parse(stdout.trim())),
+      new Promise((resolve) => setTimeout(() => resolve('blocked'), 250)),
+    ])
+    const text = response === 'blocked' ? '' : response.result?.content?.[0]?.text
+    const [metadata, row] = text ? text.split('\n') : ['', '']
+
+    assert.deepEqual(
+      { indexedStatus: indexed.status, primedStatus: primed.status, promotion: String(promotion).trim(), response: response === 'blocked' ? 'blocked' : { metadata: JSON.parse(metadata), row } },
+      { indexedStatus: 0, primedStatus: 0, promotion: 'PROMOTION_STARTED', response: { metadata: { revision: null, freshness: 'validated', coverage: 'calls', validatedGeneration }, row: 'src/calls.ts:2 -> src/calls.ts:1 call' } },
+    )
+  } finally {
+    child.kill('SIGKILL')
+    await once(child, 'exit').catch(() => {})
+  }
+})
+
+test('combinatorial concurrency: mapped MCP queries return unchanged while one semantic runtime hydrates in the background', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-mcp-background-hydration-'))
+  const loaderRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-mcp-background-hydration-loader-'))
+  temporaryRoots.add(root)
+  temporaryRoots.add(loaderRoot)
+  fs.mkdirSync(path.join(root, 'src'))
+  fs.writeFileSync(path.join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { module: 'ESNext' }, include: ['src'] }))
+  fs.writeFileSync(path.join(root, 'src', 'calls.ts'), 'export function target() { return 1 }\nexport function caller() { return target() }\n')
+  const indexed = spawnSync(process.execPath, ['cli.mjs', 'index', '--root', root], { cwd: path.resolve(import.meta.dirname, '..'), encoding: 'utf8' })
+  const primed = spawnSync(process.execPath, ['tool.mjs', 'query', JSON.stringify({ type: 'deps', name: 'caller', limit: 200 }), '--root', root], { cwd: path.resolve(import.meta.dirname, '..'), encoding: 'utf8' })
+  const validatedGeneration = fs.readFileSync(path.join(root, '.codegraph', 'CURRENT'), 'utf8').trim()
+  const loaderPath = path.join(loaderRoot, 'stall-runtime-loader.mjs')
+  fs.writeFileSync(loaderPath, `
+export async function load(url, context, nextLoad) {
+  if (!url.endsWith('/mcp-runtime.mjs')) return nextLoad(url, context)
+  return { format: 'module', shortCircuit: true, source: \`
+    export class McpProjectRuntime {
+      constructor() { process.stderr.write('RUNTIME_CREATED\\\\n'); this.engine = {} }
+      async start() { process.stderr.write('HYDRATION_STARTED\\\\n'); await new Promise(() => {}) }
+      async close() {}
+    }
+  \` }
+}
+`)
+  const child = spawn(process.execPath, ['--no-warnings', '--experimental-loader', loaderPath, 'mcp-server.mjs'], {
+    cwd: path.resolve(import.meta.dirname, '..'),
+    stdio: ['pipe', 'pipe', 'pipe'],
+  })
+  let stdout = ''
+  let stderr = ''
+  child.stdout.setEncoding('utf8')
+  child.stderr.setEncoding('utf8')
+  child.stdout.on('data', (chunk) => { stdout += chunk })
+  child.stderr.on('data', (chunk) => { stderr += chunk })
+  const firstRequest = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'codegraph_deps', arguments: { root, target: 'caller' } } }) + '\n'
+  const secondRequest = JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'codegraph_deps', arguments: { root, target: 'caller' } } }) + '\n'
+
+  try {
+    child.stdin.write(firstRequest + secondRequest)
+    let observationFinished = false
+    const observed = await Promise.race([
+      new Promise((resolve) => {
+        const inspect = () => {
+          if (observationFinished) return
+          const responses = stdout.trim().split('\n').filter(Boolean)
+          if (responses.length === 2 && stderr.includes('HYDRATION_STARTED')) { observationFinished = true; resolve({ responses, stderr }) }
+          else setImmediate(inspect)
+        }
+        inspect()
+      }),
+      new Promise((resolve) => setTimeout(() => { observationFinished = true; resolve({ responses: stdout.trim().split('\n').filter(Boolean), stderr }) }, 500)),
+    ])
+    const responses = observed.responses.map((line) => JSON.parse(line))
+    const output = `${JSON.stringify({ revision: null, freshness: 'validated', coverage: 'calls', validatedGeneration })}\nsrc/calls.ts:2 -> src/calls.ts:1 call`
+
+    assert.deepEqual(
+      { indexedStatus: indexed.status, primedStatus: primed.status, runtimeCreations: observed.stderr.match(/RUNTIME_CREATED/g)?.length ?? 0, hydrationStarted: observed.stderr.includes('HYDRATION_STARTED'), responses: responses.map((response) => ({ id: response.id, isError: response.result?.isError, text: response.result?.content?.[0]?.text })) },
+      { indexedStatus: 0, primedStatus: 0, runtimeCreations: 1, hydrationStarted: true, responses: [{ id: 1, isError: undefined, text: output }, { id: 2, isError: undefined, text: output }] },
+    )
+  } finally {
+    child.kill('SIGKILL')
+    await once(child, 'exit').catch(() => {})
+  }
+})
+
+test('domain analysis: tsconfig content changed before the first MCP read labels the cached result with its validated generation', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-mcp-stale-config-'))
+  temporaryRoots.add(root)
+  fs.mkdirSync(path.join(root, 'src'))
+  fs.writeFileSync(path.join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { module: 'ESNext' }, include: ['src'] }))
+  fs.writeFileSync(path.join(root, 'src', 'calls.ts'), 'export function target() { return 1 }\nexport function caller() { return target() }\n')
+  const indexed = spawnSync(process.execPath, ['cli.mjs', 'index', '--root', root], { cwd: path.resolve(import.meta.dirname, '..'), encoding: 'utf8' })
+  const primed = spawnSync(process.execPath, ['tool.mjs', 'query', JSON.stringify({ type: 'deps', name: 'caller', limit: 200 }), '--root', root], { cwd: path.resolve(import.meta.dirname, '..'), encoding: 'utf8' })
+  const validatedGeneration = fs.readFileSync(path.join(root, '.codegraph', 'CURRENT'), 'utf8').trim()
+  fs.writeFileSync(path.join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { module: 'ESNext', target: 'ES2022' }, include: ['src'] }))
   const request = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'codegraph_deps', arguments: { root, target: 'caller' } } }) + '\n'
 
-  const result = spawnSync(process.execPath, ['--experimental-loader', loaderPath, 'mcp.mjs'], { cwd: path.resolve(import.meta.dirname, '..'), encoding: 'utf8', input: request, timeout: 10_000 })
+  const result = spawnSync(process.execPath, ['mcp.mjs'], { cwd: path.resolve(import.meta.dirname, '..'), encoding: 'utf8', input: request, timeout: 10_000 })
   const response = JSON.parse(result.stdout.trim())
+  const [metadata, row] = response.result?.content?.[0]?.text.split('\n') ?? []
 
   assert.deepEqual(
-    { indexedStatus: indexed.status, primedStatus: primed.status, status: result.status, isError: response.result?.isError, hasMappedCall: response.result?.content?.[0]?.text.includes('src/calls.ts:2 -> src/calls.ts:1 call'), loadedHeavyEngine: result.stderr.split('\n').some((line) => line.startsWith('HEAVY ')) },
-    { indexedStatus: 0, primedStatus: 0, status: 0, isError: undefined, hasMappedCall: true, loadedHeavyEngine: true },
+    { indexedStatus: indexed.status, primedStatus: primed.status, status: result.status, isError: response.result?.isError, metadata: JSON.parse(metadata), row },
+    { indexedStatus: 0, primedStatus: 0, status: 0, isError: undefined, metadata: { revision: null, freshness: 'validated', coverage: 'calls', validatedGeneration }, row: 'src/calls.ts:2 -> src/calls.ts:1 call' },
   )
 })
 

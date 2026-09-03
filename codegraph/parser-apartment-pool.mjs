@@ -6,10 +6,37 @@ import { parseFile } from './incremental-resolver.mjs'
 
 const DEFAULT_TIMEOUT_MS = 30_000
 
+// availableParallelism() reports the machine, not what is free: it is per-pool, so N pools each
+// claim every core and oversubscribe by N. CODEGRAPH_PARSER_WORKERS overrides it for the cases a
+// process cannot see — a second test runner, or a CI container whose quota is below the host.
+const defaultWorkerCount = () => {
+  const configured = Number(process.env.CODEGRAPH_PARSER_WORKERS)
+  return Number.isInteger(configured) && configured >= 0 ? configured : Math.max(0, availableParallelism() - 1)
+}
+
 const workerCountOption = (value) => {
-  const count = value === undefined ? Math.max(0, availableParallelism() - 1) : value
+  const count = value === undefined ? defaultWorkerCount() : value
   if (!Number.isFinite(count) || !Number.isInteger(count) || count < 0) throw new TypeError('workerCount must be a finite non-negative integer')
   return count
+}
+
+// Threads are shared across every live pool in this process, so two roots split one budget rather
+// than claiming a full one each. Pools allocate lazily, so an idle pool holds nothing.
+// Every live pool is owed one apartment it can always have, so growth may only spend what is left
+// after those reservations. Without that a pool created early spends the whole budget and every
+// later pool has to overdraw it.
+const threadBudget = { limit: null, used: 0, unserved: 0 }
+const budgetLimit = () => (threadBudget.limit ??= Math.max(1, defaultWorkerCount()))
+const registerPool = () => { budgetLimit(); threadBudget.unserved += 1 }
+const takeFirstThread = () => { threadBudget.unserved -= 1; threadBudget.used += 1 }
+const takeThread = () => {
+  if (threadBudget.used + threadBudget.unserved >= budgetLimit()) return false
+  threadBudget.used += 1
+  return true
+}
+const releaseThread = (count, served) => {
+  threadBudget.used = Math.max(0, threadBudget.used - count)
+  if (!served) threadBudget.unserved = Math.max(0, threadBudget.unserved - 1)
 }
 
 const normalizeRelativePath = (root, value) => {
@@ -26,10 +53,17 @@ export class ParserApartmentPool {
     this.workerFactory = options.workerFactory ?? ((url, workerOptions) => new Worker(url, workerOptions))
     this.latestRevisionByFile = new Map(); this.affinityByFile = new Map(); this.nextRequestId = 1; this.closed = false
     this.workers = []
+    this.budgeted = options.workerFactory === undefined
+    if (this.budgeted) registerPool()
   }
 
+  // The budget caps real OS threads; an injected workerFactory makes fakes, which cost nothing and
+  // whose counts tests assert on exactly. The first apartment is always granted — a pool that can
+  // never make one apartment cannot serve at all.
+  #claimThread() { return !this.budgeted || takeThread() }
+
   #ensureWorkers() {
-    if (this.workers.length === 0 && this.workerCount > 0) this.workers.push(this.#newApartment(0))
+    if (this.workers.length === 0 && this.workerCount > 0) { if (this.budgeted) takeFirstThread(); this.workers.push(this.#newApartment(0)) }
   }
   #newApartment(index) { const apartment = { index, worker: null, queue: [], active: null, replacing: null, terminated: false, requiresRequestId: false }; this.#installWorker(apartment); return apartment }
   #installWorker(apartment) {
@@ -64,7 +98,7 @@ export class ParserApartmentPool {
     let apartment = this.affinityByFile.get(identity)
     if (!apartment) {
       apartment = this.workers.find((candidate) => !candidate.active && !candidate.replacing && candidate.queue.length === 0)
-      if (!apartment && this.workers.length < this.workerCount) { apartment = this.#newApartment(this.workers.length); this.workers.push(apartment) }
+      if (!apartment && this.workers.length < this.workerCount && this.#claimThread()) { apartment = this.#newApartment(this.workers.length); this.workers.push(apartment) }
       if (!apartment) apartment = this.workers.reduce((best, candidate) => candidate.queue.length + (candidate.active ? 1 : 0) < best.queue.length + (best.active ? 1 : 0) ? candidate : best)
       this.affinityByFile.set(identity, apartment)
     }
@@ -110,5 +144,6 @@ export class ParserApartmentPool {
     if (this.closed) return; this.closed = true; const error = new Error('parser apartment pool is disposed')
     for (const apartment of this.workers) { if (apartment.active) { clearTimeout(apartment.active.timer); apartment.active.reject(error); apartment.active = null } for (const work of apartment.queue.splice(0)) work.reject(error) }
     await Promise.allSettled(this.workers.map(async (apartment) => { await apartment.replacing; if (!apartment.terminated && apartment.worker) { apartment.terminated = true; await apartment.worker.terminate() } }))
+    if (this.budgeted) releaseThread(this.workers.length, this.workers.length > 0)
   }
 }

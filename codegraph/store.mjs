@@ -6,6 +6,13 @@ const stable = (value) => JSON.stringify(value)
 const digest = (value) => crypto.createHash('sha256').update(stable(value)).digest('hex')
 const digestSerialized = (value) => crypto.createHash('sha256').update(value).digest('hex')
 
+export const OVERLAY_VERSION = 2
+
+// v2 stores edges per file so a rebuild can reuse unchanged files; consumers still want one flat
+// list, so it is synthesized on read rather than persisted twice. v1 overlays already are flat.
+const hydrateOverlay = (overlay) =>
+  overlay?.version === OVERLAY_VERSION ? { ...overlay, edges: Object.values(overlay.files).flatMap((entry) => entry.edges) } : overlay
+
 export class GraphStore {
   constructor(root, cacheDir = '.codegraph') {
     this.root = root; this.dir = path.join(root, cacheDir)
@@ -40,15 +47,31 @@ export class GraphStore {
   }
   readSource(id) { return fs.readFileSync(path.join(this.sources, id), 'utf8') }
   readOverlay(generation) {
-    try { return JSON.parse(fs.readFileSync(path.join(this.overlays, `${generation}.json`), 'utf8')) } catch (error) {
+    try { return hydrateOverlay(JSON.parse(fs.readFileSync(path.join(this.overlays, `${generation}.json`), 'utf8'))) } catch (error) {
       if (error.code === 'ENOENT') return null
       throw error
     }
   }
+  // Per-file entries from the newest overlay of any generation, as reuse donors. Overlays are
+  // rewritten whole on every generation, so without a donor every rebuild reparses the repo.
+  donorOverlayFiles(exclude) {
+    try {
+      const names = fs.readdirSync(this.overlays).filter((name) => name.endsWith('.json') && name.slice(0, -5) !== exclude)
+        .sort((a, b) => fs.statSync(path.join(this.overlays, b)).mtimeMs - fs.statSync(path.join(this.overlays, a)).mtimeMs)
+      for (const name of names) {
+        const overlay = JSON.parse(fs.readFileSync(path.join(this.overlays, name), 'utf8'))
+        if (overlay.version === OVERLAY_VERSION && overlay.files) return overlay.files
+      }
+    } catch {}
+    return {}
+  }
   writeOverlay(generation, overlay) {
     this.initialize()
     if (overlay.generation !== generation) throw new Error('overlay generation mismatch')
-    this.#atomicWrite(path.join(this.overlays, `${generation}.json`), stable(overlay))
+    // `edges` is derived from `files` on read, and `ordered` describes only the in-memory copy
+    // just built — a hydrated overlay flattens in file order, not edge order.
+    const { edges, ordered, ...persisted } = overlay
+    this.#atomicWrite(path.join(this.overlays, `${generation}.json`), stable(persisted.files ? persisted : overlay))
     return overlay
   }
   publish(manifest) {

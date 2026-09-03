@@ -1,9 +1,17 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
+import crypto from 'node:crypto'
+import os from 'node:os'
 import path from 'node:path'
+import { spawnSync } from 'node:child_process'
 import { performance } from 'node:perf_hooks'
-import { MmapQueryCache } from '../mmap-query-cache.mjs'
+import { pathToFileURL } from 'node:url'
+import { DaemonQueryEngine } from '../daemon-query-engine.mjs'
+import { CodeGraphEngine } from '../tool-engine.mjs'
+import { MmapQueryCache, QUERY_VIEW_CACHE_FILE } from '../mmap-query-cache.mjs'
+import * as queryCacheSchema from '../query-cache-schema.mjs'
+import { nativeMmapAdapter } from '../native/mmap-adapter.mjs'
 
 class FakeMmapAdapter {
   constructor({ basePadding = 0 } = {}) {
@@ -104,6 +112,10 @@ const createCache = (adapter, capacityBytes = 65536) => new MmapQueryCache({
   adapter,
   capacityBytes,
 })
+
+const oldReleaseFixture = path.join(import.meta.dirname, 'fixtures', 'query-view-cache.bin')
+const oldReleaseFixtureSha256 = 'd5c575bb20ab5132f17bec86e64aff12a24dd80185db1377e00b6fc3dfdb7b48'
+const sha256File = (filePath) => crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex')
 
 test('boundary value: the default logical mapping requests a fixed one-gibibyte sparse capacity', () => {
   const requestedCapacities = []
@@ -428,6 +440,157 @@ test('build contract: optional native build declares node-gyp or resolves npm bu
   const buildScript = fs.readFileSync(path.join(import.meta.dirname, '..', 'native', 'build-optional.mjs'), 'utf8')
 
   assert.equal(Boolean(packageJson.devDependencies?.['node-gyp']) || buildScript.includes('npm/node_modules/node-gyp/bin/node-gyp.js'), true)
+})
+
+test('schema boundary: the stable cache filename reaches both query engine runtime paths', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-cache-name-'))
+  const opened = []
+  const originalOpen = nativeMmapAdapter.open
+  nativeMmapAdapter.open = (filePath) => { opened.push(filePath); throw new Error('path observed') }
+  const daemon = new DaemonQueryEngine(root)
+  const engine = new CodeGraphEngine(root, {
+    mmapQueryCache: { adapter: { open: (filePath) => { opened.push(filePath); throw new Error('path observed') } } },
+    validationWorkerFactory: () => ({ dispose: async () => {} }),
+  })
+
+  try {
+    assert.deepEqual({ exportedName: QUERY_VIEW_CACHE_FILE, opened }, {
+      exportedName: 'query-view-cache.bin',
+      opened: [path.join(root, '.codegraph', 'query-view-cache.bin'), path.join(root, '.codegraph', 'query-view-cache.bin')],
+    })
+  } finally {
+    nativeMmapAdapter.open = originalOpen
+    await daemon.dispose()
+    await engine.dispose()
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('equivalence partition: the current reader opens the immutable old-release binary with both calls and complete pages intact', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-old-cache-reader-'))
+  const cacheFile = path.join(root, 'query-view-cache.bin')
+  fs.copyFileSync(oldReleaseFixture, cacheFile)
+  const cache = new MmapQueryCache({ filePath: cacheFile, root: '/workspace/project', adapter: nativeMmapAdapter, capacityBytes: 65536 })
+
+  try {
+    const calls = cache.acquire({ generation: 'old-release-calls', coverage: 'calls' })
+    const complete = cache.acquire({ generation: 'old-release-complete', coverage: 'complete' })
+    const result = {
+      callsGeneration: calls.value.mappedView.generation,
+      callsCoverage: calls.value.mappedView.edgeCoverage,
+      callsRows: calls.value.mappedView.relationships({ name: 'useSettings' }, 'incoming'),
+      completeGeneration: complete.value.mappedView.generation,
+      completeCoverage: complete.value.mappedView.edgeCoverage,
+      completeRows: complete.value.mappedView.relationships({ name: 'saveCampaign' }, 'incoming'),
+      fixtureSha256: sha256File(oldReleaseFixture),
+    }
+    calls.release()
+    complete.release()
+
+    assert.deepEqual(result, {
+      callsGeneration: 'old-release-calls',
+      callsCoverage: 'calls',
+      callsRows: [{ from: 'settings-panel', to: 'use-settings', line: 14, call: true }],
+      completeGeneration: 'old-release-complete',
+      completeCoverage: 'complete',
+      completeRows: [{ from: 'campaign-route', to: 'save-campaign', line: 9, call: true }],
+      fixtureSha256: oldReleaseFixtureSha256,
+    })
+  } finally {
+    cache.dispose()
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('boundary value: an absent mistaken versioned cache returns the stable path without creating either file', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-cache-no-legacy-'))
+
+  try {
+    const prepared = queryCacheSchema.prepareQueryViewCache(root)
+
+    assert.deepEqual({ prepared, files: fs.readdirSync(root) }, { prepared: path.join(root, 'query-view-cache.bin'), files: [] })
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('domain analysis: the mistaken versioned cache is atomically adopted in place without rebuilding or leaving a suffix', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-cache-adopt-'))
+  const versioned = path.join(root, 'query-view-cache-v2.bin')
+  const stable = path.join(root, 'query-view-cache.bin')
+  fs.copyFileSync(oldReleaseFixture, versioned)
+  const originalInode = fs.statSync(versioned).ino
+
+  try {
+    const prepared = queryCacheSchema.prepareQueryViewCache(root)
+
+    assert.deepEqual({
+      prepared,
+      files: fs.readdirSync(root),
+      inodePreserved: fs.statSync(stable).ino === originalInode,
+      bytesPreserved: sha256File(stable),
+      fixturePreserved: sha256File(oldReleaseFixture),
+    }, {
+      prepared: stable,
+      files: ['query-view-cache.bin'],
+      inodePreserved: true,
+      bytesPreserved: oldReleaseFixtureSha256,
+      fixturePreserved: oldReleaseFixtureSha256,
+    })
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('error guessing: rename failure keeps both cache files byte-identical and continues with the warm versioned cache', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-cache-rename-failure-'))
+  const versioned = path.join(root, 'query-view-cache-v2.bin')
+  const stable = path.join(root, 'query-view-cache.bin')
+  fs.copyFileSync(oldReleaseFixture, versioned)
+  fs.writeFileSync(stable, 'stable-cache-must-survive')
+  const originalRenameSync = fs.renameSync
+  fs.renameSync = () => { throw new Error('simulated rename failure') }
+
+  try {
+    const prepared = queryCacheSchema.prepareQueryViewCache(root)
+
+    assert.deepEqual({ prepared, versionedSha256: sha256File(versioned), stableText: fs.readFileSync(stable, 'utf8') }, {
+      prepared: versioned,
+      versionedSha256: oldReleaseFixtureSha256,
+      stableText: 'stable-cache-must-survive',
+    })
+  } finally {
+    fs.renameSync = originalRenameSync
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('error guessing: a stale mmap module namespace cannot break a new importer of the cache schema leaf', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-stale-esm-'))
+  const staleModule = path.join(root, 'mmap-query-cache.mjs')
+  const newImporter = path.join(root, 'new-importer.mjs')
+  const runner = path.join(root, 'runner.mjs')
+  const schemaUrl = pathToFileURL(path.join(import.meta.dirname, '..', 'query-cache-schema.mjs')).href
+  fs.writeFileSync(staleModule, 'export class MmapQueryCache {}\n')
+  fs.writeFileSync(newImporter, `import { QUERY_VIEW_CACHE_FILE } from ${JSON.stringify(schemaUrl)}\nexport { QUERY_VIEW_CACHE_FILE }\n`)
+  fs.writeFileSync(runner, `
+    const stale = await import('./mmap-query-cache.mjs')
+    if (Object.hasOwn(stale, 'QUERY_VIEW_CACHE_FILE')) throw new Error('fixture is not stale')
+    const current = await import('./new-importer.mjs')
+    process.stdout.write(current.QUERY_VIEW_CACHE_FILE)
+  `)
+
+  try {
+    const result = spawnSync(process.execPath, [runner], { encoding: 'utf8' })
+
+    assert.deepEqual({ status: result.status, stdout: result.stdout, stderr: result.stderr }, {
+      status: 0,
+      stdout: 'query-view-cache.bin',
+      stderr: '',
+    })
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
 })
 
 test('hotpath regression: acquire and indexed symbols deps and resolved refs never materialize graph or decode unrelated records', () => {

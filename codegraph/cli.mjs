@@ -5,16 +5,20 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { execFileSync } from 'node:child_process'
+import { isFrameworkExport } from './framework-exports.mjs'
 
 const argRoot = (() => {
   const i = process.argv.indexOf('--root')
   return i >= 0 ? process.argv[i + 1] : null
 })()
-const ROOT = path.resolve(argRoot ?? process.env.CODEGRAPH_ROOT ?? process.cwd())
-if (!fs.existsSync(ROOT) || !fs.statSync(ROOT).isDirectory()) {
-  console.error(`codegraph: "${ROOT}" is not a directory — pass --root <repo> or set CODEGRAPH_ROOT`)
+const REQUESTED_ROOT = path.resolve(argRoot ?? process.env.CODEGRAPH_ROOT ?? process.cwd())
+if (!fs.existsSync(REQUESTED_ROOT) || !fs.statSync(REQUESTED_ROOT).isDirectory()) {
+  console.error(`codegraph: "${REQUESTED_ROOT}" is not a directory — pass --root <repo> or set CODEGRAPH_ROOT`)
   process.exit(1)
 }
+// Index and query must agree on one spelling of the tree, or a symlinked root (/tmp, /var on
+// macOS) indexes under one path and reads under the other.
+const ROOT = fs.realpathSync(REQUESTED_ROOT)
 const OUT = path.join(ROOT, '.codegraph')
 
 const fail = (msg) => { console.error(`codegraph: ${msg}`); process.exit(1) }
@@ -148,20 +152,6 @@ function cmdCallers(query, depth) {
   walk(roots, 0, '')
 }
 
-// Called by the framework, never by code — static resolution cannot see these, and a text
-// search "confirms" they are unused. Withheld from the listing so nothing downstream can
-// mistake them for deletable.
-const FRAMEWORK_EXPORTS = new Set([
-  'GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS', 'default', 'middleware',
-  'generateMetadata', 'generateStaticParams', 'generateViewport', 'metadata', 'viewport',
-  'revalidate', 'dynamic', 'dynamicParams', 'runtime', 'fetchCache', 'preferredRegion', 'maxDuration',
-])
-
-// Next.js file conventions: the framework imports these by PATH, and a default export keeps its
-// function name (`export default function ApprovalsPage`), so a name check alone misses them.
-const FRAMEWORK_FILES =
-  /(^|\/)(page|layout|route|template|default|error|global-error|loading|not-found|sitemap|robots|manifest|icon|apple-icon|opengraph-image|twitter-image|instrumentation|middleware)\.(ts|tsx|js|jsx)$/
-
 function cmdDead(prefix = '', includeFramework = false) {
   const dead = []
   let withheld = 0
@@ -169,7 +159,7 @@ function cmdDead(prefix = '', includeFramework = false) {
     if (!sym.exp || sym.kind === 'module') return
     if (prefix && !fileOf(id).startsWith(prefix)) return
     if (edges(g.rev, id).some(([from]) => fileOf(from) !== fileOf(id))) return
-    if (FRAMEWORK_EXPORTS.has(sym.name) || FRAMEWORK_FILES.test(fileOf(id))) {
+    if (isFrameworkExport(sym.name, fileOf(id))) {
       withheld++
       if (!includeFramework) return
     }
@@ -195,6 +185,7 @@ if (!cmd || cmd === 'help') {
   deps <name|file.ts>            what a symbol or file calls, in-repo only
   callers <name> [--depth N]     inverted call tree upward (default depth 3)
   dead [path/prefix]             exports with no reference outside their own file
+       --include-framework       also list framework-convention exports (withheld by default)
   visualize [--port N]           launch interactive web visualizer`)
   process.exit(0)
 }

@@ -8,6 +8,20 @@ import { createTraceProfiler } from '../trace-profile.mjs'
 import { CodeGraphEngine } from '../tool-engine.mjs'
 import { createSemanticProject, parsePartition, prepareSemanticProject } from '../parser.mjs'
 
+const fullWorkerResult = (engine, payload) => {
+  const sources = new Map(Object.entries(payload.baseSourceBlobs).map(([file, id]) => [file, engine.store.readSource(id)]))
+  for (const change of payload.changes) sources.set(change.path, change.source)
+  const context = prepareSemanticProject(createSemanticProject(payload.root, sources), payload.root)
+  const known = new Set(sources.keys())
+  return {
+    revision: payload.revision,
+    mode: 'full',
+    baseGeneration: payload.baseGeneration,
+    sourceBlobs: Object.fromEntries([...sources].map(([file, source]) => [file, engine.store.writeSource(source)])),
+    partitions: Object.fromEntries([...sources].map(([file, source]) => [file, parsePartition(file, source, known, context)])),
+  }
+}
+
 test('equivalence partition: an absent profile path creates no profiler and touches neither clock nor filesystem', () => {
   let clockCalls = 0
   let writeCalls = 0
@@ -191,7 +205,7 @@ test('domain analysis: fast refresh profiles provisional work separately from ba
   fs.mkdirSync(path.join(root, 'src'))
   fs.writeFileSync(path.join(root, 'src', 'a.ts'), 'export function a(){ return 1 }\n')
   const tracePath = path.join(root, 'profile.json')
-  const engine = new CodeGraphEngine(root, { profile: tracePath, validationWorkerFactory: () => ({ validate: async (snapshot) => snapshot, dispose: async () => {} }) })
+  const engine = new CodeGraphEngine(root, { profile: tracePath, validationWorkerFactory: () => ({ validate: async (payload) => fullWorkerResult(engine, payload), dispose: async () => {} }) })
   await engine.build()
 
   const refreshed = engine.applyChanges([{ type: 'change', path: 'src/a.ts', source: 'export function a(){ return 2 }\n' }])
@@ -311,21 +325,21 @@ test('domain analysis: detailed profiling emits one analyzer-compatible complete
   await engine.build()
   const detailed = JSON.parse(fs.readFileSync(tracePath, 'utf8')).traceEvents.filter((event) => event.args?.file)
 
-  assert.deepEqual(detailed.map((event) => ({ name: event.name, file: event.args.file, phase: event.ph, category: event.cat, counterKeys: Object.keys(event.args).filter((key) => key !== 'file').sort() })), [
+  assert.deepEqual(detailed.map((event) => ({ name: event.name, file: event.args.file, phase: event.ph, category: event.cat, counterKeys: Object.keys(event.args).filter((key) => key !== 'file').sort() })).toSorted((left, right) => `${left.file}:${left.name}`.localeCompare(`${right.file}:${right.name}`)), [
     { name: 'collect-file-syntax', file: 'src/a.ts', phase: 'X', category: 'codegraph', counterKeys: ['declarationCount', 'descendantTraversals', 'identifierCount'] },
-    { name: 'collect-file-syntax', file: 'src/b.ts', phase: 'X', category: 'codegraph', counterKeys: ['declarationCount', 'descendantTraversals', 'identifierCount'] },
+    { name: 'dependencies', file: 'src/a.ts', phase: 'X', category: 'codegraph', counterKeys: ['candidates', 'dependencyDecls', 'resolved', 'unresolved'] },
     { name: 'exports', file: 'src/a.ts', phase: 'X', category: 'codegraph', counterKeys: ['exportsVisited'] },
     { name: 'identifiers-symbol-resolution', file: 'src/a.ts', phase: 'X', category: 'codegraph', counterKeys: ['aliases', 'calls', 'declarationProbes', 'edges', 'noOwner', 'nonCalls', 'selfTarget', 'symbolMissing', 'targetMissing', 'total'] },
-    { name: 'dependencies', file: 'src/a.ts', phase: 'X', category: 'codegraph', counterKeys: ['candidates', 'dependencyDecls', 'resolved', 'unresolved'] },
-    { name: 'source-hash', file: 'src/a.ts', phase: 'X', category: 'codegraph', counterKeys: ['sourceBytes'] },
     { name: 'partition-hash', file: 'src/a.ts', phase: 'X', category: 'codegraph', counterKeys: ['partitionBytes'] },
     { name: 'partition-write', file: 'src/a.ts', phase: 'X', category: 'codegraph', counterKeys: ['cacheWrite', 'partitionBytes'] },
+    { name: 'source-hash', file: 'src/a.ts', phase: 'X', category: 'codegraph', counterKeys: ['sourceBytes'] },
+    { name: 'collect-file-syntax', file: 'src/b.ts', phase: 'X', category: 'codegraph', counterKeys: ['declarationCount', 'descendantTraversals', 'identifierCount'] },
+    { name: 'dependencies', file: 'src/b.ts', phase: 'X', category: 'codegraph', counterKeys: ['candidates', 'dependencyDecls', 'resolved', 'unresolved'] },
     { name: 'exports', file: 'src/b.ts', phase: 'X', category: 'codegraph', counterKeys: ['exportsVisited'] },
     { name: 'identifiers-symbol-resolution', file: 'src/b.ts', phase: 'X', category: 'codegraph', counterKeys: ['aliases', 'calls', 'declarationProbes', 'edges', 'noOwner', 'nonCalls', 'selfTarget', 'symbolMissing', 'targetMissing', 'total'] },
-    { name: 'dependencies', file: 'src/b.ts', phase: 'X', category: 'codegraph', counterKeys: ['candidates', 'dependencyDecls', 'resolved', 'unresolved'] },
-    { name: 'source-hash', file: 'src/b.ts', phase: 'X', category: 'codegraph', counterKeys: ['sourceBytes'] },
     { name: 'partition-hash', file: 'src/b.ts', phase: 'X', category: 'codegraph', counterKeys: ['partitionBytes'] },
     { name: 'partition-write', file: 'src/b.ts', phase: 'X', category: 'codegraph', counterKeys: ['cacheWrite', 'partitionBytes'] },
+    { name: 'source-hash', file: 'src/b.ts', phase: 'X', category: 'codegraph', counterKeys: ['sourceBytes'] },
   ])
 })
 
@@ -584,6 +598,21 @@ test('equivalence partition and lifecycle boundary: one build-local cursor is re
     },
     { retainedSource: '', offset: 0, line: 1, largeLines: [1, 2], smallLine: 1 },
   )
+})
+
+test('worker ownership trace contract: a persistent build keeps the semantic-project phase between source reading and parse indexing', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-profile-worker-owner-'))
+  fs.writeFileSync(path.join(root, 'tsconfig.json'), JSON.stringify({ include: ['src'] }))
+  fs.mkdirSync(path.join(root, 'src'))
+  fs.writeFileSync(path.join(root, 'src', 'a.ts'), 'export const a = 1\n')
+  const tracePath = path.join(root, 'profile.json')
+  const engine = new CodeGraphEngine(root, { profile: tracePath, retainSemanticState: true })
+
+  await engine.build()
+  await engine.dispose()
+  const phases = JSON.parse(fs.readFileSync(tracePath, 'utf8')).traceEvents.map((event) => event.name).filter((name) => ['codegraph.build', 'scan', 'read-sources', 'semantic-project', 'parse-index', 'publish'].includes(name))
+
+  assert.deepEqual(phases, ['codegraph.build', 'scan', 'read-sources', 'semantic-project', 'parse-index', 'publish'])
 })
 
 test('domain analysis: cold refs records one enrichment phase while warm refs reuses the atomic overlay', async () => {

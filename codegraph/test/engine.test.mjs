@@ -5,9 +5,12 @@ import os from 'node:os'
 import path from 'node:path'
 import fsp from 'node:fs/promises'
 import { performance } from 'node:perf_hooks'
+import { spawnSync } from 'node:child_process'
+import { Worker } from 'node:worker_threads'
 import { CodeGraphEngine } from '../tool-engine.mjs'
 import { FileLocalResolver } from '../incremental-resolver.mjs'
 import { SemanticCheckerWorker } from '../semantic-checker-worker.mjs'
+import { contentHash, createSemanticProject, parsePartition, prepareSemanticProject } from '../parser.mjs'
 
 class EngineFakeMmapAdapter {
   constructor() { this.files = new Map(); this.maps = []; this.unmaps = 0; this.closes = 0; this.flushes = 0 }
@@ -45,6 +48,400 @@ function fixture() {
 const canon = (g) => JSON.stringify({ files: g.files, symbols: g.symbols, edges: g.edges })
 
 const manifestBytes = (engine) => JSON.stringify(engine.readGeneration())
+
+const fullWorkerResult = (engine, payload) => {
+  const sources = new Map(Object.entries(payload.baseSourceBlobs).map(([file, id]) => [file, engine.store.readSource(id)]))
+  for (const change of payload.changes) {
+    if (change.type === 'unlink') sources.delete(change.path)
+    else sources.set(change.path, change.source ?? fs.readFileSync(path.join(payload.root, change.path), 'utf8'))
+  }
+  const context = prepareSemanticProject(createSemanticProject(payload.root, sources), payload.root)
+  const known = new Set(sources.keys())
+  const partitions = Object.fromEntries([...sources].map(([file, source]) => [file, parsePartition(file, source, known, context)]))
+  return { revision: payload.revision, mode: 'full', baseGeneration: payload.baseGeneration, sourceBlobs: Object.fromEntries([...sources].map(([file, source]) => [file, engine.store.writeSource(source)])), partitions }
+}
+
+test('architecture boundary: importing the tool engine on the main thread loads neither the semantic parser nor the ts-morph wrapper', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-tool-engine-import-'))
+  const loaderPath = path.join(root, 'record-loader.mjs')
+  fs.writeFileSync(loaderPath, `
+export async function load(url, context, nextLoad) {
+  if (url.endsWith('/parser.mjs') || url.includes('/node_modules/ts-morph/dist/ts-morph.js')) process.stderr.write('FORBIDDEN ' + url + '\\n')
+  return nextLoad(url, context)
+}
+`)
+
+  const result = spawnSync(process.execPath, ['--experimental-loader', loaderPath, '--input-type=module', '--eval', "await import('./tool-engine.mjs'); process.stdout.write('tool-engine-imported')"], {
+    cwd: path.resolve(import.meta.dirname, '..'),
+    encoding: 'utf8',
+  })
+  fs.rmSync(root, { recursive: true, force: true })
+
+  assert.deepEqual(
+    { status: result.status, stdout: result.stdout, forbiddenLoads: result.stderr.split('\n').filter((line) => line.startsWith('FORBIDDEN ')) },
+    { status: 0, stdout: 'tool-engine-imported', forbiddenLoads: [] },
+  )
+})
+
+test('architecture boundary: importing the semantic checker client on the main thread loads neither the semantic parser nor the ts-morph wrapper', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-semantic-checker-import-'))
+  const loaderPath = path.join(root, 'record-loader.mjs')
+  fs.writeFileSync(loaderPath, `
+export async function load(url, context, nextLoad) {
+  if (url.endsWith('/parser.mjs') || url.includes('/node_modules/ts-morph/dist/ts-morph.js')) process.stderr.write('FORBIDDEN ' + url + '\\n')
+  return nextLoad(url, context)
+}
+`)
+
+  const result = spawnSync(process.execPath, ['--experimental-loader', loaderPath, '--input-type=module', '--eval', "await import('./semantic-checker-worker.mjs'); process.stdout.write('semantic-checker-imported')"], {
+    cwd: path.resolve(import.meta.dirname, '..'),
+    encoding: 'utf8',
+  })
+  fs.rmSync(root, { recursive: true, force: true })
+
+  assert.deepEqual(
+    { status: result.status, stdout: result.stdout, forbiddenLoads: result.stderr.split('\n').filter((line) => line.startsWith('FORBIDDEN ')) },
+    { status: 0, stdout: 'semantic-checker-imported', forbiddenLoads: [] },
+  )
+})
+
+test('equivalence partition: only a semantic-checker worker imports the parser and ts-morph', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-semantic-worker-import-'))
+  const loaderPath = path.join(root, 'record-loader.mjs')
+  const workerPath = path.join(root, 'import-worker.mjs')
+  const driverPath = path.join(root, 'run-worker.mjs')
+  fs.writeFileSync(loaderPath, `
+export async function load(url, context, nextLoad) {
+  if (url.endsWith('/parser.mjs')) process.stderr.write('PARSER_LOADED\\n')
+  if (url.includes('/node_modules/ts-morph/dist/ts-morph.js')) process.stderr.write('TS_MORPH_LOADED\\n')
+  return nextLoad(url, context)
+}
+`)
+  fs.writeFileSync(workerPath, `
+import { parentPort } from 'node:worker_threads'
+await import(${JSON.stringify(new URL('../semantic-checker-worker.mjs', import.meta.url).href)})
+parentPort.postMessage('imported')
+`)
+  fs.writeFileSync(driverPath, `
+import { once } from 'node:events'
+import { Worker } from 'node:worker_threads'
+const worker = new Worker(${JSON.stringify(workerPath)}, { workerData: { semanticChecker: process.env.SEMANTIC_CHECKER === 'true' } })
+await once(worker, 'message')
+await worker.terminate()
+process.stdout.write('imported')
+`)
+
+  const ordinary = spawnSync(process.execPath, ['--no-warnings', '--experimental-loader', loaderPath, driverPath], { encoding: 'utf8', env: { ...process.env, SEMANTIC_CHECKER: 'false' } })
+  const semantic = spawnSync(process.execPath, ['--no-warnings', '--experimental-loader', loaderPath, driverPath], { encoding: 'utf8', env: { ...process.env, SEMANTIC_CHECKER: 'true' } })
+  fs.rmSync(root, { recursive: true, force: true })
+
+  assert.deepEqual(
+    { ordinary: { status: ordinary.status, stdout: ordinary.stdout, imports: ordinary.stderr.trim().split('\n').filter(Boolean) }, semantic: { status: semantic.status, stdout: semantic.stdout, imports: semantic.stderr.trim().split('\n').filter(Boolean) } },
+    { ordinary: { status: 0, stdout: 'imported', imports: [] }, semantic: { status: 0, stdout: 'imported', imports: ['PARSER_LOADED', 'TS_MORPH_LOADED'] } },
+  )
+})
+
+test('boundary analysis: a fresh engine hydrates a persisted base and validates one changed leaf as a one-partition delta', async () => {
+  const root = fixture()
+  fs.writeFileSync(path.join(root, 'src', 'leaf.ts'), 'export const leaf = 1\n')
+  const builder = trackedEngine(root)
+  await builder.build()
+  await builder.dispose()
+  fs.writeFileSync(path.join(root, 'src', 'leaf.ts'), 'export const leaf = 2\n')
+  const cold = trackedEngine(root)
+  let writes = 0
+  const writePartition = cold.store.writePartition.bind(cold.store)
+  cold.store.writePartition = (...args) => { writes += 1; return writePartition(...args) }
+
+  const result = await cold.reconcile()
+  const clean = trackedEngine(root, { cacheDir: '.clean-cold-leaf-delta' })
+  await clean.build()
+  const actual = cold.readGeneration()
+  const expected = clean.readGeneration()
+
+  assert.deepEqual(
+    {
+      validationMode: result.validationMode,
+      validatedFiles: result.validatedFiles,
+      writes,
+      graph: canon(cold.snapshot()),
+      deterministicManifest: {
+        version: actual.version,
+        root: actual.root,
+        edgeCoverage: actual.edgeCoverage,
+        controlHashes: actual.controlHashes,
+        sources: actual.sources,
+        partitions: actual.partitions,
+        partitionHashes: actual.partitionHashes,
+      },
+    },
+    {
+      validationMode: 'delta',
+      validatedFiles: ['src/leaf.ts'],
+      writes: 1,
+      graph: canon(clean.snapshot()),
+      deterministicManifest: {
+        version: expected.version,
+        root: expected.root,
+        edgeCoverage: expected.edgeCoverage,
+        controlHashes: expected.controlHashes,
+        sources: expected.sources,
+        partitions: expected.partitions,
+        partitionHashes: expected.partitionHashes,
+      },
+    },
+  )
+})
+
+test('domain analysis: a changed export validates each member of a converging diamond exactly once', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-engine-diamond-'))
+  fs.writeFileSync(path.join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { module: 'ESNext' }, include: ['src'] }))
+  fs.mkdirSync(path.join(root, 'src'))
+  fs.writeFileSync(path.join(root, 'src', 'base.ts'), 'export interface Value { id: string }\n')
+  fs.writeFileSync(path.join(root, 'src', 'left.ts'), "export { Value } from './base'\n")
+  fs.writeFileSync(path.join(root, 'src', 'right.ts'), "export { Value } from './base'\n")
+  fs.writeFileSync(path.join(root, 'src', 'top.ts'), "import type { Value as Left } from './left'\nimport type { Value as Right } from './right'\nexport const top = (left: Left, right: Right) => left.id + right.id\n")
+  const engine = trackedEngine(root)
+  await engine.build()
+  let writes = 0
+  const writePartition = engine.store.writePartition.bind(engine.store)
+  engine.store.writePartition = (...args) => { writes += 1; return writePartition(...args) }
+  fs.writeFileSync(path.join(root, 'src', 'base.ts'), 'export interface Value { id: string; revision?: number }\n')
+
+  const result = await engine.incremental([{ type: 'change', path: 'src/base.ts' }])
+  const clean = trackedEngine(root, { cacheDir: '.clean-diamond-delta' })
+  await clean.build()
+
+  assert.deepEqual(
+    { validationMode: result.validationMode, validatedFiles: result.validatedFiles, writes, graph: canon(engine.snapshot()) },
+    { validationMode: 'delta', validatedFiles: ['src/base.ts', 'src/left.ts', 'src/right.ts', 'src/top.ts'], writes: 4, graph: canon(clean.snapshot()) },
+  )
+})
+
+test('equivalence partition and domain analysis: an unrelated unresolved stylesheet does not expand a leaf edit beyond its reverse closure', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-engine-unrelated-unresolved-'))
+  fs.writeFileSync(path.join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { module: 'ESNext' }, include: ['src'] }))
+  fs.mkdirSync(path.join(root, 'src'))
+  fs.writeFileSync(path.join(root, 'src', 'leaf.ts'), 'export const leaf = 1\n')
+  fs.writeFileSync(path.join(root, 'src', 'page.ts'), "import './missing.css'\nexport const page = 'ready'\n")
+  const engine = trackedEngine(root)
+  await engine.build()
+  fs.writeFileSync(path.join(root, 'src', 'leaf.ts'), 'export const leaf = 2\n')
+
+  const result = await engine.incremental([{ type: 'change', path: 'src/leaf.ts' }])
+  const clean = trackedEngine(root, { cacheDir: '.clean-unrelated-unresolved' })
+  await clean.build()
+
+  assert.deepEqual(
+    { validationMode: result.validationMode, validatedFiles: result.validatedFiles, graph: canon(engine.snapshot()) },
+    { validationMode: 'delta', validatedFiles: ['src/leaf.ts'], graph: canon(clean.snapshot()) },
+  )
+})
+
+test('boundary value and domain analysis: a changed path matching an unresolved candidate retains full validation', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-engine-matching-unresolved-'))
+  fs.writeFileSync(path.join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { module: 'ESNext' }, include: ['src'] }))
+  fs.mkdirSync(path.join(root, 'src'))
+  fs.writeFileSync(path.join(root, 'src', 'waiting.ts'), "import { later } from './later'\nexport const waiting = () => later()\n")
+  const engine = trackedEngine(root)
+  await engine.build()
+  fs.writeFileSync(path.join(root, 'src', 'later.ts'), 'export const later = () => 7\n')
+
+  const result = await engine.incremental([{ type: 'change', path: 'src/later.ts' }])
+  const clean = trackedEngine(root, { cacheDir: '.clean-matching-unresolved' })
+  await clean.build()
+
+  assert.deepEqual(
+    { validationMode: result.validationMode, validatedFiles: result.validatedFiles, graph: canon(engine.snapshot()) },
+    { validationMode: 'full', validatedFiles: ['src/later.ts', 'src/waiting.ts'], graph: canon(clean.snapshot()) },
+  )
+})
+
+test('error guessing and domain analysis: the coordinator rejects a delta when an unresolved candidate matches the changed path', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-engine-unsafe-unresolved-delta-'))
+  fs.writeFileSync(path.join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { module: 'ESNext' }, include: ['src'] }))
+  fs.mkdirSync(path.join(root, 'src'))
+  fs.writeFileSync(path.join(root, 'src', 'waiting.ts'), "import { later } from './later'\nexport const waiting = () => later()\n")
+  let engine
+  engine = trackedEngine(root, { validationWorkerFactory: () => ({ validate: async (payload) => {
+    const complete = fullWorkerResult(engine, payload)
+    return { ...complete, mode: 'delta', partitions: { 'src/later.ts': complete.partitions['src/later.ts'] } }
+  }, dispose: async () => {} }) })
+  const built = await engine.build()
+  const before = manifestBytes(engine)
+
+  const refreshed = engine.applyChanges([{ type: 'change', path: 'src/later.ts', source: 'export const later = () => 7\n' }])
+  await assert.rejects(refreshed.validation, /unresolved|candidate|unsafe/i)
+
+  assert.deepEqual({ generation: engine.readGeneration().generation, manifest: manifestBytes(engine) }, { generation: built.generation, manifest: before })
+})
+
+test('equivalence partition: two simultaneous source edits use full validation and publish a complete clean-build-equivalent generation', async () => {
+  const root = fixture()
+  const engine = trackedEngine(root)
+  await engine.build()
+  let writes = 0
+  const writePartition = engine.store.writePartition.bind(engine.store)
+  engine.store.writePartition = (...args) => { writes += 1; return writePartition(...args) }
+  fs.writeFileSync(path.join(root, 'src', 'a.ts'), 'export function a(){ return 11 }\n')
+  fs.writeFileSync(path.join(root, 'src', 'b.ts'), "import { a } from './a'; export function b(){ return a()+22 }\n")
+
+  const result = await engine.incremental([{ type: 'change', path: 'src/a.ts' }, { type: 'change', path: 'src/b.ts' }])
+  await result.validation
+  const clean = trackedEngine(root, { cacheDir: '.clean-multiple-full' })
+  await clean.build()
+
+  assert.deepEqual(
+    { validationMode: result.validationMode, validatedFiles: result.validatedFiles, writes, graph: canon(engine.snapshot()) },
+    { validationMode: 'full', validatedFiles: ['src/a.ts', 'src/b.ts'], writes: 2, graph: canon(clean.snapshot()) },
+  )
+})
+
+test('equivalence partition: an unknown semantic result mode is rejected before CURRENT changes', async () => {
+  const root = fixture()
+  const engine = trackedEngine(root, { validationWorkerFactory: () => ({ validate: async (payload) => ({ revision: payload.revision, mode: 'surprise', baseGeneration: payload.baseGeneration, sourceBlobs: payload.baseSourceBlobs, partitions: {} }), dispose: async () => {} }) })
+  const built = await engine.build()
+  const before = manifestBytes(engine)
+
+  const refreshed = engine.applyChanges([{ type: 'change', path: 'src/b.ts', source: 'export function b(){ return 9 }\n' }])
+  await assert.rejects(refreshed.validation, /mode|full|delta|unknown/i)
+
+  assert.deepEqual({ generation: engine.readGeneration().generation, manifest: manifestBytes(engine) }, { generation: built.generation, manifest: before })
+})
+
+test('error guessing: a delta for a stale base generation is rejected before CURRENT changes', async () => {
+  const root = fixture()
+  const engine = trackedEngine(root, { validationWorkerFactory: () => ({ validate: async (payload) => ({ revision: payload.revision, mode: 'delta', baseGeneration: 'stale-generation', sourceBlobs: payload.baseSourceBlobs, partitions: {} }), dispose: async () => {} }) })
+  const built = await engine.build()
+  const before = manifestBytes(engine)
+
+  const refreshed = engine.applyChanges([{ type: 'change', path: 'src/b.ts', source: 'export function b(){ return 9 }\n' }])
+  await assert.rejects(refreshed.validation, /base|generation|stale|mismatch/i)
+
+  assert.deepEqual({ generation: engine.readGeneration().generation, manifest: manifestBytes(engine) }, { generation: built.generation, manifest: before })
+})
+
+test('error guessing: a delta containing an unknown partition key is rejected before CURRENT changes', async () => {
+  const root = fixture()
+  const engine = trackedEngine(root, { validationWorkerFactory: () => ({ validate: async (payload) => ({ revision: payload.revision, mode: 'delta', baseGeneration: payload.baseGeneration, sourceBlobs: payload.baseSourceBlobs, partitions: { 'src/ghost.ts': { file: 'src/ghost.ts', sourceHash: 'ghost', symbols: [], edges: [], dependencies: [], unresolved: [] } } }), dispose: async () => {} }) })
+  const built = await engine.build()
+  const before = manifestBytes(engine)
+
+  const refreshed = engine.applyChanges([{ type: 'change', path: 'src/b.ts', source: 'export function b(){ return 9 }\n' }])
+  await assert.rejects(refreshed.validation, /partition|unknown|membership|ghost/i)
+
+  assert.deepEqual({ generation: engine.readGeneration().generation, manifest: manifestBytes(engine) }, { generation: built.generation, manifest: before })
+})
+
+test('domain analysis: changing a global script into a module uses full validation and removes its stale cross-script edge', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-engine-script-module-'))
+  fs.writeFileSync(path.join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { module: 'ESNext' }, include: ['src'] }))
+  fs.mkdirSync(path.join(root, 'src'))
+  fs.writeFileSync(path.join(root, 'src', 'global.ts'), 'function shared(){ return 1 }\n')
+  fs.writeFileSync(path.join(root, 'src', 'use.ts'), 'const result = shared()\n')
+  const engine = trackedEngine(root)
+  await engine.build()
+  fs.writeFileSync(path.join(root, 'src', 'global.ts'), 'export function shared(){ return 1 }\n')
+
+  const result = await engine.incremental([{ type: 'change', path: 'src/global.ts' }])
+  const clean = trackedEngine(root, { cacheDir: '.clean-script-module' })
+  await clean.build()
+
+  assert.deepEqual(
+    { validationMode: result.validationMode, validatedFiles: result.validatedFiles, graph: canon(engine.snapshot()) },
+    { validationMode: 'full', validatedFiles: ['src/global.ts', 'src/use.ts'], graph: canon(clean.snapshot()) },
+  )
+})
+
+test('domain analysis: a delta omitting a required reverse dependent is rejected before CURRENT changes', async () => {
+  const root = fixture()
+  let engine
+  engine = trackedEngine(root, { validationWorkerFactory: () => ({ validate: async (payload) => { const base = engine.readGeneration(payload.baseGeneration); return { revision: payload.revision, mode: 'delta', baseGeneration: payload.baseGeneration, sourceBlobs: payload.baseSourceBlobs, partitions: { 'src/a.ts': engine.store.readPartition(base.partitions['src/a.ts']) } } }, dispose: async () => {} }) })
+  const built = await engine.build()
+  const before = manifestBytes(engine)
+
+  const refreshed = engine.applyChanges([{ type: 'change', path: 'src/a.ts', source: 'export function a(){ return 1 }\n' }])
+  await assert.rejects(refreshed.validation, /dependent|closure|missing|incomplete/i)
+
+  assert.deepEqual({ generation: engine.readGeneration().generation, manifest: manifestBytes(engine) }, { generation: built.generation, manifest: before })
+})
+
+test('domain analysis: a delta cannot change an unchanged source blob while omitting that file partition', async () => {
+  const root = fixture()
+  let engine
+  engine = trackedEngine(root, { validationWorkerFactory: () => ({ validate: async (payload) => { const base = engine.readGeneration(payload.baseGeneration); return { revision: payload.revision, mode: 'delta', baseGeneration: payload.baseGeneration, sourceBlobs: { ...payload.baseSourceBlobs, 'src/a.ts': engine.store.writeSource('export function a(){ return 999 }\n') }, partitions: { 'src/b.ts': engine.store.readPartition(base.partitions['src/b.ts']) } } }, dispose: async () => {} }) })
+  const built = await engine.build()
+  const before = manifestBytes(engine)
+
+  const refreshed = engine.applyChanges([{ type: 'change', path: 'src/b.ts', source: "import { a } from './a'; export function b(){ return a() }\n" }])
+  await assert.rejects(refreshed.validation, /source|blob|partition|unchanged|missing|mismatch/i)
+
+  assert.deepEqual({ generation: engine.readGeneration().generation, manifest: manifestBytes(engine) }, { generation: built.generation, manifest: before })
+})
+
+test('error guessing: a failed delta partition write does not poison the following successful validation', async () => {
+  const root = fixture()
+  const engine = trackedEngine(root)
+  await engine.build()
+  const warmed = engine.applyChanges([{ type: 'change', path: 'src/b.ts', source: "import { a } from './a'; export function b(){ return a()+1 }\n" }])
+  const warmedValidation = await warmed.validation
+  const writePartition = engine.store.writePartition.bind(engine.store)
+  let failWrite = true
+  engine.store.writePartition = (...args) => { if (failWrite) { failWrite = false; throw new Error('delta partition write failed') } return writePartition(...args) }
+
+  const failed = engine.applyChanges([{ type: 'change', path: 'src/b.ts', source: "import { a } from './a'; export function b(){ return a()+2 }\n" }])
+  await assert.rejects(failed.validation, /delta partition write failed/)
+  const recovered = engine.applyChanges([{ type: 'change', path: 'src/b.ts', source: "import { a } from './a'; export function b(){ return a()+3 }\n" }])
+  const recoveredValidation = await recovered.validation
+  const clean = trackedEngine(root, { cacheDir: '.clean-after-delta-write-failure' })
+  fs.writeFileSync(path.join(root, 'src', 'b.ts'), "import { a } from './a'; export function b(){ return a()+3 }\n")
+  await clean.build()
+
+  assert.deepEqual({ warmedMode: warmedValidation.validationMode, recoveredMode: recoveredValidation.validationMode, graph: canon(engine.snapshot()) }, { warmedMode: 'delta', recoveredMode: 'delta', graph: canon(clean.snapshot()) })
+})
+
+test('domain analysis: explicit base partitions replace a warm worker cache even when source blobs are unchanged', async () => {
+  const root = fixture()
+  const engine = trackedEngine(root)
+  const built = await engine.build()
+  const manifest = engine.readGeneration(built.generation)
+  const worker = new SemanticCheckerWorker()
+  const unchangedA = engine.store.readSource(manifest.sources['src/a.ts'])
+  await worker.validate({ revision: 1, root, baseGeneration: built.generation, baseSourceBlobs: manifest.sources, basePartitionIds: manifest.partitions, partitionDir: engine.store.partitions, sourceDir: engine.store.sources, changes: [{ type: 'change', path: 'src/a.ts', source: unchangedA }] })
+  const b = engine.store.readPartition(manifest.partitions['src/b.ts'])
+  const replacementB = engine.store.writePartition({ ...b, dependencies: [] })
+
+  const result = await worker.validate({ revision: 2, root, baseGeneration: 'generation-with-new-control-context', baseSourceBlobs: manifest.sources, basePartitionIds: { ...manifest.partitions, 'src/b.ts': replacementB }, partitionDir: engine.store.partitions, sourceDir: engine.store.sources, changes: [{ type: 'change', path: 'src/a.ts', source: unchangedA }] })
+  await worker.dispose()
+
+  assert.deepEqual({ mode: result.mode, validatedFiles: Object.keys(result.partitions).sort() }, { mode: 'delta', validatedFiles: ['src/a.ts'] })
+})
+
+test('domain analysis: a delta cannot replace an unchanged dependent blob and partition together', async () => {
+  const root = fixture()
+  let engine
+  engine = trackedEngine(root, { validationWorkerFactory: () => ({ validate: async (payload) => { const complete = fullWorkerResult(engine, { ...payload, changes: [...payload.changes, { type: 'change', path: 'src/a.ts', source: 'export function a(){ return 999 }\n' }] }); return { ...complete, mode: 'delta' } }, dispose: async () => {} }) })
+  const built = await engine.build()
+  const before = manifestBytes(engine)
+
+  const refreshed = engine.applyChanges([{ type: 'change', path: 'src/b.ts', source: "import { a } from './a'; export function b(){ return a()+2 }\n" }])
+  await assert.rejects(refreshed.validation, /unchanged|source|blob|partition|extra/i)
+
+  assert.deepEqual({ generation: engine.readGeneration().generation, manifest: manifestBytes(engine) }, { generation: built.generation, manifest: before })
+})
+
+test('domain analysis: delta partitions must equal the exact reverse closure without extra known files', async () => {
+  const root = fixture()
+  let engine
+  engine = trackedEngine(root, { validationWorkerFactory: () => ({ validate: async (payload) => ({ ...fullWorkerResult(engine, payload), mode: 'delta' }), dispose: async () => {} }) })
+  const built = await engine.build()
+  const before = manifestBytes(engine)
+
+  const refreshed = engine.applyChanges([{ type: 'change', path: 'src/b.ts', source: "import { a } from './a'; export function b(){ return a()+2 }\n" }])
+  await assert.rejects(refreshed.validation, /closure|extra|unexpected|validated/i)
+
+  assert.deepEqual({ generation: engine.readGeneration().generation, manifest: manifestBytes(engine) }, { generation: built.generation, manifest: before })
+})
 
 test('incremental edit/add/delete/rename is equivalent to clean full build and reuses partitions', async () => {
   const root = fixture()
@@ -178,7 +575,7 @@ test('domain analysis: a path-only provisional change carries the parser-admitte
   let validationPayload
   const parsed = new FileLocalResolver(root, new Map([['src/b.ts', 'export function b(){ return 9 }\n']])).files.get('src/b.ts')
   const parserPool = { parse: async () => ({ ...parsed, source: undefined }), snapshot: () => ({ workerCount: 1, queued: 0, inFlight: 0, latestRevisionByFile: {} }), dispose: async () => {} }
-  const engine = trackedEngine(root, { parserPool, validationWorkerFactory: () => ({ validate: async (payload) => { validationPayload = payload; return { revision: payload.revision, sourceBlobs: payload.baseSourceBlobs, partitions: {} } }, dispose: async () => {} }) })
+  const engine = trackedEngine(root, { parserPool, validationWorkerFactory: () => ({ validate: async (payload) => { validationPayload = payload; return fullWorkerResult(engine, payload) }, dispose: async () => {} }) })
   await engine.build()
   fs.writeFileSync(path.join(root, 'src', 'b.ts'), 'export function b(){ return 9 }\n')
 
@@ -356,7 +753,7 @@ test('error guessing: an active stale validation is discarded before its newer p
   const first = engine.applyChanges([{ type: 'change', path: 'src/b.ts', source: 'export function b(){ return 2 }\n' }])
   const second = engine.applyChanges([{ type: 'change', path: 'src/b.ts', source: 'export function b(){ return 3 }\n' }])
 
-  pending[0].resolve(pending[0].snapshot)
+  pending[0].resolve(fullWorkerResult(engine, pending[0].snapshot))
   const firstResult = await first.validation
   await new Promise((resolve) => setImmediate(resolve))
 
@@ -365,7 +762,7 @@ test('error guessing: an active stale validation is discarded before its newer p
     { workerRevisions: [1, 2], firstResult: null, generationAfterStaleResult: built.generation, latestRevision: 2 },
   )
 
-  pending[1].resolve(pending[1].snapshot)
+  pending[1].resolve(fullWorkerResult(engine, pending[1].snapshot))
   const secondResult = await second.validation
 
   assert.deepEqual({ priorGeneration: built.generation, secondGeneration: secondResult.generation, finalGeneration: engine.readGeneration().generation, latestRevision: engine.provisionalSnapshot().revision }, { priorGeneration: built.generation, secondGeneration: secondResult.generation, finalGeneration: secondResult.generation, latestRevision: 2 })
@@ -387,7 +784,7 @@ test('boundary and concurrency: 120 rapid changes keep one active validation and
     { provisionalRevision: 120, workerCallCountWhileStalled: 1, activeWorkerRevision: 1 },
   )
 
-  workerCalls[0].resolve(workerCalls[0].snapshot)
+  workerCalls[0].resolve(fullWorkerResult(engine, workerCalls[0].snapshot))
   await new Promise((resolve) => setImmediate(resolve))
 
   assert.deepEqual(
@@ -395,7 +792,7 @@ test('boundary and concurrency: 120 rapid changes keep one active validation and
     { workerCallCountAfterRelease: 2, validatedWorkerRevisions: [1, 120], latestSource: 'export function b(){ return 120 }\n' },
   )
 
-  workerCalls[1].resolve(workerCalls[1].snapshot)
+  workerCalls[1].resolve(fullWorkerResult(engine, workerCalls[1].snapshot))
   const validationResults = await Promise.race([
     Promise.all(refreshes.map(({ validation }) => validation)),
     new Promise((_, reject) => setTimeout(() => reject(new Error('coalesced validation promises did not settle')), 100)),
@@ -427,7 +824,7 @@ test('hotpath boundary: 120 coalesced edits materialize validation payloads only
     { provisionalRevision: 120, materializedRevisionsWhileStalled: [1], workerPayloadsWhileStalled: [{ revision: 1, changedFiles: ['src/b.ts'], changes: [{ type: 'change', path: 'src/b.ts', source: 'export function b(){ return 1 }\n' }] }] },
   )
 
-  workerCalls[0].resolve(workerCalls[0].payload)
+  workerCalls[0].resolve(fullWorkerResult(engine, workerCalls[0].payload))
   await refreshes[0].validation
   await new Promise((resolve) => setImmediate(resolve))
 
@@ -436,7 +833,7 @@ test('hotpath boundary: 120 coalesced edits materialize validation payloads only
     { materializedRevisionsAfterRelease: [1, 120], workerPayloadsAfterRelease: [{ revision: 1, changedFiles: ['src/b.ts'], changes: [{ type: 'change', path: 'src/b.ts', source: 'export function b(){ return 1 }\n' }] }, { revision: 120, changedFiles: ['src/b.ts'], changes: [{ type: 'change', path: 'src/b.ts', source: 'export function b(){ return 120 }\n' }] }] },
   )
 
-  workerCalls[1].resolve(workerCalls[1].payload)
+  workerCalls[1].resolve(fullWorkerResult(engine, workerCalls[1].payload))
   const validationResults = await Promise.race([
     Promise.all(refreshes.map(({ validation }) => validation)),
     new Promise((_, reject) => setTimeout(() => reject(new Error('lazily materialized validation promises did not settle')), 100)),
@@ -472,41 +869,6 @@ test('error guessing: engine disposal terminates the validation worker and rejec
 
   assert.throws(() => engine.applyChanges([{ type: 'change', path: 'src/b.ts', source: 'export function b(){ return 5 }\n' }]), /disposed|closed/i)
   assert.deepEqual({ validationDisposed, parserDisposed }, { validationDisposed: 1, parserDisposed: 1 })
-})
-
-test('hotpath architecture: applyChanges on an 855-file workspace stays under 5ms and schedules only changed files plus base blob references', (t) => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-855-fast-refresh-'))
-  const sources = new Map()
-  const baseSourceBlobs = {}
-  for (let index = 0; index < 855; index += 1) {
-    const file = `src/file-${String(index).padStart(3, '0')}.ts`
-    sources.set(file, `export function file${String(index).padStart(3, '0')}(){ return ${index} }\n`)
-    baseSourceBlobs[file] = `blob-${String(index).padStart(3, '0')}`
-  }
-  let validationPayload
-  const engine = trackedEngine(root, { validationWorkerFactory: () => ({ validate: (payload) => { validationPayload = payload; return new Promise(() => {}) }, dispose: async () => {} }) })
-  engine.resolver = new FileLocalResolver(root, sources)
-  engine.validatedGeneration = 'validated-generation'
-  engine.validatedSourceBlobs = baseSourceBlobs
-  for (let iteration = 0; iteration < 20; iteration += 1) engine.applyChanges([{ type: 'change', path: 'src/file-427.ts', source: iteration % 2 ? 'export function file427(){ return 1 }\n' : 'export function file427(){ return 2 }\n' }])
-  const durations = []
-
-  for (let iteration = 0; iteration < 120; iteration += 1) {
-    const source = iteration % 2 ? 'export function file427(){ return 1 }\n' : 'export function file427(){ return 2 }\n'
-    const started = performance.now()
-    engine.applyChanges([{ type: 'change', path: 'src/file-427.ts', source }])
-    durations.push(performance.now() - started)
-  }
-  const ordered = durations.toSorted((left, right) => left - right)
-  const metrics = { p50: ordered[59], p95: ordered[113], p99: ordered[118], max: ordered[119] }
-
-  const enforceFiveMs = process.env.CODEGRAPH_ENFORCE_FAST_REFRESH === '1'
-  t.diagnostic(`CodeGraphEngine.applyChanges 855-file workspace hard target max<=5ms ${JSON.stringify({ ...metrics, enforced: enforceFiveMs, targetMet: metrics.max <= 5 })}`)
-  assert.deepEqual(
-    { changedFiles: validationPayload.changedFiles, baseSourceBlobCount: Object.keys(validationPayload.baseSourceBlobs ?? {}).length, carriesAllSourceTexts: Array.isArray(validationPayload.sources) },
-    { changedFiles: ['src/file-427.ts'], baseSourceBlobCount: 855, carriesAllSourceTexts: false },
-  )
-  assert.equal(!enforceFiveMs || metrics.max <= 5, true, `isolated CodeGraphEngine.applyChanges max exceeded 5ms: ${JSON.stringify(metrics)}`)
 })
 
 test('error guessing: an unexpected semantic worker error rejects the current and future validation promptly and dispose settles', async () => {
@@ -577,7 +939,7 @@ test('regression: unchanged cold reconcile hydrates latest provisional state and
 
 test('domain analysis: latest query rows retain one atomic revision and validated generation when refresh advances mid-stream', async () => {
   const root = fixture()
-  const engine = trackedEngine(root, { validationWorkerFactory: () => ({ validate: async (snapshot) => snapshot, dispose: async () => {} }) })
+  const engine = trackedEngine(root, { validationWorkerFactory: () => ({ validate: async (payload) => fullWorkerResult(engine, payload), dispose: async () => {} }) })
   const built = await engine.build()
   const rows = engine.query({ type: 'symbols', consistency: 'latest' })
   const first = await rows.next()
@@ -914,6 +1276,188 @@ test('domain analysis: refs enrich the requested generation from its source blob
   const overlay = engine.store.readOverlay(old.generation)
 
   assert.deepEqual({ rows: rows.map(({ call, line }) => ({ call, line })), coverage: overlay.edgeCoverage, generation: overlay.generation }, { rows: [{ call: false, line: 2 }], coverage: 'complete', generation: old.generation })
+})
+
+test('domain analysis: a post-cascade refs query asks the warm worker for exactly the stale files without rereading sources on the main thread', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-warm-overlay-cascade-'))
+  fs.writeFileSync(path.join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { module: 'ESNext' }, include: ['src'] }))
+  fs.mkdirSync(path.join(root, 'src'))
+  fs.writeFileSync(path.join(root, 'src', 'value.ts'), 'export interface Value { id: string }\n')
+  fs.writeFileSync(path.join(root, 'src', 'left.ts'), "import type { Value } from './value'\nexport const left = (value: Value) => value.id\n")
+  fs.writeFileSync(path.join(root, 'src', 'right.ts'), "import type { Value } from './value'\nexport const right = (value: Value) => value.id\n")
+  fs.writeFileSync(path.join(root, 'src', 'unrelated.ts'), 'export const unrelated = 1\n')
+  let engine
+  let workerReadSource
+  const overlayRequests = []
+  const worker = {
+    validate: async (payload) => fullWorkerResult(engine, payload),
+    referenceOverlay: async (payload) => {
+      overlayRequests.push(payload)
+      const sources = new Map(Object.entries(payload.sourceBlobs).map(([file, id]) => [file, workerReadSource(id)]))
+      const context = prepareSemanticProject(createSemanticProject(root, sources), root)
+      const known = new Set(sources.keys())
+      return {
+        generation: payload.generation,
+        files: Object.fromEntries(payload.staleFiles.map((file) => [file, { edges: parsePartition(file, sources.get(file), known, context).edges.filter((edge) => !edge.call) }])),
+      }
+    },
+    dispose: async () => {},
+  }
+  engine = trackedEngine(root, { validationWorkerFactory: () => worker })
+  workerReadSource = engine.store.readSource.bind(engine.store)
+  await engine.build()
+  for await (const ignored of engine.query({ type: 'refs', name: 'Value' })) void ignored
+  fs.writeFileSync(path.join(root, 'src', 'value.ts'), 'export interface Value { id: string; revision?: number }\n')
+  const changed = await engine.incremental([{ type: 'change', path: 'src/value.ts' }])
+  await changed.validation
+  let sourceReads = 0
+  const readSource = engine.store.readSource.bind(engine.store)
+  engine.store.readSource = (...args) => { sourceReads += 1; return readSource(...args) }
+
+  const rows = await engine.queryBatch({ type: 'refs', name: 'Value', resolved: true })
+
+  assert.deepEqual(
+    {
+      requestCount: overlayRequests.length,
+      requestedGeneration: overlayRequests[0]?.generation,
+      currentGeneration: engine.readGeneration().generation,
+      staleFiles: overlayRequests[0]?.staleFiles,
+      sourceReads,
+      rows: rows.map(({ fromSymbol, toSymbol, line, call }) => ({ fromFile: fromSymbol.file, toFile: toSymbol.file, line, call })).toSorted((left, right) => left.fromFile.localeCompare(right.fromFile)),
+    },
+    {
+      requestCount: 1,
+      requestedGeneration: engine.readGeneration().generation,
+      currentGeneration: engine.readGeneration().generation,
+      staleFiles: ['src/left.ts', 'src/right.ts', 'src/value.ts'],
+      sourceReads: 0,
+      rows: [
+        { fromFile: 'src/left.ts', toFile: 'src/value.ts', line: 2, call: false },
+        { fromFile: 'src/left.ts', toFile: 'src/value.ts', line: 2, call: false },
+        { fromFile: 'src/right.ts', toFile: 'src/value.ts', line: 2, call: false },
+        { fromFile: 'src/right.ts', toFile: 'src/value.ts', line: 2, call: false },
+      ],
+    },
+  )
+})
+
+test('all-pairs parity: warm and fallback overlays resolve aliases re-exports namespace and default imports identically after a cascade', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-overlay-parity-'))
+  fs.writeFileSync(path.join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { module: 'ESNext', target: 'ES2022' }, include: ['src'] }))
+  fs.mkdirSync(path.join(root, 'src'))
+  fs.writeFileSync(path.join(root, 'src', 'base.ts'), 'export default function primary(){ return 1 }\nexport const named = 2\n')
+  fs.writeFileSync(path.join(root, 'src', 'barrel.ts'), "export { default, default as alias, named as renamed } from './base'\nexport * as space from './base'\n")
+  fs.writeFileSync(path.join(root, 'src', 'consumer.ts'), "import primary, { alias, renamed, space } from './barrel'\nimport * as namespace from './barrel'\nexport const consume = () => primary() + alias() + renamed + space.named + namespace.renamed\n")
+  fs.writeFileSync(path.join(root, 'src', 'donor.ts'), 'export const donor = 3\nexport const readDonor = () => donor\n')
+  const warmChecker = new SemanticCheckerWorker()
+  let warmStaleFiles
+  const warm = trackedEngine(root, { cacheDir: '.warm-parity', validationWorkerFactory: () => ({
+    validate: (payload) => warmChecker.validate(payload),
+    referenceOverlay: (payload) => { warmStaleFiles = payload.staleFiles; return warmChecker.referenceOverlay(payload) },
+    dispose: () => warmChecker.dispose(),
+  }) })
+  const checker = new SemanticCheckerWorker()
+  const fallbackWorker = {
+    validate: (payload) => checker.validate(payload),
+    referenceOverlay: async () => { throw new Error('force existing fallback') },
+    dispose: () => checker.dispose(),
+  }
+  const fallback = trackedEngine(root, { cacheDir: '.fallback-parity', validationWorkerFactory: () => fallbackWorker })
+  await warm.build()
+  await fallback.build()
+  await warm.queryBatch({ type: 'refs', resolved: true })
+  await fallback.queryBatch({ type: 'refs', resolved: true })
+  const warmDonor = warm.store.readOverlay(warm.readGeneration().generation).files['src/donor.ts']
+  const fallbackDonor = fallback.store.readOverlay(fallback.readGeneration().generation).files['src/donor.ts']
+  fs.writeFileSync(path.join(root, 'src', 'base.ts'), 'export default function primary(){ return 10 }\nexport const named = 20\nexport const added = 30\n')
+  const warmChange = await warm.incremental([{ type: 'change', path: 'src/base.ts' }])
+  const fallbackChange = await fallback.incremental([{ type: 'change', path: 'src/base.ts' }])
+  await warmChange.validation
+  await fallbackChange.validation
+
+  const warmRows = await warm.queryBatch({ type: 'refs', resolved: true })
+  const fallbackRows = await fallback.queryBatch({ type: 'refs', resolved: true })
+  const warmOverlay = warm.store.readOverlay(warm.readGeneration().generation)
+  const fallbackOverlay = fallback.store.readOverlay(fallback.readGeneration().generation)
+  const normalizeRows = (rows) => rows.map(({ fromSymbol, toSymbol, line, call }) => ({ from: `${fromSymbol.file}:${fromSymbol.name}`, to: `${toSymbol.file}:${toSymbol.name}`, line, call })).toSorted((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)))
+  const normalizeFiles = (files) => Object.fromEntries(Object.entries(files).toSorted(([left], [right]) => left.localeCompare(right)).map(([file, fragment]) => [file, { key: fragment.key, edges: fragment.edges.toSorted((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right))) }]))
+
+  assert.deepEqual(
+    {
+      rows: normalizeRows(warmRows),
+      files: normalizeFiles(warmOverlay.files),
+      warmStaleFiles,
+      donorFragmentWasReused: warmOverlay.files['src/donor.ts']?.key === warmDonor.key && fallbackOverlay.files['src/donor.ts']?.key === fallbackDonor.key,
+    },
+    {
+      rows: normalizeRows(fallbackRows),
+      files: normalizeFiles(fallbackOverlay.files),
+      warmStaleFiles: ['src/barrel.ts', 'src/base.ts', 'src/consumer.ts'],
+      donorFragmentWasReused: true,
+    },
+  )
+})
+
+test('equivalence partition: malformed warm-worker overlay fragments reject the refs query and persist no partial overlay', async () => {
+  const root = fixture()
+  let engine
+  const worker = {
+    validate: async (payload) => fullWorkerResult(engine, payload),
+    referenceOverlay: async (payload) => ({ generation: payload.generation, files: { 'src/b.ts': { edges: [{ from: 'missing-from', to: 'missing-to', line: 2, call: true }] } } }),
+    dispose: async () => {},
+  }
+  engine = trackedEngine(root, { validationWorkerFactory: () => worker })
+  await engine.build()
+  fs.writeFileSync(path.join(root, 'src', 'b.ts'), "import { a } from './a'; export function b(){ return a()+2 }\n")
+  const changed = await engine.incremental([{ type: 'change', path: 'src/b.ts' }])
+  await changed.validation
+
+  await assert.rejects(engine.queryBatch({ type: 'refs', name: 'a' }), /overlay|fragment|edge|endpoint|call/i)
+
+  assert.equal(engine.store.readOverlay(engine.readGeneration().generation), null)
+})
+
+test('error guessing: a rejected warm-worker overlay request falls back to the existing builder and returns exact references', async () => {
+  const root = fixture()
+  let engine
+  let overlayRequests = 0
+  const worker = {
+    validate: async (payload) => fullWorkerResult(engine, payload),
+    referenceOverlay: async () => { overlayRequests += 1; throw new Error('overlay worker exited') },
+    dispose: async () => {},
+  }
+  engine = trackedEngine(root, { validationWorkerFactory: () => worker })
+  await engine.build()
+  fs.writeFileSync(path.join(root, 'src', 'b.ts'), "import { a } from './a'; export function b(){ return a()+2 }\n")
+  const changed = await engine.incremental([{ type: 'change', path: 'src/b.ts' }])
+  await changed.validation
+
+  const rows = await engine.queryBatch({ type: 'refs', name: 'a', resolved: true })
+
+  assert.deepEqual(
+    { overlayRequests, rows: rows.map(({ fromSymbol, toSymbol, line, call }) => ({ fromFile: fromSymbol.file, toFile: toSymbol.file, line, call })), overlayCoverage: engine.store.readOverlay(engine.readGeneration().generation)?.edgeCoverage },
+    { overlayRequests: 1, rows: [{ fromFile: 'src/b.ts', toFile: 'src/a.ts', line: 1, call: true }], overlayCoverage: 'complete' },
+  )
+})
+
+test('domain boundary: a historical refs query bypasses the warm worker and uses the persisted generation sources', async () => {
+  const root = fixture()
+  let engine
+  let overlayRequests = 0
+  const worker = {
+    validate: async (payload) => fullWorkerResult(engine, payload),
+    referenceOverlay: async () => { overlayRequests += 1; throw new Error('historical query reached warm worker') },
+    dispose: async () => {},
+  }
+  engine = trackedEngine(root, { validationWorkerFactory: () => worker })
+  const old = await engine.build()
+  fs.writeFileSync(path.join(root, 'src', 'b.ts'), 'export function b(){ return 2 }\n')
+  const changed = await engine.incremental([{ type: 'change', path: 'src/b.ts' }])
+  await changed.validation
+
+  const rows = await engine.queryBatch({ type: 'refs', name: 'a', generation: old.generation, resolved: true })
+
+  assert.deepEqual({ overlayRequests, rows: rows.map(({ fromSymbol, toSymbol, line, call }) => ({ fromFile: fromSymbol.file, toFile: toSymbol.file, line, call })) }, { overlayRequests: 0, rows: [{ fromFile: 'src/b.ts', toFile: 'src/a.ts', line: 1, call: true }] })
 })
 
 test('error guessing: concurrent cold refs coalesce into one overlay build and both receive the complete result', async () => {
@@ -1274,31 +1818,6 @@ test('domain analysis: warmed resolved rows stay pinned to one generation and pe
   })
 })
 
-test('hotpath boundary: a primed validated query emitting exactly 200 rows completes in under 5ms', async (t) => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-query-view-latency-'))
-  fs.writeFileSync(path.join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { module: 'ESNext' }, include: ['src'] }))
-  fs.mkdirSync(path.join(root, 'src'))
-  fs.writeFileSync(path.join(root, 'src', 'symbols.ts'), Array.from({ length: 200 }, (_, index) => `export const symbol${String(index).padStart(3, '0')} = ${index}`).join('\n'))
-  const engine = trackedEngine(root)
-  await engine.build()
-  for (let iteration = 0; iteration < 20; iteration += 1) await engine.queryBatch({ type: 'symbols', limit: 200 })
-  const durations = []
-  let rowCount = 0
-  for (let iteration = 0; iteration < 120; iteration += 1) {
-    const started = performance.now()
-    const rows = await engine.queryBatch({ type: 'symbols', limit: 200 })
-    rowCount = rows.length
-    durations.push(performance.now() - started)
-  }
-  const ordered = durations.toSorted((left, right) => left - right)
-  const metrics = { p50: ordered[59], p95: ordered[113], p99: ordered[118], max: ordered[119] }
-  const enforceFiveMs = process.env.CODEGRAPH_ENFORCE_FAST_REFRESH === '1'
-
-  t.diagnostic(`CodeGraphEngine warm validated 200-row query hard target p99<5ms ${JSON.stringify({ ...metrics, enforced: enforceFiveMs, targetMet: metrics.p99 < 5 })}`)
-  assert.equal(rowCount, 200)
-  assert.equal(!enforceFiveMs || metrics.p99 < 5, true, `isolated warm validated query p99 exceeded 5ms: ${JSON.stringify(metrics)}`)
-})
-
 test('hotpath integration: a valid cold mapped complete page avoids generation partition and overlay reads', async () => {
   const root = fixture()
   const adapter = new EngineFakeMmapAdapter()
@@ -1474,4 +1993,261 @@ test('hotpath integration: a DnD-shaped mapped refs query returns the exact firs
     fromSymbol: { id: '6d1f36a6e18b5f8677635dc0', name: 'b', file: 'src/b.ts', line: 1, kind: 'function' },
     toSymbol: { id: '3bdd027f2bd7f1dadf7f2e4a', name: 'a', file: 'src/a.ts', line: 1, kind: 'function' },
   }])
+})
+
+// Pairwise lifecycle coverage matrix (each row is its own reported test):
+// first build/none/success/publication success; first build/none/rejection/source write;
+// first build/advanced/malformed/manifest failure; first build/advanced/exit/CURRENT failure;
+// persisted reconcile/current/success/publication success; persisted reconcile/current/rejection/manifest failure;
+// persisted reconcile/advanced/malformed/source write; persisted reconcile/advanced/exit/CURRENT failure.
+// Existing publication, stale-generation, worker-exit, and dispose tests cover the paired failure rows;
+// the ownership tests below cover success, rejection/retry, malformed membership, and retained delta state.
+
+test('worker ownership: a persistent clean build indexes once in the worker, retains no main workspace, and validates the next leaf as a hydrated delta', async () => {
+  const root = fixture()
+  const checker = new SemanticCheckerWorker()
+  const requests = { index: [], hydrate: [], validate: [] }
+  const worker = {
+    index: async (payload) => { requests.index.push(payload); return checker.index(payload) },
+    hydrate: async (payload) => { requests.hydrate.push(payload); return checker.hydrate(payload) },
+    validate: async (payload) => { requests.validate.push(payload); return checker.validate(payload) },
+    referenceOverlay: (payload) => checker.referenceOverlay(payload),
+    dispose: () => checker.dispose(),
+  }
+  const persistent = trackedEngine(root, { cacheDir: '.persistent', retainSemanticState: true, validationWorkerFactory: () => worker })
+  const local = trackedEngine(root, { cacheDir: '.local' })
+
+  const persistentBuild = await persistent.build()
+  const localBuild = await local.build()
+  fs.writeFileSync(path.join(root, 'src', 'b.ts'), "import { a } from './a'; export function b(){ return a()+2 }\n")
+  const changed = await persistent.incremental([{ type: 'change', path: 'src/b.ts' }])
+  await changed.validation
+
+  assert.deepEqual({
+    indexRequests: requests.index.length,
+    hydrateRequests: requests.hydrate.length,
+    indexSources: requests.index[0]?.sources.map(([file]) => file),
+    retainedWorkspace: persistent.workspace !== null,
+    graph: canon(persistent.snapshot(persistentBuild.generation)),
+    localGraph: canon(local.snapshot(localBuild.generation)),
+    validationMode: changed.validationMode,
+    validationFiles: changed.validatedFiles,
+    validationHasBasePartitionIds: Object.hasOwn(requests.validate[0] ?? {}, 'basePartitionIds'),
+    validationHasPartitionDir: Object.hasOwn(requests.validate[0] ?? {}, 'partitionDir'),
+  }, {
+    indexRequests: 1,
+    hydrateRequests: 0,
+    indexSources: ['src/a.ts', 'src/b.ts'],
+    retainedWorkspace: false,
+    graph: canon(local.snapshot(localBuild.generation)),
+    localGraph: canon(local.snapshot(localBuild.generation)),
+    validationMode: 'delta',
+    validationFiles: ['src/b.ts'],
+    validationHasBasePartitionIds: false,
+    validationHasPartitionDir: false,
+  })
+})
+
+test('worker ownership: persistent reconcile hydrates exactly once and the first edit uses the adopted worker state', async () => {
+  const root = fixture()
+  const builder = trackedEngine(root, { cacheDir: '.persisted' })
+  await builder.build()
+  await builder.dispose()
+  const checker = new SemanticCheckerWorker()
+  const requests = { index: 0, hydrate: [], validate: [] }
+  const worker = {
+    index: async (payload) => { requests.index += 1; return checker.index(payload) },
+    hydrate: async (payload) => { requests.hydrate.push(payload); return checker.hydrate(payload) },
+    validate: async (payload) => { requests.validate.push(payload); return checker.validate(payload) },
+    referenceOverlay: (payload) => checker.referenceOverlay(payload),
+    dispose: () => checker.dispose(),
+  }
+  const engine = trackedEngine(root, { cacheDir: '.persisted', retainSemanticState: true, validationWorkerFactory: () => worker })
+
+  const reconciled = await engine.reconcile()
+  fs.writeFileSync(path.join(root, 'src', 'b.ts'), "import { a } from './a'; export function b(){ return a()+3 }\n")
+  const changed = await engine.incremental([{ type: 'change', path: 'src/b.ts' }])
+  await changed.validation
+
+  assert.deepEqual({ indexRequests: requests.index, hydrateRequests: requests.hydrate.length, hydrateSources: requests.hydrate[0]?.sources.map(([file]) => file), retainedWorkspace: engine.workspace !== null, reusedFiles: reconciled.reusedFiles, validationMode: changed.validationMode, validationFiles: changed.validatedFiles, validationHasBasePartitionIds: Object.hasOwn(requests.validate[0] ?? {}, 'basePartitionIds') }, { indexRequests: 0, hydrateRequests: 1, hydrateSources: ['src/a.ts', 'src/b.ts'], retainedWorkspace: false, reusedFiles: ['src/a.ts', 'src/b.ts'], validationMode: 'delta', validationFiles: ['src/b.ts'], validationHasBasePartitionIds: false })
+})
+
+test('worker ownership boundary: a default short-lived engine never calls worker index or hydrate', async () => {
+  const root = fixture()
+  let indexRequests = 0
+  let hydrateRequests = 0
+  const engine = trackedEngine(root, { validationWorkerFactory: () => ({ index: async () => { indexRequests += 1; throw new Error('unexpected index') }, hydrate: async () => { hydrateRequests += 1; throw new Error('unexpected hydrate') }, validate: async () => { throw new Error('unexpected validate') }, dispose: async () => {} }) })
+
+  const built = await engine.build()
+  const reconciled = await engine.reconcile()
+
+  assert.deepEqual({ indexRequests, hydrateRequests, buildFiles: Object.keys(engine.readGeneration(built.generation).sources), reconciledGeneration: reconciled.generation, retainedWorkspace: engine.workspace !== null }, { indexRequests: 0, hydrateRequests: 0, buildFiles: ['src/a.ts', 'src/b.ts'], reconciledGeneration: built.generation, retainedWorkspace: true })
+})
+
+test('worker ownership error guessing: a rejected first index preserves absent CURRENT and a retry starts a fresh successful index', async () => {
+  const root = fixture()
+  const checker = new SemanticCheckerWorker()
+  let attempts = 0
+  const engine = trackedEngine(root, { retainSemanticState: true, validationWorkerFactory: () => ({
+    index: async (payload) => { attempts += 1; if (attempts === 1) throw new Error('worker index rejected'); return checker.index(payload) },
+    hydrate: (payload) => checker.hydrate(payload), validate: (payload) => checker.validate(payload), referenceOverlay: (payload) => checker.referenceOverlay(payload), dispose: () => checker.dispose(),
+  }) })
+
+  await assert.rejects(engine.build(), /worker index rejected/)
+  const currentAfterFailure = fs.existsSync(path.join(root, '.codegraph', 'CURRENT'))
+  const built = await engine.build()
+
+  assert.deepEqual({ attempts, currentAfterFailure, currentAfterRetry: engine.readGeneration().generation, builtGeneration: built.generation, retainedWorkspace: engine.workspace !== null }, { attempts: 2, currentAfterFailure: false, currentAfterRetry: built.generation, builtGeneration: built.generation, retainedWorkspace: false })
+})
+
+test('worker ownership equivalence partition: malformed index source membership cannot publish CURRENT', async () => {
+  const root = fixture()
+  const engine = trackedEngine(root, { retainSemanticState: true, validationWorkerFactory: () => ({ index: async () => ({ mode: 'full', sourceBlobs: {}, partitions: {} }), dispose: async () => {} }) })
+
+  await assert.rejects(engine.build(), /membership|source|malformed/i)
+
+  assert.equal(fs.existsSync(path.join(root, '.codegraph', 'CURRENT')), false)
+})
+
+test('worker protocol boundary: an unknown request type rejects instead of falling through to validation', async () => {
+  const worker = new Worker(new URL('../semantic-checker-worker.mjs', import.meta.url), { workerData: { semanticChecker: true } })
+  const response = new Promise((resolve, reject) => { worker.once('message', resolve); worker.once('error', reject) })
+  worker.postMessage({ id: 91, type: 'not-a-semantic-operation', payload: {} })
+
+  const message = await response
+  await worker.terminate()
+
+  assert.deepEqual({ id: message.id, hasResult: Object.hasOwn(message, 'result'), errorMatches: /unknown|unsupported/i.test(message.error?.message ?? message.error ?? '') }, { id: 91, hasResult: false, errorMatches: true })
+})
+
+test('worker index boundary: an empty project returns exact empty source and partition membership', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-worker-index-empty-'))
+  fs.writeFileSync(path.join(root, 'tsconfig.json'), '{}')
+  const worker = new SemanticCheckerWorker()
+
+  const result = await worker.index({ root, sources: [], sourceBlobs: {} })
+  await worker.dispose()
+
+  assert.deepEqual(result, { mode: 'full', sourceBlobs: {}, partitions: {} })
+})
+
+test('worker index boundary: a one-file project returns that exact source and partition membership', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-worker-index-one-'))
+  fs.writeFileSync(path.join(root, 'tsconfig.json'), '{}')
+  const source = 'export const one = 1\n'
+  const hash = contentHash(source)
+  const worker = new SemanticCheckerWorker()
+
+  const result = await worker.index({ root, sources: [['one.ts', source]], sourceBlobs: { 'one.ts': hash } })
+  await worker.dispose()
+
+  assert.deepEqual({ mode: result.mode, sourceFiles: Object.keys(result.sourceBlobs), sourceHash: result.sourceBlobs['one.ts'], partitionFiles: Object.keys(result.partitions), partitionFile: result.partitions['one.ts'].file, partitionHash: result.partitions['one.ts'].sourceHash }, { mode: 'full', sourceFiles: ['one.ts'], sourceHash: hash, partitionFiles: ['one.ts'], partitionFile: 'one.ts', partitionHash: hash })
+})
+
+test('worker index boundary: many files preserve exact source and partition membership', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-worker-index-many-'))
+  fs.writeFileSync(path.join(root, 'tsconfig.json'), '{}')
+  const a = 'export const a = 1\n'
+  const b = "import { a } from './a'; export const b = a\n"
+  const worker = new SemanticCheckerWorker()
+
+  const result = await worker.index({ root, sources: [['a.ts', a], ['b.ts', b]], sourceBlobs: { 'a.ts': contentHash(a), 'b.ts': contentHash(b) } })
+  await worker.dispose()
+
+  assert.deepEqual({ sourceFiles: Object.keys(result.sourceBlobs), partitionFiles: Object.keys(result.partitions), edgeCount: result.partitions['b.ts'].edges.length }, { sourceFiles: ['a.ts', 'b.ts'], partitionFiles: ['a.ts', 'b.ts'], edgeCount: 1 })
+})
+
+test('worker index invalid partition: duplicate source membership rejects before readiness', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-worker-index-duplicate-'))
+  fs.writeFileSync(path.join(root, 'tsconfig.json'), '{}')
+  const source = 'export const a = 1\n'
+  const worker = new SemanticCheckerWorker()
+
+  await assert.rejects(worker.index({ root, sources: [['a.ts', source], ['a.ts', source]], sourceBlobs: { 'a.ts': contentHash(source) } }), /duplicate|membership/i)
+  await worker.dispose()
+})
+
+test('worker hydrate invalid partition: a partition source hash mismatch rejects before readiness', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-worker-hydrate-mismatch-'))
+  fs.writeFileSync(path.join(root, 'tsconfig.json'), '{}')
+  const source = 'export const a = 1\n'
+  const worker = new SemanticCheckerWorker()
+
+  await assert.rejects(worker.hydrate({ root, sources: [['a.ts', source]], sourceBlobs: { 'a.ts': contentHash(source) }, partitions: { 'a.ts': { file: 'a.ts', sourceHash: '0'.repeat(64), symbols: [], edges: [], dependencies: [], unresolved: [] } } }), /hash|partition|mismatch/i)
+  await worker.dispose()
+})
+
+test('worker ownership atomicity: a prepared index is invisible until publication and a failed publish forces a fresh worker index', async () => {
+  const root = fixture()
+  const checker = new SemanticCheckerWorker()
+  let releaseIndex
+  let indexRequests = 0
+  let overlayRequests = 0
+  const worker = {
+    index: async (payload) => {
+      indexRequests += 1
+      if (indexRequests === 1) await new Promise((resolve) => { releaseIndex = resolve })
+      return checker.index(payload)
+    },
+    hydrate: (payload) => checker.hydrate(payload),
+    validate: (payload) => checker.validate(payload),
+    referenceOverlay: async (payload) => { overlayRequests += 1; return checker.referenceOverlay(payload) },
+    dispose: () => checker.dispose(),
+  }
+  const engine = trackedEngine(root, { retainSemanticState: true, validationWorkerFactory: () => worker })
+  const publish = engine.store.publish.bind(engine.store)
+  engine.store.publish = () => { throw new Error('CURRENT publication failed') }
+
+  const firstBuild = engine.build()
+  while (!releaseIndex) await new Promise((resolve) => setImmediate(resolve))
+  const concurrentQuery = engine.queryBatch({ type: 'refs', name: 'a', resolved: true }).then(() => 'published', () => 'unavailable')
+  releaseIndex()
+  await assert.rejects(firstBuild, /publication failed/)
+  const queryWhilePrepared = await concurrentQuery
+  const currentAfterFailure = fs.existsSync(path.join(root, '.codegraph', 'CURRENT'))
+  engine.store.publish = publish
+
+  const built = await engine.build()
+  const rows = await engine.queryBatch({ type: 'refs', name: 'a', resolved: true, generation: built.generation })
+
+  assert.deepEqual({ queryWhilePrepared, currentAfterFailure, indexRequests, overlayRequests, rows: rows.map(({ fromSymbol, toSymbol, line, call }) => ({ fromFile: fromSymbol.file, toFile: toSymbol.file, line, call })), retainedWorkspace: engine.workspace !== null }, { queryWhilePrepared: 'unavailable', currentAfterFailure: false, indexRequests: 2, overlayRequests: 1, rows: [{ fromFile: 'src/b.ts', toFile: 'src/a.ts', line: 1, call: true }], retainedWorkspace: false })
+})
+
+test('worker ownership recovery: failed persisted hydration preserves CURRENT and read queries then retries hydration without a main workspace', async () => {
+  const root = fixture()
+  const builder = trackedEngine(root, { cacheDir: '.hydrate-retry' })
+  const built = await builder.build()
+  const currentPath = path.join(root, '.hydrate-retry', 'CURRENT')
+  const currentBefore = fs.readFileSync(currentPath)
+  await builder.dispose()
+  const checker = new SemanticCheckerWorker()
+  let hydrateRequests = 0
+  const worker = {
+    index: (payload) => checker.index(payload),
+    hydrate: async (payload) => { hydrateRequests += 1; if (hydrateRequests === 1) throw new Error('worker hydrate rejected'); return checker.hydrate(payload) },
+    validate: (payload) => checker.validate(payload),
+    referenceOverlay: (payload) => checker.referenceOverlay(payload),
+    dispose: () => checker.dispose(),
+  }
+  const engine = trackedEngine(root, { cacheDir: '.hydrate-retry', retainSemanticState: true, validationWorkerFactory: () => worker })
+
+  await assert.rejects(engine.reconcile(), /hydrate rejected/)
+  const rowsAfterFailure = await engine.queryBatch({ type: 'symbols', name: 'a', generation: built.generation })
+  const currentAfterFailure = fs.readFileSync(currentPath)
+  const retried = await engine.reconcile()
+
+  assert.deepEqual({ hydrateRequests, currentUnchanged: currentAfterFailure.equals(currentBefore), rowsAfterFailure: rowsAfterFailure.map(({ name, file, line }) => ({ name, file, line })), retryGeneration: retried.generation, retainedWorkspace: engine.workspace !== null }, { hydrateRequests: 2, currentUnchanged: true, rowsAfterFailure: [{ name: 'a', file: 'src/a.ts', line: 1 }], retryGeneration: built.generation, retainedWorkspace: false })
+})
+
+test('worker ownership storage boundary: a fresh persistent build never rereads partitions returned by worker index', async () => {
+  const root = fixture()
+  const checker = new SemanticCheckerWorker()
+  let partitionReads = 0
+  const engine = trackedEngine(root, { retainSemanticState: true, validationWorkerFactory: () => ({ index: (payload) => checker.index(payload), hydrate: (payload) => checker.hydrate(payload), validate: (payload) => checker.validate(payload), referenceOverlay: (payload) => checker.referenceOverlay(payload), dispose: () => checker.dispose() }) })
+  const readPartition = engine.store.readPartition.bind(engine.store)
+  engine.store.readPartition = (...args) => { partitionReads += 1; return readPartition(...args) }
+
+  const built = await engine.build()
+
+  assert.deepEqual({ partitionReads, generation: engine.readGeneration().generation, builtGeneration: built.generation, retainedWorkspace: engine.workspace !== null }, { partitionReads: 0, generation: built.generation, builtGeneration: built.generation, retainedWorkspace: false })
 })

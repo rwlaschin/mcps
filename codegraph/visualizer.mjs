@@ -3,6 +3,7 @@ import fs from 'node:fs'
 import http from 'node:http'
 import path from 'node:path'
 import { streamQuery } from './query-client.mjs'
+import { QUERY_VIEW_CACHE_FILE } from './query-cache-schema.mjs'
 import { buildLayeredGraph, buildHeatmapData, buildSunburstData, buildChordData } from './visualizer-graph.mjs'
 
 const args = process.argv.slice(2)
@@ -2561,7 +2562,7 @@ export function createVisualizerServer(rootPath = root, options = {}) {
     if (p.includes('/node_modules/') || p.includes('/.git/') || p.includes('/dist/') || p.includes('/build/') || p.includes('/coverage/')) return true
     if (p.endsWith('/node_modules') || p.endsWith('/.git') || p.endsWith('/dist') || p.endsWith('/build') || p.endsWith('/coverage')) return true
     if (p.includes('/.codegraph/generations') || p.includes('/.codegraph/partitions') || p.includes('/.codegraph/overlays')) return true
-    if (p.endsWith('.tmp') || p.includes('.tmp.') || p.includes('query-view-cache.bin')) return true
+    if (p.endsWith('.tmp') || p.includes('.tmp.') || p.includes(QUERY_VIEW_CACHE_FILE) || p.includes('query-view-cache-v2.bin')) return true
     return false
   }
 
@@ -2577,6 +2578,9 @@ export function createVisualizerServer(rootPath = root, options = {}) {
       const isSource = ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.mts', '.cts'].includes(path.extname(file).toLowerCase())
       if (isCurrent || isSource) handleFileChange(evt, file)
     })
+    // fs.watch has no 'ready' event of its own, but the watch is live once the call returns, and
+    // callers wait on one before making a change they expect to be seen.
+    queueMicrotask(() => watcher?.emit('ready'))
     console.log(`[CodeGraph Server] Watching for code & index changes in: ${resolvedRoot}`)
   } catch (err) {
     console.warn(`[CodeGraph Server] Could not attach watcher to ${resolvedRoot}:`, err.message)
@@ -2697,4 +2701,3 @@ if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(im
     process.stderr.write(`⚡ CodeGraph visualizer: http://127.0.0.1:${port}\n`)
   })
 }
-

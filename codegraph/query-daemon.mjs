@@ -247,9 +247,57 @@ export class QueryDaemonClient {
     })
   }
 
+  // Streams over the daemon's op:'query' path rather than awaiting queryBatch. Batching deadlocks
+  // any consumer that cancels in response to a row: the daemon drains the whole generator before
+  // writing, so an engine awaiting an abort waits on a client that is waiting on the batch.
   async *query(query, options = {}) {
-    const rows = await this.queryBatch(query, options)
-    for (const row of rows) { if (options.signal?.aborted) return; yield row }
+    let attempt = 0
+    let delivered = 0
+    while (attempt < 2) {
+      if (options.signal?.aborted) return
+      // Same connect-or-start path as queryBatch: a bare connect() skips daemon startup and the
+      // queries captured while it is coming up.
+      if (!this.socket || this.socket.destroyed) this._attach(await connectAfterStart(this.root, this.startDaemon))
+      const id = this.nextId++
+      const socket = this.socket
+      const queued = []
+      let notify = null
+      let done = false
+      let failure = null
+      const wake = () => { const resume = notify; notify = null; resume?.() }
+      const abort = () => { if (socket?.writable) socket.write(`${JSON.stringify({ op: 'cancel', id })}\n`) }
+      this.pending.set(id, {
+        socket,
+        push(row) { queued.push(row); wake() },
+        setRows(rows) { queued.push(...rows); wake() },
+        finish(rows) { if (rows) queued.push(...rows); done = true; wake() },
+        fail(error) { failure = error; done = true; wake() },
+      })
+      options.signal?.addEventListener('abort', abort, { once: true })
+      socket.write(`${JSON.stringify({ op: 'query', id, query, maxQueue: options.maxQueue })}\n`)
+      try {
+        while (true) {
+          while (queued.length && !options.signal?.aborted) { delivered += 1; yield queued.shift() }
+          if (done && !failure) return
+          if (failure) break
+          // After cancelling, drain to the daemon's done frame rather than returning at once: the
+          // frame is what proves the daemon delivered the abort to the engine.
+          await new Promise((resolve) => { notify = resolve })
+        }
+      } finally {
+        this.pending.delete(id)
+        options.signal?.removeEventListener('abort', abort)
+        // A consumer that breaks out of the loop runs this without the daemon ever being told, so
+        // the engine would keep producing rows for an id nobody reads. Cancel unless it finished.
+        if (!done && socket?.writable) socket.write(`${JSON.stringify({ op: 'cancel', id })}\n`)
+      }
+      // Retry only a connection loss that delivered nothing — rows already yielded cannot be
+      // un-yielded, so a mid-stream failure has to surface.
+      if (options.signal?.aborted) return
+      if (this.closed || delivered > 0 || attempt++ > 0 || !this.startDaemon || !/connection|EPIPE|ECONN/.test(failure.message)) throw failure
+      this.socket?.destroy()
+      this.socket = null
+    }
   }
 
   async queryBatch(query, options = {}) {

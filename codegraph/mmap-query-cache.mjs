@@ -1,9 +1,12 @@
 import crypto from 'node:crypto'
 import { crc32 } from 'node:zlib'
+import { coverageName, requireCoverage } from './edge-coverage.mjs'
+import { CACHE_SCHEMA_VERSION } from './query-cache-schema.mjs'
+export { CACHE_SCHEMA_VERSION, QUERY_VIEW_CACHE_FILE } from './query-cache-schema.mjs'
 
 const FILE_MAGIC = 0x43474d4d
 const PAGE_MAGIC = 0x43515047
-const VERSION = 2
+const VERSION = CACHE_SCHEMA_VERSION
 const HEADER_BYTES = 256
 const SCRATCH_BYTES = 4096
 const PAGE_HEADER_BYTES = 64
@@ -38,7 +41,7 @@ const encodePage = ({ generation, coverage, view }) => {
     return offset
   }
   const generationOffset = intern(generation)
-  const coverageOffset = intern(coverage)
+  const coverageOffset = intern(coverageName(requireCoverage(coverage)))
   for (const file of graph.files) intern(file)
   for (const symbol of graph.symbols) {
     intern(symbol.id); intern(symbol.file); intern(symbol.name); intern(symbol.kind)
@@ -236,7 +239,7 @@ export class MmapQueryCache {
         const data = new DataView(this.mapping.buffer, this.mapping.byteOffset + descriptor.offset, descriptor.length)
         if (data.getUint32(0, true) !== PAGE_MAGIC || data.getUint32(4, true) !== VERSION) continue
         const temporary = new MappedQueryView(this.mapping, descriptor.offset, descriptor.length, () => {})
-        if (temporary.string(data.getUint32(56, true)) !== generation || temporary.string(data.getUint32(60, true)) !== coverage) continue
+        if (temporary.string(data.getUint32(56, true)) !== generation || temporary.string(data.getUint32(60, true)) !== coverageName(requireCoverage(coverage))) continue
         this.leases[index] += 1; let released = false
         const release = () => { if (!released) { released = true; this.leases[index] = Math.max(0, this.leases[index] - 1) } }
         const mappedView = new MappedQueryView(this.mapping, descriptor.offset, descriptor.length, release, this.decodeObserver)

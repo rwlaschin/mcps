@@ -1,6 +1,8 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { MmapQueryCache } from './mmap-query-cache.mjs'
+import { prepareQueryViewCache } from './query-cache-schema.mjs'
+import { EDGE_COVERAGE, coverageCode, coverageName } from './edge-coverage.mjs'
 import { nativeMmapAdapter } from './native/mmap-adapter.mjs'
 
 const endpoint = ({ id, name, file, line, kind }) => ({ id, name, file, line, kind })
@@ -9,7 +11,7 @@ export class DaemonQueryEngine {
   constructor(root, options = {}) {
     this.root = path.resolve(root)
     this.cache = (options.cacheFactory ?? (() => new MmapQueryCache({
-      filePath: path.join(this.root, '.codegraph', 'query-view-cache.bin'),
+      filePath: prepareQueryViewCache(path.join(this.root, '.codegraph')),
       root: this.root,
       adapter: nativeMmapAdapter,
     })))()
@@ -17,7 +19,6 @@ export class DaemonQueryEngine {
       const { CodeGraphEngine } = await import('./tool-engine.mjs')
       return new CodeGraphEngine(this.root)
     })
-    this.beforeQuery = options.beforeQuery ?? null
     this.disposeFallback = options.disposeFallback ?? true
     this.fallback = null
     this.leases = new Set()
@@ -38,16 +39,16 @@ export class DaemonQueryEngine {
   async pinQuery(request, options = {}) {
     if (options.signal?.aborted) return { metadata: {}, graph: null, rows: [] }
     if (this.disposed) throw new Error('daemon query engine is disposed')
-    await this.beforeQuery?.()
-    if (options.signal?.aborted) return { metadata: {}, graph: null, rows: [] }
     if (request.consistency === 'latest') return this.#pinFallback(request, options)
     const generation = request.generation ?? this.#currentGeneration()
     if (!generation) return this.#pinFallback(request, options)
-    const coverage = request.type === 'refs' || request.type === 'graph' ? (request.edgeCoverage ?? 'complete') : 'calls'
+    const coverage = request.type === 'refs' || request.type === 'graph'
+      ? (coverageCode(request.edgeCoverage) ?? EDGE_COVERAGE.COMPLETE)
+      : EDGE_COVERAGE.CALLS
     let lease
     try {
-      lease = this.cache.acquire({ generation, coverage })
-      if (!lease && request.type === 'symbols') lease = this.cache.acquire({ generation, coverage: 'complete' })
+      lease = this.cache.acquire({ generation, coverage: coverageName(coverage) })
+      if (!lease && request.type === 'symbols') lease = this.cache.acquire({ generation, coverage: coverageName(EDGE_COVERAGE.COMPLETE) })
     } catch {}
     if (!lease) return this.#pinFallback(request, options)
     this.leases.add(lease)
@@ -94,7 +95,7 @@ export class DaemonQueryEngine {
 
   async #pinFallback(request, options) {
     const engine = await this.#fallback()
-    if (request.type === 'graph' && request.edgeCoverage === 'complete') {
+    if (request.type === 'graph' && coverageCode(request.edgeCoverage) === EDGE_COVERAGE.COMPLETE) {
       const graph = await engine.snapshotComplete(request.generation, options)
       return { metadata: { revision: null, freshness: 'validated', coverage: graph.edgeCoverage, validatedGeneration: graph.generation }, graph, rows: [graph] }
     }

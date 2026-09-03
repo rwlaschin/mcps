@@ -5,6 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { EventEmitter } from 'node:events'
 import { DebouncedBuildQueue, McpProjectRuntime } from '../mcp-runtime.mjs'
+import { DaemonQueryEngine } from '../daemon-query-engine.mjs'
 
 test('debounce coalesces and preserves events arriving during a build', async () => {
   const batches = []; let release
@@ -33,6 +34,41 @@ test('MCP runtime reconciles on startup and shuts watcher down', async () => {
   assert.equal(reconciled, 1)
   await runtime.close()
   assert.equal(runtime.queue.closed, true)
+})
+
+test('ownership boundary: the MCP runtime creates an engine that retains semantic state in its worker', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-mcp-worker-owner-'))
+  fs.writeFileSync(path.join(root, 'tsconfig.json'), '{}')
+
+  const runtime = new McpProjectRuntime(root)
+
+  assert.equal(runtime.engine.retainSemanticState, true)
+  return runtime.engine.dispose()
+})
+
+test('ownership boundary: the MCP runtime preserves an injected engine without replacing its policy', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-mcp-injected-owner-'))
+  fs.writeFileSync(path.join(root, 'tsconfig.json'), '{}')
+  const injected = { retainSemanticState: false, policy: (await import('../source-policy.mjs')).createSourcePolicy(root), reconcile: async () => {}, incremental: async () => {}, dispose: async () => {} }
+
+  const runtime = new McpProjectRuntime(root, { engine: injected })
+
+  assert.equal(runtime.engine, injected)
+})
+
+test('ownership boundary: mmap-only daemon queries do not opt the fallback engine into retained semantic state', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-mmap-owner-'))
+  fs.mkdirSync(path.join(root, '.codegraph'))
+  let requestedOptions
+  const query = new DaemonQueryEngine(root, {
+    cacheFactory: () => ({ acquire: () => null, dispose: () => {} }),
+    engineFactory: async (options) => { requestedOptions = options; return { queryBatch: async () => [], dispose: async () => {} } },
+  })
+
+  await query.queryBatch({ type: 'symbols', name: 'missing' })
+  await query.dispose()
+
+  assert.equal(requestedOptions, undefined)
 })
 
 test('domain analysis: a watcher build advancing CURRENT cannot change an already pinned reference request', async () => {

@@ -1,11 +1,15 @@
 #!/usr/bin/env node
+import fs from 'node:fs'
 import path from 'node:path'
 import readline from 'node:readline'
 import { once } from 'node:events'
 
 const args = process.argv.slice(2)
 const rootAt = args.indexOf('--root')
-const root = path.resolve(rootAt >= 0 ? args[rootAt + 1] : process.env.CODEGRAPH_ROOT ?? process.cwd())
+const requestedRoot = path.resolve(rootAt >= 0 ? args[rootAt + 1] : process.env.CODEGRAPH_ROOT ?? process.cwd())
+// One spelling of the tree across every entry point; a symlinked root would otherwise be indexed
+// under one path and queried under another.
+const root = fs.existsSync(requestedRoot) ? fs.realpathSync(requestedRoot) : requestedRoot
 const profileAt = args.indexOf('--profile')
 if (profileAt >= 0 && (!args[profileAt + 1] || args[profileAt + 1].startsWith('--'))) {
   process.stderr.write('codegraph: --profile requires a file path\n')

@@ -1,6 +1,6 @@
 {
   "name": "@mcps/codegraph",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Ultra-fast, zero-overhead type-resolved symbol and call graph engine for TypeScript/JavaScript codebases. Model Context Protocol (MCP) server & CLI with memory-mapped query views and incremental kernel watching.",
   "type": "module",
   "main": "query-client.mjs",
@@ -53,7 +53,8 @@
     "visualize": "node visualizer.mjs",
     "visualize:watch": "node --watch-path=visualizer.mjs --watch-path=visualizer-graph.mjs --watch-path=indexer.mjs --watch-path=query-client.mjs --watch-path=tool.mjs visualizer.mjs",
     "dev": "node --watch-path=visualizer.mjs --watch-path=visualizer-graph.mjs --watch-path=indexer.mjs --watch-path=query-client.mjs --watch-path=tool.mjs visualizer.mjs",
-    "test": "node --test"
+    "test": "node --test",
+    "performance": "node scripts/codegraph.performance.mjs"
   },
   "dependencies": {
     "@ts-morph/common": "^0.29.0",

@@ -4,6 +4,7 @@ import fs from 'node:fs'
 import { Project, Node, SyntaxKind } from 'ts-morph'
 import { RealFileSystemHost } from '@ts-morph/common'
 import { PrefetchedFileSystemHost } from './prefetched-file-system.mjs'
+import { EDGE_COVERAGE, requireCoverage } from './edge-coverage.mjs'
 
 export const contentHash = (text) => crypto.createHash('sha256').update(text).digest('hex')
 const slash = (p) => p.split(path.sep).join('/')
@@ -119,25 +120,33 @@ function collectFileSyntax(file, source, lineCursor) {
   return { rows: result, identifiers }
 }
 
-export function prepareSemanticProject(project, root, profiler = null) {
-  project.__codegraphRoot = root
-  const byDeclaration = new Map(); const perFile = new Map(); const lineCursor = new LineCursor()
-  for (const file of project.getSourceFiles()) {
-    const rel = slash(path.relative(root, file.getFilePath()))
+// Re-collects syntax for a subset of an existing context's files. `nodesByFile` exists so an
+// overwritten source file's declaration nodes leave `byDeclaration` instead of accumulating
+// detached nodes for the life of the worker.
+export function refreshSemanticFiles(context, files, profiler = null) {
+  for (const file of files) {
+    const rel = slash(path.relative(context.root, file.getFilePath()))
     const args = { file: rel, descendantTraversals: 1, declarationCount: 0, identifierCount: 0 }
     const profile = profiler?.begin('collect-file-syntax', args)
     try {
-      const analysis = collectFileSyntax(file, file.getFullText(), lineCursor)
+      for (const node of context.nodesByFile.get(file.getFilePath()) ?? []) context.byDeclaration.delete(node)
+      const analysis = collectFileSyntax(file, file.getFullText(), context.lineCursor)
       args.declarationCount = analysis.rows.length
       args.identifierCount = analysis.identifiers.length
-      perFile.set(file.getFilePath(), analysis)
-      for (const row of analysis.rows) byDeclaration.set(row.node.compilerNode, row.identity)
+      context.perFile.set(file.getFilePath(), analysis)
+      context.nodesByFile.set(file.getFilePath(), analysis.rows.map((row) => row.node.compilerNode))
+      for (const row of analysis.rows) context.byDeclaration.set(row.node.compilerNode, row.identity)
     } finally {
-      lineCursor.clear()
+      context.lineCursor.clear()
       if (profile) profiler.end(profile)
     }
   }
-  return { project, root, byDeclaration, perFile, lineCursor }
+  return context
+}
+
+export function prepareSemanticProject(project, root, profiler = null) {
+  project.__codegraphRoot = root
+  return refreshSemanticFiles({ project, root, byDeclaration: new Map(), perFile: new Map(), nodesByFile: new Map(), lineCursor: new LineCursor() }, project.getSourceFiles(), profiler)
 }
 
 function identityForSymbol(symbol, context, identifierArgs) {
@@ -156,7 +165,7 @@ function callExpressionForIdentifier(ident) {
   return Node.isPropertyAccessExpression(parent) && parent.getNameNode() === ident && Node.isCallExpression(grand) && grand.getExpression() === parent
 }
 
-function resolveIdentifierEdges(identifiers, localByNode, context, identifierArgs, edgeCoverage) {
+function resolveIdentifierEdges(identifiers, localByNode, context, identifierArgs, coverage) {
   const edges = []
   const enclosing = (node) => {
     for (let cur = node.getParent(); cur; cur = cur.getParent()) {
@@ -170,7 +179,7 @@ function resolveIdentifierEdges(identifiers, localByNode, context, identifierArg
     const { node: ident, line } = identifier
     identifierArgs.total += 1
     const call = callExpressionForIdentifier(ident)
-    if (edgeCoverage === 'calls' && !call) continue
+    if (coverage === EDGE_COVERAGE.CALLS && !call) continue
     const from = enclosing(ident)
     if (!from) { identifierArgs.noOwner += 1; continue }
     let symbol = ident.getSymbol?.()
@@ -190,7 +199,7 @@ function resolveIdentifierEdges(identifiers, localByNode, context, identifierArg
   return edges
 }
 
-export function parsePartition(rel, source, knownFiles, context, profiler = null, edgeCoverage = 'complete') {
+export function parsePartition(rel, source, knownFiles, context, profiler = null, edgeCoverage = EDGE_COVERAGE.COMPLETE) {
   const absolute = path.join(context.root, rel)
   const file = context.project.getSourceFile(absolute)
   if (!file) throw new Error(`source was not prefetched: ${rel}`)
@@ -211,7 +220,7 @@ export function parsePartition(rel, source, knownFiles, context, profiler = null
   const localByNode = new Map(rows.map(({ node, identity }) => [node.compilerNode, identity]))
   const identifierArgs = { file: rel, total: 0, noOwner: 0, symbolMissing: 0, aliases: 0, targetMissing: 0, selfTarget: 0, edges: 0, calls: 0, nonCalls: 0, declarationProbes: 0 }
   const identifierProfile = profiler?.begin('identifiers-symbol-resolution', identifierArgs)
-  const edges = resolveIdentifierEdges(analysis.identifiers, localByNode, context, identifierArgs, edgeCoverage)
+  const edges = resolveIdentifierEdges(analysis.identifiers, localByNode, context, identifierArgs, requireCoverage(edgeCoverage))
   if (identifierProfile) profiler.end(identifierProfile)
   const dependencies = []; const unresolved = []
   const dependencyArgs = { file: rel, dependencyDecls: 0, resolved: 0, unresolved: 0, candidates: 0 }
