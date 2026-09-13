@@ -25,10 +25,17 @@ const RELEASE = { release: true }
 
 const body = new URL('./mcp-server.mjs', import.meta.url)
 let server = null
+let serverReady = Promise.resolve()
 let held = ''
 
 const spawn = () => {
   server = new Worker(body)
+  const worker = server
+  serverReady = new Promise((resolve) => {
+    const ready = (message) => { if (message?.ready) { worker.off('message', ready); resolve() } }
+    worker.on('message', ready)
+    worker.once('exit', resolve)
+  })
   // Replies come back as messages and this process writes them, so nothing is in flight on the
   // worker's own stdout when it is terminated.
   server.on('message', (message) => { if (message?.out) process.stdout.write(message.out) })
@@ -43,6 +50,7 @@ const stop = async () => {
   const worker = server
   if (!worker) return
   server = null
+  await Promise.race([serverReady, new Promise((resolve) => setTimeout(resolve, 5_000).unref())])
   await Promise.race([
     new Promise((resolve) => {
       const onMessage = (message) => { if (message?.released) { worker.off('message', onMessage); resolve() } }

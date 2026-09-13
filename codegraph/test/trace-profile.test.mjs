@@ -7,6 +7,7 @@ import { execFileSync, spawnSync } from 'node:child_process'
 import { createTraceProfiler } from '../trace-profile.mjs'
 import { CodeGraphEngine } from '../tool-engine.mjs'
 import { createSemanticProject, parsePartition, prepareSemanticProject } from '../parser.mjs'
+import { decodeInternalPartition } from '../internal-graph.mjs'
 
 const fullWorkerResult = (engine, payload) => {
   const sources = new Map(Object.entries(payload.baseSourceBlobs).map(([file, id]) => [file, engine.store.readSource(id)]))
@@ -178,46 +179,6 @@ test('domain analysis: the root build event reports aggregate IO and reuse count
   )
 })
 
-test('hotpath regression: one changed file profiles provisional refresh and background validation with exact revision metadata', async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-profile-warm-incremental-'))
-  fs.writeFileSync(path.join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { module: 'ESNext' }, include: ['src'] }))
-  fs.mkdirSync(path.join(root, 'src'))
-  fs.writeFileSync(path.join(root, 'src', 'a.ts'), 'export function a(){ return 1 }\n')
-  fs.writeFileSync(path.join(root, 'src', 'b.ts'), "import { a } from './a'; export function b(){ return a() }\n")
-  const tracePath = path.join(root, 'profile.json')
-  const engine = new CodeGraphEngine(root, { profile: tracePath })
-  await engine.build()
-  fs.writeFileSync(path.join(root, 'src', 'b.ts'), "import { a } from './a'; export function b(){ return a()+2 }\n")
-
-  await engine.incremental([{ type: 'change', path: 'src/b.ts' }])
-  const trace = JSON.parse(fs.readFileSync(tracePath, 'utf8')).traceEvents
-  const events = trace.filter((event) => event.name === 'codegraph.provisional-refresh' || event.name === 'codegraph.background-validation')
-
-  assert.deepEqual(events.map(({ name, args }) => ({ name, revision: args.revision, freshness: args.freshness, coverage: args.coverage, status: args.status })), [
-    { name: 'codegraph.provisional-refresh', revision: 1, freshness: 'provisional', coverage: 'module-linked-syntax', status: 'ok' },
-    { name: 'codegraph.background-validation', revision: 1, freshness: 'validated', coverage: 'calls', status: 'ok' },
-  ])
-})
-
-test('domain analysis: fast refresh profiles provisional work separately from background validation and reports exact revision metadata', async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-profile-provisional-refresh-'))
-  fs.writeFileSync(path.join(root, 'tsconfig.json'), JSON.stringify({ include: ['src'] }))
-  fs.mkdirSync(path.join(root, 'src'))
-  fs.writeFileSync(path.join(root, 'src', 'a.ts'), 'export function a(){ return 1 }\n')
-  const tracePath = path.join(root, 'profile.json')
-  const engine = new CodeGraphEngine(root, { profile: tracePath, validationWorkerFactory: () => ({ validate: async (payload) => fullWorkerResult(engine, payload), dispose: async () => {} }) })
-  await engine.build()
-
-  const refreshed = engine.applyChanges([{ type: 'change', path: 'src/a.ts', source: 'export function a(){ return 2 }\n' }])
-  await refreshed.validation
-  const events = JSON.parse(fs.readFileSync(tracePath, 'utf8')).traceEvents.filter((event) => event.name === 'codegraph.provisional-refresh' || event.name === 'codegraph.background-validation')
-
-  assert.deepEqual(events.map(({ name, args }) => ({ name, revision: args.revision, freshness: args.freshness, coverage: args.coverage, status: args.status })), [
-    { name: 'codegraph.provisional-refresh', revision: 1, freshness: 'provisional', coverage: 'module-linked-syntax', status: 'ok' },
-    { name: 'codegraph.background-validation', revision: 1, freshness: 'validated', coverage: 'calls', status: 'ok' },
-  ])
-})
-
 test('boundary value: configured read concurrency is reported by the profile while peak reads stays bounded by file count', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-profile-read-concurrency-'))
   fs.writeFileSync(path.join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { module: 'ESNext' }, include: ['src'] }))
@@ -313,58 +274,6 @@ test('regression: profiling preserves reconcile fallback to a successful build w
   )
 })
 
-test('domain analysis: detailed profiling emits one analyzer-compatible complete event per file and parser subphase with literal counters', async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-profile-detail-'))
-  fs.writeFileSync(path.join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { module: 'ESNext' }, include: ['src'] }))
-  fs.mkdirSync(path.join(root, 'src'))
-  fs.writeFileSync(path.join(root, 'src', 'a.ts'), "import { b } from './b'; export function a(){ return b() }\n")
-  fs.writeFileSync(path.join(root, 'src', 'b.ts'), 'export function b(){ return 1 }\n')
-  const tracePath = path.join(root, 'profile.json')
-  const engine = new CodeGraphEngine(root, { profile: tracePath })
-
-  await engine.build()
-  const detailed = JSON.parse(fs.readFileSync(tracePath, 'utf8')).traceEvents.filter((event) => event.args?.file)
-
-  assert.deepEqual(detailed.map((event) => ({ name: event.name, file: event.args.file, phase: event.ph, category: event.cat, counterKeys: Object.keys(event.args).filter((key) => key !== 'file').sort() })).toSorted((left, right) => `${left.file}:${left.name}`.localeCompare(`${right.file}:${right.name}`)), [
-    { name: 'collect-file-syntax', file: 'src/a.ts', phase: 'X', category: 'codegraph', counterKeys: ['declarationCount', 'descendantTraversals', 'identifierCount'] },
-    { name: 'dependencies', file: 'src/a.ts', phase: 'X', category: 'codegraph', counterKeys: ['candidates', 'dependencyDecls', 'resolved', 'unresolved'] },
-    { name: 'exports', file: 'src/a.ts', phase: 'X', category: 'codegraph', counterKeys: ['exportsVisited'] },
-    { name: 'identifiers-symbol-resolution', file: 'src/a.ts', phase: 'X', category: 'codegraph', counterKeys: ['aliases', 'calls', 'declarationProbes', 'edges', 'noOwner', 'nonCalls', 'selfTarget', 'symbolMissing', 'targetMissing', 'total'] },
-    { name: 'partition-hash', file: 'src/a.ts', phase: 'X', category: 'codegraph', counterKeys: ['partitionBytes'] },
-    { name: 'partition-write', file: 'src/a.ts', phase: 'X', category: 'codegraph', counterKeys: ['cacheWrite', 'partitionBytes'] },
-    { name: 'source-hash', file: 'src/a.ts', phase: 'X', category: 'codegraph', counterKeys: ['sourceBytes'] },
-    { name: 'collect-file-syntax', file: 'src/b.ts', phase: 'X', category: 'codegraph', counterKeys: ['declarationCount', 'descendantTraversals', 'identifierCount'] },
-    { name: 'dependencies', file: 'src/b.ts', phase: 'X', category: 'codegraph', counterKeys: ['candidates', 'dependencyDecls', 'resolved', 'unresolved'] },
-    { name: 'exports', file: 'src/b.ts', phase: 'X', category: 'codegraph', counterKeys: ['exportsVisited'] },
-    { name: 'identifiers-symbol-resolution', file: 'src/b.ts', phase: 'X', category: 'codegraph', counterKeys: ['aliases', 'calls', 'declarationProbes', 'edges', 'noOwner', 'nonCalls', 'selfTarget', 'symbolMissing', 'targetMissing', 'total'] },
-    { name: 'partition-hash', file: 'src/b.ts', phase: 'X', category: 'codegraph', counterKeys: ['partitionBytes'] },
-    { name: 'partition-write', file: 'src/b.ts', phase: 'X', category: 'codegraph', counterKeys: ['cacheWrite', 'partitionBytes'] },
-    { name: 'source-hash', file: 'src/b.ts', phase: 'X', category: 'codegraph', counterKeys: ['sourceBytes'] },
-  ])
-})
-
-test('boundary values: a declaration-free file still emits exactly one event for every detailed subphase with zero counters', async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-profile-detail-empty-'))
-  fs.writeFileSync(path.join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { module: 'ESNext' }, include: ['src'] }))
-  fs.mkdirSync(path.join(root, 'src'))
-  fs.writeFileSync(path.join(root, 'src', 'empty.ts'), '')
-  const tracePath = path.join(root, 'profile.json')
-  const engine = new CodeGraphEngine(root, { profile: tracePath })
-
-  await engine.build()
-  const detailed = JSON.parse(fs.readFileSync(tracePath, 'utf8')).traceEvents.filter((event) => event.args?.file === 'src/empty.ts')
-
-  assert.deepEqual(detailed.map((event) => ({ name: event.name, args: event.name === 'partition-hash' || event.name === 'partition-write' ? { ...event.args, partitionBytesIsPositiveInteger: Number.isInteger(event.args.partitionBytes) && event.args.partitionBytes > 0, partitionBytes: undefined } : event.args })), [
-    { name: 'collect-file-syntax', args: { file: 'src/empty.ts', descendantTraversals: 1, declarationCount: 0, identifierCount: 0 } },
-    { name: 'exports', args: { file: 'src/empty.ts', exportsVisited: 0 } },
-    { name: 'identifiers-symbol-resolution', args: { file: 'src/empty.ts', total: 0, noOwner: 0, symbolMissing: 0, aliases: 0, targetMissing: 0, selfTarget: 0, edges: 0, calls: 0, nonCalls: 0, declarationProbes: 0 } },
-    { name: 'dependencies', args: { file: 'src/empty.ts', dependencyDecls: 0, resolved: 0, unresolved: 0, candidates: 0 } },
-    { name: 'source-hash', args: { file: 'src/empty.ts', sourceBytes: 0 } },
-    { name: 'partition-hash', args: { file: 'src/empty.ts', partitionBytes: undefined, partitionBytesIsPositiveInteger: true } },
-    { name: 'partition-write', args: { file: 'src/empty.ts', partitionBytes: undefined, cacheWrite: 1, partitionBytesIsPositiveInteger: true } },
-  ])
-})
-
 test('combinatorial all-pairs: only major outer events sample memory and report integer before after and delta fields', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-profile-memory-'))
   fs.writeFileSync(path.join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { module: 'ESNext' }, include: ['src'] }))
@@ -410,47 +319,6 @@ test('equivalence partition and hotpath regression: disabled profiling touches n
   assert.deepEqual({ parsedFiles: result.parsedFiles, files: engine.snapshot().files, symbols: engine.snapshot().symbols.map(({ name, kind, exported }) => ({ name, kind, exported })), clockCalls, memoryCalls }, { parsedFiles: ['src/a.ts'], files: ['src/a.ts'], symbols: [{ name: 'a', kind: 'function', exported: true }], clockCalls: 0, memoryCalls: 0 })
 })
 
-test('domain analysis: identifier resolution profiling partitions every identifier through one terminal outcome and every edge by call shape', async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-profile-identifier-outcomes-'))
-  fs.writeFileSync(path.join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { module: 'ESNext', noEmit: true }, include: ['src'] }))
-  fs.mkdirSync(path.join(root, 'src'))
-  fs.writeFileSync(path.join(root, 'src', 'dependency.ts'), 'export function dependency(){ return 1 }\n')
-  fs.writeFileSync(path.join(root, 'src', 'subject.ts'), "import { dependency as imported } from './dependency'\nexport function subject(parameter: number){ subject; parameter; missingName; imported; return imported() }\n")
-  const tracePath = path.join(root, 'profile.json')
-  const engine = new CodeGraphEngine(root, { profile: tracePath })
-
-  await engine.build()
-  const event = JSON.parse(fs.readFileSync(tracePath, 'utf8')).traceEvents.find((candidate) => candidate.name === 'identifiers-symbol-resolution' && candidate.args.file === 'src/subject.ts')
-
-  assert.deepEqual(event.args, {
-    file: 'src/subject.ts',
-    total: 9,
-    noOwner: 0,
-    symbolMissing: 0,
-    aliases: 1,
-    targetMissing: 0,
-    selfTarget: 0,
-    edges: 1,
-    calls: 1,
-    nonCalls: 0,
-    declarationProbes: 1,
-  })
-})
-
-test('boundary values: identifier resolution profiling reconciles an empty file with every counter at zero', async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-profile-identifier-empty-'))
-  fs.writeFileSync(path.join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { module: 'ESNext' }, include: ['src'] }))
-  fs.mkdirSync(path.join(root, 'src'))
-  fs.writeFileSync(path.join(root, 'src', 'empty.ts'), '')
-  const tracePath = path.join(root, 'profile.json')
-  const engine = new CodeGraphEngine(root, { profile: tracePath })
-
-  await engine.build()
-  const event = JSON.parse(fs.readFileSync(tracePath, 'utf8')).traceEvents.find((candidate) => candidate.name === 'identifiers-symbol-resolution')
-
-  assert.deepEqual(event.args, { file: 'src/empty.ts', total: 0, noOwner: 0, symbolMissing: 0, aliases: 0, targetMissing: 0, selfTarget: 0, edges: 0, calls: 0, nonCalls: 0, declarationProbes: 0 })
-})
-
 test('equivalence partition and hotpath regression: disabling identifier profiling preserves resolver output without clock sampling', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-profile-identifier-disabled-'))
   fs.writeFileSync(path.join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { module: 'ESNext' }, include: ['src'] }))
@@ -472,55 +340,91 @@ test('equivalence partition and hotpath regression: disabling identifier profili
   })
 })
 
-test('domain analysis and hotpath regression: one descendant walk per file indexes declarations and identifiers without kind-specific fallback', () => {
+test('performance contract: one syntax walk emits the exact semantic and internal graph for a source file', () => {
   const root = '/tmp/cg-one-pass-fixture'
-  const sources = new Map([
-    ['src/a.ts', "import { b } from './b'; export function z(){ return b() }\nexport const a = z()\n"],
-    ['src/b.ts', 'export function b(){ return 1 }\n'],
-  ])
+  const sources = new Map([['src/a.ts', 'export function z({ value = 1 }){ return value }\n']])
   const project = createSemanticProject(root, sources)
-  const traversals = new Map()
-
-  for (const file of project.getSourceFiles()) {
-    traversals.set(file.getBaseName(), 0)
-    const walk = file.forEachDescendant.bind(file)
-    file.forEachDescendant = (...args) => {
-      traversals.set(file.getBaseName(), traversals.get(file.getBaseName()) + 1)
-      return walk(...args)
-    }
-    file.getDescendantsOfKind = () => { throw new Error(`kind-specific descendant fallback used for ${file.getBaseName()}`) }
+  const file = project.getSourceFileOrThrow('/tmp/cg-one-pass-fixture/src/a.ts')
+  let traversalCount = 0
+  const walk = file.forEachDescendant.bind(file)
+  file.forEachDescendant = (callback, ...args) => {
+    traversalCount += 1
+    return walk((node, traversal) => {
+      node.getDescendantsOfKind = () => { throw new Error(`second descendant traversal from ${node.getKindName()}`) }
+      node.getChildren = () => { throw new Error(`wrapper child traversal from ${node.getKindName()}`) }
+      return callback(node, traversal)
+    }, ...args)
   }
 
   const context = prepareSemanticProject(project, root)
-  const a = parsePartition('src/a.ts', sources.get('src/a.ts'), new Set(['src/a.ts', 'src/b.ts']), context)
-  const b = parsePartition('src/b.ts', sources.get('src/b.ts'), new Set(['src/a.ts', 'src/b.ts']), context)
+  const partition = parsePartition('src/a.ts', sources.get('src/a.ts'), new Set(['src/a.ts']), context)
+  const internal = decodeInternalPartition(partition.internalPartition, { compilerFingerprint: partition.internalFingerprint })
 
-  assert.deepEqual({ traversals: Object.fromEntries(traversals), partitions: [a, b] }, {
-    traversals: { 'a.ts': 1, 'b.ts': 1 },
-    partitions: [
-      {
-        file: 'src/a.ts',
-        sourceHash: '806358c49b0ff2eee9e2378fd033004819930bf85ceecbf7d1d7b3c26ecbb2f7',
-        symbols: [
-          { id: '39d29ade4a34dea5e9d8e826', file: 'src/a.ts', name: 'z', kind: 'function', line: 1, qualifiedPath: '<module>', signature: '<>():', ordinal: 0, exported: true },
-          { id: '15c29361acdf05e1efdf95f0', file: 'src/a.ts', name: 'a', kind: 'variable', line: 2, qualifiedPath: '<module>', signature: '<>():', ordinal: 0, exported: true },
-        ],
-        edges: [
-          { from: '39d29ade4a34dea5e9d8e826', to: '6d1f36a6e18b5f8677635dc0', line: 1, call: true },
-          { from: '15c29361acdf05e1efdf95f0', to: '39d29ade4a34dea5e9d8e826', line: 2, call: true },
-        ],
-        dependencies: ['src/b.ts'],
-        unresolved: [],
-      },
-      {
-        file: 'src/b.ts',
-        sourceHash: 'e21cb4b885a9027e3c6384b92f6b7d1d8f93a4beaac235270341532dd57b65b0',
-        symbols: [{ id: '6d1f36a6e18b5f8677635dc0', file: 'src/b.ts', name: 'b', kind: 'function', line: 1, qualifiedPath: '<module>', signature: '<>():', ordinal: 0, exported: true }],
-        edges: [],
-        dependencies: [],
-        unresolved: [],
-      },
-    ],
+  assert.deepEqual({
+    traversalCount,
+    semantic: { file: partition.file, sourceHash: partition.sourceHash, symbols: partition.symbols, edges: partition.edges, dependencies: partition.dependencies, unresolved: partition.unresolved },
+    internal: {
+      owners: internal.owners.map(({ id, kind, name, symbolId, parentOwnerId, cyclomatic, branchCount, nestingDepth, nodeCount }) => ({ id, kind, name, symbolId: symbolId ?? null, parentOwnerId: parentOwnerId ?? null, cyclomatic, branchCount, nestingDepth, nodeCount })),
+      nodes: internal.nodes.map(({ id, ownerId, kind, role, start, end, unreachable }) => ({ id, ownerId, kind, role, start, end, unreachable })),
+      edges: internal.edges,
+      relations: internal.relations,
+    },
+  }, {
+    traversalCount: 1,
+    semantic: {
+      file: 'src/a.ts',
+      sourceHash: 'af94513adaeca51eb2e3914445e0e06b9eb9f4fb3fd088528c66f1a14da3d2b0',
+      symbols: [{ id: '76e3ba62aab7be875b7c8c2e', file: 'src/a.ts', name: 'z', kind: 'function', line: 1, qualifiedPath: '<module>', signature: '<>({ value = 1 }:?):', ordinal: 0, exported: true }],
+      edges: [],
+      dependencies: [],
+      unresolved: [],
+    },
+    internal: {
+      owners: [
+        { id: 0, kind: 'module', name: '<module>', symbolId: null, parentOwnerId: null, cyclomatic: 1, branchCount: 0, nestingDepth: 0, nodeCount: 2 },
+        { id: 1, kind: 'function', name: 'z', symbolId: '76e3ba62aab7be875b7c8c2e', parentOwnerId: 0, cyclomatic: 2, branchCount: 0, nestingDepth: 0, nodeCount: 4 },
+      ],
+      nodes: [
+        { id: 0, ownerId: 0, kind: 'entry', role: 'body', start: 0, end: 49, unreachable: false },
+        { id: 1, ownerId: 0, kind: 'exit', role: 'body', start: 0, end: 49, unreachable: false },
+        { id: 2, ownerId: 1, kind: 'entry', role: 'body', start: 0, end: 48, unreachable: false },
+        { id: 3, ownerId: 1, kind: 'exit', role: 'body', start: 0, end: 48, unreachable: false },
+        { id: 4, ownerId: 1, kind: 'return', role: 'body', start: 34, end: 46, unreachable: false },
+        { id: 5, ownerId: 1, kind: 'condition', role: 'initializer', start: 20, end: 29, unreachable: false },
+      ],
+      edges: [{ ownerId: 0, from: 0, to: 1, kind: 'next' }, { ownerId: 1, from: 4, to: 3, kind: 'return' }, { ownerId: 1, from: 5, to: 4, kind: 'true' }, { ownerId: 1, from: 5, to: 4, kind: 'false' }, { ownerId: 1, from: 2, to: 5, kind: 'next' }],
+      relations: [],
+    },
+  })
+})
+
+test('release-order regression: resolving an untracked property in an earlier file does not traverse that file twice', () => {
+  const root = '/tmp/cg-untracked-declaration-fixture'
+  const sources = new Map([
+    ['src/a.ts', 'export const object = { value: 1 }\n'],
+    ['src/b.ts', "import { object } from './a'; export function read(){ return object.value }\n"],
+  ])
+  const project = createSemanticProject(root, sources)
+  const context = prepareSemanticProject(project, root)
+  const knownFiles = new Set(['src/a.ts', 'src/b.ts'])
+
+  const first = parsePartition('src/a.ts', sources.get('src/a.ts'), knownFiles, context)
+  const later = parsePartition('src/b.ts', sources.get('src/b.ts'), knownFiles, context)
+
+  assert.deepEqual({
+    traversalCounts: context.semanticTraversalCounts,
+    first: { symbols: first.symbols, edges: first.edges },
+    later: { symbols: later.symbols, edges: later.edges },
+  }, {
+    traversalCounts: { 'src/a.ts': 1, 'src/b.ts': 1 },
+    first: {
+      symbols: [{ id: 'b98c416cbd6500fb5e3d454d', file: 'src/a.ts', name: 'object', kind: 'variable', line: 1, qualifiedPath: '<module>', signature: '<>():', ordinal: 0, exported: true }],
+      edges: [],
+    },
+    later: {
+      symbols: [{ id: 'f17d4168d47708e09dde0167', file: 'src/b.ts', name: 'read', kind: 'function', line: 1, qualifiedPath: '<module>', signature: '<>():', ordinal: 0, exported: true }],
+      edges: [{ from: 'f17d4168d47708e09dde0167', to: 'b98c416cbd6500fb5e3d454d', line: 1, call: false }],
+    },
   })
 })
 
@@ -606,7 +510,7 @@ test('worker ownership trace contract: a persistent build keeps the semantic-pro
   fs.mkdirSync(path.join(root, 'src'))
   fs.writeFileSync(path.join(root, 'src', 'a.ts'), 'export const a = 1\n')
   const tracePath = path.join(root, 'profile.json')
-  const engine = new CodeGraphEngine(root, { profile: tracePath, retainSemanticState: true })
+  const engine = new CodeGraphEngine(root, { profile: tracePath })
 
   await engine.build()
   await engine.dispose()

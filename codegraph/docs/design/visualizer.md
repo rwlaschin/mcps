@@ -1,5 +1,5 @@
 ---
-modified: 2026-08-27
+modified: 2026-09-12
 dependencies: [parsing-and-resolution.md, storage-and-query.md, mcp-and-cli.md]
 ---
 
@@ -33,12 +33,14 @@ Read this if you are changing anything the browser draws, adding or altering a v
 
 The MCP and CLI surfaces answer targeted graph questions (callers of X, dead code, dependencies of Y). The visualizer answers the shape-of-the-whole-codebase questions those cannot: where the traffic concentrates, what is orphaned, and which calls run against the intended architectural direction. It exists as a local server rather than a static export because the graph is regenerated as the user edits: an fs watcher invalidates the cache and pushes an SSE event, and the page offers a one-click in-place refresh instead of forcing a reload (`visualizer.mjs:877-931`, `:2543-2557`).
 
-The four views are four questions over the same graph:
+The views answer complementary questions over the same validated generation:
 
 - **Layered Flow** — per-symbol cards, split Frontend/Backend, banded by exact connection count, with callers/callees drawn on selection and upward calls flagged as violations.
 - **Heat Map** — one 50x50 tile per file laid out in a boustrophedon (serpentine) flow, colored by normalized incoming-call density, bordered by module color.
 - **Sunburst** — radial partition of the real directory tree (root → directories → file → symbol), arc width proportional to `1 + incoming calls`, with tail symbols collapsed into a `+N more` group arc.
 - **Chord** — module-to-module coupling matrix as perimeter arcs plus interior ribbons, violating pairs colored red.
+- **Call Tree** — a depth-bounded function call hierarchy with complexity bands and selected-function detail.
+- **Complexity** — a directory/file/function treemap and histogram backed by indexed cyclomatic metrics.
 
 Three cross-cutting controls apply to all four: a substring search box, a four-way filter (`all` / `most-called` / `orphans` / `violations`), and an "Include Tests" toggle that re-fetches with `?includeTests=1`.
 
@@ -73,6 +75,8 @@ Routes, in order, each a bare `if (parsedUrl.pathname === …)` with a copy-past
 Anything else falls through to `res.statusCode = 404; res.end('not found')` (`:2688-2689`).
 
 Live reload: one recursive `fs.watch` on the resolved root (`:2572-2579`) — chosen over several narrow watches so a single fd covers both source files and `.codegraph/CURRENT`. `isIgnoredWatchPath` (`:2559-2566`) drops `node_modules`, `.git`, `dist`, `build`, `coverage`, `.codegraph/{generations,partitions,overlays}`, `*.tmp`, and `query-view-cache.bin`. A surviving event for `CURRENT` or a source extension enters `handleFileChange`, which broadcasts `{status:'indexing'}` once, then after `debounceMs` (default 1500, overridable via `options.debounceMs`) nulls `cachedRawGraph` and broadcasts `{status:'ready'}`. A watcher that fails to attach is caught and logged; the server still serves.
+
+The `/calltree` and `/complexity` routes read generation-pinned internal summaries through the same query client as the existing views. Detailed CFG records load only for the selected function.
 
 Client architecture: module-scope state (`currentView`, one cache variable per view, `transform`, selection ids), pan/zoom via a single `transform` attribute on `#canvas` written inside a `requestAnimationFrame` (`scheduleTransform`, `:686-694`), and `switchView()` (`:933-1000`) as the single dispatcher — it toggles the four stats rows, swaps the explanation text, and lazily loads the active view, clearing all four caches when `forceFresh`. `fetchViewData` (`:1003-1021`) dedupes concurrent fetches by URL. Active-tab state persists in `localStorage` under `codegraph_active_tab` and in `location.hash`, with a `hashchange` listener (`:1134-1158`). Each view keeps its own render function, selection state, and `applyFilter` branch (`:2302-2466`); there is no shared render abstraction.
 
@@ -183,20 +187,19 @@ chord:  { source, target, sourceCalls, targetCalls, calls, color, d, isViolation
 
 ## Use Cases
 
-### UC-1: Inspect a symbol's callers and callees in the Layered Flow view
+### 1. Inspect a symbol's callers and callees in the Layered Flow view
 
-**Goal** — A developer determines who calls a given function, what it calls, and whether any of those calls runs against the intended architectural direction.
+**Goal:** A developer determines who calls a given function, what it calls, and whether any of those calls runs against the intended architectural direction.
 
-**Stakeholders** — The developer changing the function; reviewers judging blast radius; anyone relying on the codebase's layering staying acyclic.
+**Stakeholders:** The developer changing the function; reviewers judging blast radius; anyone relying on the codebase's layering staying acyclic.
 
-**Actors** — Developer (browser); the visualizer HTTP server; the query layer supplying the raw graph.
+**Actors:** Developer (browser); the visualizer HTTP server; the query layer supplying the raw graph.
 
-**Preconditions** — The visualizer server is running on 127.0.0.1 for an indexed root; `streamQuery(root, {type:'graph'})` yields a graph row; the browser has loaded `/`.
+**Preconditions:** The visualizer server is running on 127.0.0.1 for an indexed root; `streamQuery(root, {type:'graph'})` yields a graph row; the browser has loaded `/`.
 
-**Postconditions** — `graphData` is cached client-side; the clicked node's id is held in `activeSelectedId`; its caller and callee edges exist in `#edge-layer`; the sidebar shows that symbol's tier, location, layer, and adjacency lists; `cachedRawGraph` is populated server-side for subsequent requests.
+**Postconditions:** `graphData` is cached client-side; the clicked node's id is held in `activeSelectedId`; its caller and callee edges exist in `#edge-layer`; the sidebar shows that symbol's tier, location, layer, and adjacency lists; `cachedRawGraph` is populated server-side for subsequent requests.
 
-**Basic Course of Events**
-
+**Basic Course of Events:**
 1. The page initializes `currentView` from `location.hash` or `localStorage.codegraph_active_tab`, defaulting to `layered`, and calls `switchView()`.
 2. `switchView` shows the layered stats row and explanation, sees `graphData === null`, and calls `loadGraph(false)`, which displays the progress overlay.
 3. `loadGraph` fetches `/graph` through `fetchViewData`.
@@ -208,35 +211,32 @@ chord:  { source, target, sourceCalls, targetCalls, calls, color, d, isViolation
 9. `selectNode` clears prior highlights, sets `has-selection` on the SVG (dimming unrelated cards via CSS), highlights the node and its callers and callees, and builds a caller/callee edge path for each with `createEdgePathElement` — violating edges get the dashed red `violation` class and the danger arrow marker.
 10. The sidebar renders name, tier label, `file:line`, topological layer, connection counts, and clickable caller/callee lists.
 
-**Alternate Flows**
-
+**Alternate Flows:**
 - The developer arrives at `#layered` or has that tab in `localStorage`; step 1 selects it without a click.
 - The developer clicks a caller/callee link in the sidebar, or an edge path: `focusNode` selects the target and eased-pans it to the viewport center (an edge click with Shift held always targets the edge's `from`).
 - The developer types in the search box or picks a filter; `applyFilter` hides non-matching cards, and the selected node plus its direct neighbors stay visible regardless.
 - With the `violations` filter and nothing selected, `applyFilter` draws every violating edge between two visible nodes without any selection.
 - Clicking the already-selected card (or the sidebar's `✕ Reset`) calls `selectNode(null)`, which clears the edge layer, drops `has-selection`, and restores the placeholder text.
 
-**Exceptions**
-
+**Exceptions:**
 - The fetch fails or the route returns 500: `loadGraph`'s `.catch` replaces the progress message with `Error: <message>`, the overlay stays up, and no graph renders.
 - No symbols survive `filterSymbols`: `buildLayeredGraph` returns empty arrays; the stats read 0 and the canvas holds only section headers.
 - The developer navigates away mid-query: `graphForRequest`'s abort fires, the waiter count drops, and the underlying query is aborted only if no other request is still waiting.
 - An edge references a symbol filtered out of `posMap`: `createEdgePathElement` returns `null` and that edge is skipped.
 
-### UC-2: Locate call-traffic hotspots and orphan files across the codebase
+### 2. Locate call-traffic hotspots and orphan files across the codebase
 
-**Goal** — A developer finds which files absorb the most incoming calls and which are called by nothing, without reading any code.
+**Goal:** A developer finds which files absorb the most incoming calls and which are called by nothing, without reading any code.
 
-**Stakeholders** — Developers planning a refactor; reviewers judging where risk concentrates.
+**Stakeholders:** Developers planning a refactor; reviewers judging where risk concentrates.
 
-**Actors** — Developer (browser); the visualizer HTTP server.
+**Actors:** Developer (browser); the visualizer HTTP server.
 
-**Preconditions** — As UC-1.
+**Preconditions:** As UC-1.
 
-**Postconditions** — `heatmapData` is cached client-side and `currentView === "heatmap"` is persisted in `localStorage` and the URL hash; the canvas holds one tile per surviving file, fitted to the viewport; the hovered or locked file's path, module, heat percentage, and symbol list are shown in the sidebar, with `activeSelectedHeatmapFile` set when locked.
+**Postconditions:** `heatmapData` is cached client-side and `currentView === "heatmap"` is persisted in `localStorage` and the URL hash; the canvas holds one tile per surviving file, fitted to the viewport; the hovered or locked file's path, module, heat percentage, and symbol list are shown in the sidebar, with `activeSelectedHeatmapFile` set when locked.
 
-**Basic Course of Events**
-
+**Basic Course of Events:**
 1. The developer clicks the "Heat Map" tab; the handler sets `currentView = "heatmap"`, persists it to `localStorage` and the URL hash, and calls `switchView`.
 2. `switchView` swaps in the heatmap stats row and explanation and, with `heatmapData === null`, calls `loadHeatmap(includeTests)`.
 3. `/heatmap` builds `buildHeatmapData(rawGraph, {includeTests, width: 1400})` off the shared raw graph and returns it with `project`.
@@ -246,33 +246,30 @@ chord:  { source, target, sourceCalls, targetCalls, calls, color, d, isViolation
 7. The developer hovers a tile; with no locked selection, `renderHeatmapFileDetails(f, false)` highlights that tile and its module siblings and lists the file's declared symbols with per-symbol in-degree.
 8. The developer clicks a tile; `window.selectHeatmapFile` locks it and re-renders the pane with the `🔍 LOCKED SELECTION` header, so subsequent hovers no longer replace it.
 
-**Alternate Flows**
-
+**Alternate Flows:**
 - The developer picks the `orphans` or `most-called` filter, or types a query: `applyFilter`'s heatmap branch fades non-matching tiles to opacity 0.06.
 - The developer ticks "Include Tests": `loadHeatmap(true)` re-fetches `/heatmap?includeTests=1` and re-renders with test files included.
 - Clicking the locked tile again unlocks it and restores the placeholder pane.
 - `selectHeatmapModule` renders a module-level pane (metrics plus contained files) for a module selection.
 
-**Exceptions**
-
+**Exceptions:**
 - No files survive filtering: `buildHeatmapData` returns `{modules: [], files: []}`, `centerView` falls back to `{x:40, y:40, k:0.85}`, and the canvas is blank.
 - Fetch or build error: the progress overlay shows `Error: <message>` and the previous view's canvas contents remain.
 - Pointer leaves the tile group with a file locked: `g.onmouseleave` restores the locked file's pane rather than clearing it.
 
-### UC-3: See a code edit reflected without losing the current view
+### 3. See a code edit reflected without losing the current view
 
-**Goal** — A developer editing source keeps the visualizer current while preserving pan, zoom, and the active tab.
+**Goal:** A developer editing source keeps the visualizer current while preserving pan, zoom, and the active tab.
 
-**Stakeholders** — The developer iterating on code; anyone demoing the graph while editing.
+**Stakeholders:** The developer iterating on code; anyone demoing the graph while editing.
 
-**Actors** — Developer (editor and browser); the recursive `fs.watch` watcher; the SSE broadcaster; the graph cache.
+**Actors:** Developer (editor and browser); the recursive `fs.watch` watcher; the SSE broadcaster; the graph cache.
 
-**Preconditions** — The server is running and the watcher attached (its startup log naming the watched root appeared); the browser holds an open `EventSource` on `/events` (the client logs the confirmed `connected` payload).
+**Preconditions:** The server is running and the watcher attached (its startup log naming the watched root appeared); the browser holds an open `EventSource` on `/events` (the client logs the confirmed `connected` payload).
 
-**Postconditions** — `cachedRawGraph` is `null` (or freshly repopulated by the reload); `hasPendingUpdate` is `false` and the toast is hidden; the active view holds data rebuilt from the current on-disk state, while the active tab, search text, and filter selection are unchanged (pan and zoom are re-fitted by `centerView` for the heatmap, sunburst, and chord views, and reset to the layered default for Layered Flow).
+**Postconditions:** `cachedRawGraph` is `null` (or freshly repopulated by the reload); `hasPendingUpdate` is `false` and the toast is hidden; the active view holds data rebuilt from the current on-disk state, while the active tab, search text, and filter selection are unchanged (pan and zoom are re-fitted by `centerView` for the heatmap, sunburst, and chord views, and reset to the layered default for Layered Flow).
 
-**Basic Course of Events**
-
+**Basic Course of Events:**
 1. The developer saves a source file under the watched root.
 2. The watch callback resolves the path, passes `isIgnoredWatchPath`, and matches either basename `CURRENT` or a source extension, so `handleFileChange` runs.
 3. `handleFileChange`, not already debouncing, logs the change and broadcasts `{status:'indexing'}`; the client shows the `⚡ Updating...` toast.
@@ -282,16 +279,14 @@ chord:  { source, target, sourceCalls, targetCalls, calls, color, d, isViolation
 7. The developer clicks Refresh; `window.applyPendingUpdate` hides the toast and calls `switchView(true)`.
 8. `switchView` clears all four view caches and reloads only the active view; the server, cache now empty, runs a fresh `streamQuery` and rebuilds.
 
-**Alternate Flows**
-
+**Alternate Flows:**
 - Instead of clicking Refresh the developer switches tabs: `switchView` sees `hasPendingUpdate`, promotes itself to `forceFresh`, and loads the newly-selected view fresh.
 - The developer dismisses the toast with `✕`: `window.dismissToast` hides it while `hasPendingUpdate` stays set, so the next tab switch still refreshes.
 - The developer ignores the toast entirely: the cache is already invalidated, so any later view load fetches fresh data.
 - An edit lands only in `node_modules`, `.git`, `dist`, `build`, `coverage`, `.codegraph/{generations,partitions,overlays}`, a `.tmp` file, or `query-view-cache.bin`: `isIgnoredWatchPath` drops it and nothing is broadcast.
 - A file with a non-source extension changes: the extension check drops it unless its basename is `CURRENT`.
 
-**Exceptions**
-
+**Exceptions:**
 - `fs.watch` throws at startup: the error is caught and logged as a warning, `server.watcher` is `null`, and the server serves normally with no live updates.
 - The SSE connection drops: `es.onerror` logs a warning and the browser's `EventSource` reconnects on its own; a fresh connection re-emits `connected`.
 - A dead SSE client remains in the set: `broadcast` and the 25 s ping both write inside `try {} catch {}`, and `req 'close'` clears the ping interval and removes the client.
@@ -302,12 +297,13 @@ chord:  { source, target, sourceCalls, targetCalls, calls, color, d, isViolation
 
 - `test/visualizer.test.mjs` — 13 unit tests calling `visualizer-graph.mjs` directly: `colorFor` palette properties, `filterSymbols` inclusion/exclusion, `buildLayeredGraph` layering, edge dedup, tier stratification, most-called/orphan marking, and a 1000-node-with-cycles performance case; `formatLocation`; `classifyArchitecturalTier` across all six tiers; `heatColorFor`; and shape assertions for `buildHeatmapData`, `buildSunburstData`, and `buildChordData`.
 - `test/visualizer-e2e.test.mjs` — 8 server tests built on `createVisualizerServer(root, { streamQuery: mockStreamQuery })` with a simulated request helper: `/` serves the HTML and client script; `/graph` returns enriched layered JSON with `project`, correct layer ordering, orphan marking, valid non-black/non-white colors, and violation detection; `/heatmap`, `/sunburst`, and `/chord` return their shapes; `/events` opens with the `connected` status; a file change produces the debounce log and `ready` SSE event; and an unknown route returns 404.
+- Internal-graph coverage verifies call-tree construction, complexity aggregation, generation pinning, selected-function detail, and bounded `/calltree`, `/complexity`, and `/internals` responses.
 
 ## UI/UX
 
 The visualizer *is* the UI, and it is described functionally above: a header (brand, project pill, four view tabs, per-view stat badges), a toolbar (search, four filter buttons, Include Tests toggle, zoom/center/reset controls), a full-bleed pan/zoom SVG canvas, and a fixed 320 px right-hand Inspector sidebar with a per-view explanation banner and a selection detail pane. Interaction: drag to pan, wheel to zoom toward the cursor (Shift+wheel pans 1:1), `+`/`-`/`0`/`Home`/`h` keyboard shortcuts, hover for a native SVG tooltip, click to select (clicking the same target deselects), and a bottom-left toast for live updates. Theme is a fixed dark palette of CSS custom properties on `:root` (`visualizer.mjs:22-31`); there is no light mode and no theme switch.
 
-There is no mockup to defer to: `codegraph/docs/mockups/` does not exist today — `codegraph/docs/` contains only `README.md` and `design/`. No part of this UI is composed from mockup-defined shared components, and the markup and CSS inside the `page` template literal in `visualizer.mjs` are currently the only specification of its appearance. Per the docs convention no mockup is embedded here.
+The call-tree and complexity views are represented by [`codegraph-calltree.html`](../mockups/codegraph-calltree.html) and [`codegraph-complexity.html`](../mockups/codegraph-complexity.html). The implementation remains the source of truth for current behavior.
 
 ## Dependencies
 

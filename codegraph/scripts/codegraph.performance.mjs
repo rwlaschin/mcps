@@ -5,10 +5,12 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import { GraphStore } from '../store.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const PROJECT = path.resolve(HERE, '..')
-const TIMEOUT_MS = 120_000
+const TIMEOUT_MS = 60_000
+const STDERR_TAIL_BYTES = (64 * 1024) - 256
 const STATES = ['indexed', 'leaf', 'cascade']
 const REQUIRED_FIXTURES = ['src/query/event.ts', 'src/pages/game/GamePopoutShell.tsx', 'src/services/data/session/storyArcState.ts', 'src/utils/plotSameSelectedItem.ts', 'src/types/index.ts']
 const EXCLUDED_DIRECTORIES = new Set(['.git', '.codegraph', 'node_modules', 'dist', 'build', 'coverage', '.next', 'out'])
@@ -21,21 +23,41 @@ export const WORKLOADS = [
   { key: 'queryNamed', label: 'Named-symbol query', tool: 'codegraph_query', arguments: { query: { type: 'symbols', name: 'useSessionEvent', limit: 2000 } } },
   { key: 'queryCapped', label: 'Symbol list (2,000 max)', tool: 'codegraph_query', arguments: { query: { type: 'symbols', limit: 2000 } } },
   { key: 'querySingle', label: 'Single-symbol query', tool: 'codegraph_query', arguments: { query: { type: 'symbols', file: 'src/query/event.ts', name: 'useSessionEvent', limit: 1 } } },
+  { key: 'cyclo', label: 'Cyclomatic complexity', tool: 'codegraph_internals', arguments: { operation: 'metrics', file: 'src/query/event.ts', owner: { symbol: 'useSessionEvent' }, metrics: ['cyclomatic'] } },
 ]
+
+export const workloadsFor = (symbol) => symbol ? WORKLOADS.map((workload) => {
+  if (workload.key === 'refs') return { ...workload, arguments: { symbol } }
+  if (workload.key === 'queryNamed') return { ...workload, arguments: { query: { ...workload.arguments.query, name: symbol } } }
+  if (workload.key === 'querySingle') return { ...workload, arguments: { query: { type: 'symbols', name: symbol, limit: 1 } } }
+  return workload
+}) : WORKLOADS
 
 export const resolveMcpPath = () => path.join(PROJECT, 'mcp.mjs')
 
 export function parseArgs(argv) {
   const options = { root: undefined, samples: 5, json: undefined, markdown: undefined, readme: undefined }
+  let profile = false
+  const profilePaths = {}
   for (let index = 0; index < argv.length; index += 1) {
     const key = argv[index]
-    if (['--root', '--samples', '--json', '--markdown', '--readme'].includes(key)) options[key.slice(2)] = argv[++index]
+    if (['--root', '--samples', '--json', '--markdown', '--readme', '--symbol'].includes(key)) options[key.slice(2)] = argv[++index]
+    else if (key === '--refresh-snapshot') options.refreshSnapshot = true
+    else if (key === '--profile') profile = true
+    else if (['--cpu', '--heap', '--trace'].includes(key)) profilePaths[key.slice(2)] = argv[++index]
+    else if (key === '--diagnostic-log') options.diagnosticLog = argv[++index]
     else throw new Error(`unknown option: ${key}`)
   }
   if (!options.root) throw new Error('--root is required')
   options.root = path.resolve(options.root)
   options.samples = Number(options.samples)
   if (!Number.isInteger(options.samples) || options.samples < 1) throw new Error('--samples must be a positive integer')
+  if (profile) {
+    if (!Object.keys(profilePaths).length) throw new Error('--profile requires --cpu, --heap, or --trace')
+    options.symbol ??= undefined
+    options.profile = profilePaths
+  } else if (options.diagnosticLog) throw new Error('--diagnostic-log requires --profile')
+  else if (Object.keys(profilePaths).length) throw new Error('--cpu, --heap, and --trace require --profile')
   return options
 }
 
@@ -67,6 +89,7 @@ export function assertExpectedReceipt(key, text) {
     queryNamed: /useSessionEvent/,
     queryCapped: /"name"/,
     querySingle: /useSessionEvent/,
+    cyclo: /"record":"metrics".*"cyclomatic":\s*[1-9]\d*/,
   }[key]
   if (!expected?.test(text)) throw new Error(`${key} receipt is not semantically expected: ${text.slice(0, 200)}`)
   return text
@@ -89,7 +112,7 @@ export const measureColdBuild = (root, { build = buildOnce } = {}) => build(root
 
 const countFiles = (value) => Array.isArray(value) ? value.length : Number(value ?? 0)
 
-export async function measureWatcherUpdate({ root, state, previousGeneration, phase, timeoutMs = TIMEOUT_MS, mutate = applyStateMutation, readMetadata, wait = () => new Promise((resolve) => setTimeout(resolve, 25)), clock = performance.now.bind(performance) }) {
+export async function measureWatcherUpdate({ root, state, previousGeneration, phase, timeoutMs = TIMEOUT_MS, mutate = applyStateMutation, readMetadata, afterValidated = async () => {}, wait = () => new Promise((resolve) => setTimeout(resolve, 25)), clock = performance.now.bind(performance) }) {
   const started = clock()
   mutate(root, state)
   return withTimeout((async () => {
@@ -98,6 +121,7 @@ export async function measureWatcherUpdate({ root, state, previousGeneration, ph
       const generation = metadata.generation ?? metadata.validatedGeneration
       const status = metadata.status ?? metadata.freshness
       if (generation && generation !== previousGeneration && status === 'validated') {
+        await afterValidated(root, generation)
         return { ms: clock() - started, generation, parsedFiles: countFiles(metadata.parsedFiles), validatedFiles: countFiles(metadata.validatedFiles) }
       }
       await wait()
@@ -128,11 +152,61 @@ export async function withDisposableMirror(sourceRoot, operation) {
   try { return await operation(mirror) } finally { fs.rmSync(path.dirname(mirror), { recursive: true, force: true }) }
 }
 
-export const startMcp = ({ spawnChild = spawn, platform = process.platform, killProcess = process.kill, requestTimeoutMs = TIMEOUT_MS, shutdownTimeoutMs = 10_000 } = {}) => {
-  const child = spawnChild(process.execPath, [resolveMcpPath()], { cwd: PROJECT, stdio: ['pipe', 'pipe', 'pipe'], detached: platform !== 'win32' })
-  let output = ''; let errors = ''; let id = 0
+export const startMcp = ({ root, profile, diagnosticLog, spawnChild = spawn, platform = process.platform, killProcess = process.kill, controller = process, requestTimeoutMs = TIMEOUT_MS, shutdownTimeoutMs = 10_000 } = {}) => {
+  const args = []
+  const cpuDestination = profile?.cpu ? path.resolve(profile.cpu) : null
+  const cpuDirectory = cpuDestination ? path.dirname(cpuDestination) : null
+  if (profile) {
+    for (const file of Object.values(profile)) fs.mkdirSync(path.dirname(path.resolve(file)), { recursive: true })
+  }
+  const diagnosticPath = diagnosticLog ? path.resolve(diagnosticLog) : null
+  if (diagnosticPath) fs.mkdirSync(path.dirname(diagnosticPath), { recursive: true })
+  const existingCpuProfiles = cpuDirectory
+    ? new Set(fs.readdirSync(cpuDirectory).filter((name) => name.startsWith('CPU.')))
+    : null
+  if (profile) {
+    if (profile.cpu) args.push('--cpu-prof', `--cpu-prof-dir=${cpuDirectory}`)
+    if (profile.heap) args.push('--heap-prof', `--heap-prof-dir=${path.dirname(path.resolve(profile.heap))}`, `--heap-prof-name=${path.basename(profile.heap)}`)
+    if (profile.trace) args.push('--trace-event-categories=v8,node,node.async_hooks', `--trace-event-file-pattern=${path.resolve(profile.trace)}`)
+  }
+  args.push(resolveMcpPath())
+  const diagnosticFd = diagnosticPath ? fs.openSync(diagnosticPath, 'w') : null
+  const environment = root || diagnosticPath
+    ? { ...process.env, ...(root && { CODEGRAPH_ROOT: root }), ...(diagnosticPath && { CODEGRAPH_DEBUG_POOL: '1' }) }
+    : process.env
+  const child = spawnChild(process.execPath, args, { cwd: PROJECT, env: environment, stdio: ['pipe', 'pipe', 'pipe'], detached: platform !== 'win32' })
+  const signalChild = (signal) => platform === 'win32' ? child.kill(signal) : killProcess(-child.pid, signal)
+  let lifecycleActive = true
+  const controllerSignals = ['SIGINT', 'SIGTERM', 'SIGHUP']
+  const onControllerExit = () => { try { if (child.exitCode === null && child.signalCode === null) signalChild('SIGTERM') } catch {} }
+  const signalHandlers = new Map(controllerSignals.map((signal) => [signal, () => {
+    unregisterLifecycle()
+    try { if (child.exitCode === null && child.signalCode === null) signalChild('SIGTERM') } finally {
+      if (typeof controller.kill === 'function' && Number.isInteger(controller.pid)) controller.kill(controller.pid, signal)
+    }
+  }]))
+  function unregisterLifecycle() {
+    if (!lifecycleActive) return
+    lifecycleActive = false
+    for (const [signal, handler] of signalHandlers) controller.off(signal, handler)
+    controller.off('exit', onControllerExit)
+  }
+  for (const [signal, handler] of signalHandlers) controller.once(signal, handler)
+  controller.once('exit', onControllerExit)
+  let output = ''; let errors = Buffer.alloc(0); let id = 0; let diagnosticClosed = false
   const waiting = new Map()
-  child.stderr.on('data', (chunk) => { errors += chunk })
+  const closeDiagnostic = () => {
+    if (diagnosticFd === null || diagnosticClosed) return
+    diagnosticClosed = true
+    fs.closeSync(diagnosticFd)
+  }
+  const errorText = () => errors.toString('utf8').trim()
+  child.stderr.on('data', (chunk) => {
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+    if (diagnosticFd !== null) fs.writeSync(diagnosticFd, bytes)
+    errors = errors.length ? Buffer.concat([errors, bytes]) : bytes
+    if (errors.length > STDERR_TAIL_BYTES) errors = errors.subarray(errors.length - STDERR_TAIL_BYTES)
+  })
   child.stdout.on('data', (chunk) => {
     output += chunk
     for (let newline = output.indexOf('\n'); newline >= 0; newline = output.indexOf('\n')) {
@@ -145,7 +219,8 @@ export const startMcp = ({ spawnChild = spawn, platform = process.platform, kill
     }
   })
   child.once('exit', (code, signal) => {
-    for (const pending of waiting.values()) pending.reject(new Error(`MCP exited (${code ?? signal}): ${errors.trim()}`))
+    unregisterLifecycle()
+    for (const pending of waiting.values()) pending.reject(new Error(`MCP exited (${code ?? signal}): ${errorText()}`))
     waiting.clear()
   })
   const request = (method, params) => withTimeout(new Promise((resolve, reject) => {
@@ -154,11 +229,36 @@ export const startMcp = ({ spawnChild = spawn, platform = process.platform, kill
     child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: requestId, method, params })}\n`)
   }), requestTimeoutMs, 'MCP request')
   const timed = async (method, params, label = 'MCP request') => { const started = performance.now(); const message = await withTimeout(request(method, params), requestTimeoutMs, label); return { message, ms: performance.now() - started } }
-  const signalChild = (signal) => platform === 'win32' ? child.kill(signal) : killProcess(-child.pid, signal)
+  let shutdownArtifacts
+  const retainCpuProfiles = () => {
+    if (!cpuDestination) return undefined
+    if (shutdownArtifacts) return shutdownArtifacts
+    const extension = '.cpuprofile'
+    const stem = cpuDestination.endsWith(extension) ? cpuDestination.slice(0, -extension.length) : cpuDestination
+    const generated = fs.readdirSync(cpuDirectory)
+      .filter((name) => name.startsWith('CPU.') && !existingCpuProfiles.has(name))
+      .sort()
+    const cpu = generated.map((name, index) => {
+      const destination = `${stem}-${index + 1}${extension}`
+      fs.renameSync(path.join(cpuDirectory, name), destination)
+      return destination
+    })
+    shutdownArtifacts = { cpu }
+    return shutdownArtifacts
+  }
   const stop = () => new Promise((resolve, reject) => {
-    if (child.exitCode !== null || child.signalCode !== null) return child.exitCode === 0 || child.signalCode === 'SIGTERM' ? resolve() : reject(new Error(`MCP shutdown failed (${child.exitCode ?? child.signalCode})`))
-    const timer = setTimeout(() => { try { signalChild('SIGKILL') } catch (error) { reject(error); return }; reject(new Error('MCP shutdown timed out')) }, shutdownTimeoutMs)
-    child.once('exit', (code, signal) => { clearTimeout(timer); code === 0 || signal === 'SIGTERM' ? resolve() : reject(new Error(`MCP shutdown failed (${code ?? signal}): ${errors.trim()}`)) })
+    unregisterLifecycle()
+    if (child.exitCode !== null || child.signalCode !== null) {
+      closeDiagnostic()
+      return child.exitCode === 0 || child.signalCode === 'SIGTERM' ? resolve(retainCpuProfiles()) : reject(new Error(`MCP shutdown failed (${child.exitCode ?? child.signalCode})`))
+    }
+    const timer = setTimeout(() => {
+      try { signalChild('SIGKILL') } catch (error) { retainCpuProfiles(); closeDiagnostic(); reject(error); return }
+      retainCpuProfiles()
+      closeDiagnostic()
+      reject(new Error('MCP shutdown timed out'))
+    }, shutdownTimeoutMs)
+    child.once('exit', (code, signal) => { clearTimeout(timer); const artifacts = retainCpuProfiles(); closeDiagnostic(); code === 0 || signal === 'SIGTERM' ? resolve(artifacts) : reject(new Error(`MCP shutdown failed (${code ?? signal}): ${errorText()}`)) })
     child.stdin.end()
     if (platform === 'win32') child.kill('SIGTERM')
     else signalChild('SIGTERM')
@@ -166,7 +266,16 @@ export const startMcp = ({ spawnChild = spawn, platform = process.platform, kill
   return { timed, stop }
 }
 
-export const stopAfter = async (mcp, operation) => { try { return await operation() } finally { await mcp.stop() } }
+export const stopAfter = async (mcp, operation) => {
+  let result; let failure
+  try { result = await operation() } catch (error) { failure = error }
+  try { await mcp.stop() } catch (error) {
+    if (!failure) throw error
+    failure.message += `; MCP shutdown also failed: ${error.message}`
+  }
+  if (failure) throw failure
+  return result
+}
 
 const toolCall = async (mcp, root, name, args, label = name) => {
   const argumentsForMcp = name === 'codegraph_deps' && args.file ? { ...args, target: args.file } : args
@@ -177,14 +286,27 @@ const toolCall = async (mcp, root, name, args, label = name) => {
   return { text, ms }
 }
 
-const semanticReceipt = (workload, text) => ['deps', 'queryNamed', 'queryCapped', 'querySingle'].includes(workload.key) ? normalizeSemanticReceipt(text) : text
+const semanticReceipt = (workload, text) => ['deps', 'queryNamed', 'queryCapped', 'querySingle', 'cyclo'].includes(workload.key) ? normalizeSemanticReceipt(text) : text
+const assertWorkloadReceipt = (workload, text, symbol) => {
+  if (symbol && workload.key === 'refs') {
+    if (!/:\d+\s*->\s*[^\n]+:\d+/.test(text)) throw new Error(`refs receipt is not semantically expected: ${text.slice(0, 200)}`)
+    return text
+  }
+  if (!symbol || !['queryNamed', 'querySingle'].includes(workload.key)) return assertExpectedReceipt(workload.key, text)
+  if (!text.includes(symbol)) throw new Error(`${workload.key} receipt is not semantically expected: ${text.slice(0, 200)}`)
+  return text
+}
 
-export async function runSweep(mcp, root) {
+export async function runSweep(mcp, root, workloads = WORKLOADS, symbol, warmRefs = false) {
   const sweep = {}
-  for (const workload of WORKLOADS) {
+  for (const workload of workloads) {
     const result = await toolCall(mcp, root, workload.tool, structuredClone(workload.arguments))
     const receipt = semanticReceipt(workload, result.text)
-    assertExpectedReceipt(workload.key, receipt)
+    assertWorkloadReceipt(workload, receipt, symbol)
+    if (warmRefs && workload.key === 'refs') {
+      const warm = semanticReceipt(workload, (await toolCall(mcp, root, workload.tool, structuredClone(workload.arguments))).text)
+      if (warm !== receipt) throw new Error('refs semantic output drifted between cold and warm calls')
+    }
     sweep[workload.key] = { ms: result.ms, receipt, sha256: crypto.createHash('sha256').update(receipt).digest('hex') }
   }
   return sweep
@@ -220,8 +342,94 @@ export const sourceSnapshot = (root) => {
   return hash.digest('hex')
 }
 
+const snapshotLocation = (sourceRoot) => {
+  const identity = crypto.createHash('sha256').update(sourceRoot).digest('hex').slice(0, 12)
+  return path.join(PROJECT, '.performance-snapshots', `${path.basename(sourceRoot)}-${identity}`)
+}
+
+export async function withSnapshotLock(root, operation, { directory, target: requestedTarget } = {}) {
+  const target = requestedTarget ?? snapshotLocation(fs.realpathSync(root))
+  const lockDirectory = directory ?? path.dirname(target)
+  const lock = path.join(lockDirectory, `${path.basename(target)}.lock`)
+  fs.mkdirSync(lockDirectory, { recursive: true })
+  let descriptor
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      descriptor = fs.openSync(lock, 'wx')
+      try { fs.writeFileSync(descriptor, `${process.pid}\n`) } catch (error) { fs.closeSync(descriptor); descriptor = undefined; fs.rmSync(lock, { force: true }); throw error }
+      break
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error
+      const owner = Number(fs.readFileSync(lock, 'utf8').trim())
+      try { process.kill(owner, 0) } catch (signalError) {
+        if (signalError.code === 'ESRCH' && attempt === 0) {
+          const backup = `${target}.${owner}.previous`
+          if (!fs.existsSync(target) && fs.existsSync(backup)) fs.renameSync(backup, target)
+          else if (fs.existsSync(target) && fs.existsSync(backup)) {
+            if (fs.existsSync(path.join(target, 'manifest.json'))) readFrozenSnapshot(target)
+            fs.rmSync(backup, { recursive: true })
+          }
+          fs.rmSync(lock, { force: true })
+          continue
+        }
+      }
+      throw new Error(`performance snapshot is already in use: ${target}`)
+    }
+  }
+  try { return await operation() } finally {
+    if (descriptor !== undefined) fs.closeSync(descriptor)
+    fs.rmSync(lock, { force: true })
+  }
+}
+
+const readFrozenSnapshot = (target) => {
+  const source = path.join(target, 'source')
+  const manifestFile = path.join(target, 'manifest.json')
+  if (!fs.statSync(source, { throwIfNoEntry: false })?.isDirectory() || !fs.statSync(manifestFile, { throwIfNoEntry: false })?.isFile()) {
+    throw new Error(`frozen performance snapshot is missing or invalid: ${target}; run again with --refresh-snapshot`)
+  }
+  let manifest
+  try { manifest = JSON.parse(fs.readFileSync(manifestFile, 'utf8')) } catch { throw new Error(`frozen performance snapshot manifest is invalid: ${manifestFile}; run again with --refresh-snapshot`) }
+  validateFixtures(source)
+  const hash = sourceSnapshot(source)
+  if (manifest.schemaVersion !== 1 || manifest.sha256 !== hash) throw new Error(`frozen performance snapshot failed validation: ${target}; run again with --refresh-snapshot`)
+  return { root: source, target, manifest }
+}
+
+export function resolvePerformanceSnapshot(root, { refresh = false } = {}) {
+  const sourceRoot = fs.realpathSync(root)
+  const target = snapshotLocation(sourceRoot)
+  if (!refresh) return readFrozenSnapshot(target)
+
+  validateFixtures(sourceRoot)
+  const before = sourceSnapshot(sourceRoot)
+  const parent = path.dirname(target)
+  fs.mkdirSync(parent, { recursive: true })
+  const temporary = fs.mkdtempSync(path.join(parent, `.${path.basename(target)}-`))
+  const replacement = path.join(temporary, path.basename(target))
+  const replacementSource = path.join(replacement, 'source')
+  const backup = `${target}.${process.pid}.previous`
+  try {
+    fs.mkdirSync(replacement)
+    fs.cpSync(sourceRoot, replacementSource, { recursive: true, filter: excluded })
+    validateFixtures(replacementSource)
+    const copied = sourceSnapshot(replacementSource)
+    if (copied !== before || sourceSnapshot(sourceRoot) !== before) throw new Error('repository changed while refreshing the frozen performance snapshot; existing snapshot was preserved')
+    const manifest = { schemaVersion: 1, sourceRoot, repository: path.basename(sourceRoot), commit: gitValue(sourceRoot, ['rev-parse', 'HEAD'], 'unavailable'), sha256: copied, createdAt: new Date().toISOString() }
+    fs.writeFileSync(path.join(replacement, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`)
+    readFrozenSnapshot(replacement)
+    if (fs.existsSync(target)) fs.renameSync(target, backup)
+    try { fs.renameSync(replacement, target) } catch (error) { if (fs.existsSync(backup)) fs.renameSync(backup, target); throw error }
+    fs.rmSync(backup, { recursive: true, force: true })
+    return readFrozenSnapshot(target)
+  } finally {
+    fs.rmSync(temporary, { recursive: true, force: true })
+  }
+}
+
 export const watcherMetadata = (root, previousGeneration, state) => {
   const cache = path.join(root, '.codegraph')
+  const store = new GraphStore(root)
   const generation = fs.readFileSync(path.join(cache, 'CURRENT'), 'utf8').trim()
   if (generation === previousGeneration) return { generation, status: 'validated' }
   const readManifest = (id) => JSON.parse(fs.readFileSync(path.join(cache, 'generations', `${id}.json`), 'utf8'))
@@ -229,7 +437,7 @@ export const watcherMetadata = (root, previousGeneration, state) => {
   const changed = state === 'leaf' ? ['src/utils/plotSameSelectedItem.ts'] : ['src/types/index.ts']
   const importers = new Map()
   for (const [file, id] of Object.entries(before.partitions)) {
-    const partition = JSON.parse(fs.readFileSync(path.join(cache, 'partitions', `${id}.json`), 'utf8'))
+    const partition = store.readPartition(id)
     for (const dependency of partition.dependencies ?? []) {
       const files = importers.get(dependency)
       if (files) files.push(file); else importers.set(dependency, [file])
@@ -241,23 +449,45 @@ export const watcherMetadata = (root, previousGeneration, state) => {
   return { generation, status: 'validated', parsedFiles, validatedFiles: [...validated] }
 }
 
-export const captureSample = async (sourceRoot, { withMirror = withDisposableMirror, start = startMcp, coldBuild = measureColdBuild, watcherUpdate = measureWatcherUpdate, readMetadata = watcherMetadata } = {}) => withMirror(sourceRoot, async (root) => {
+export const captureLifecycle = async (sourceRoot, { samples = 1, withMirror = withDisposableMirror, start = startMcp, coldBuild = measureColdBuild, watcherUpdate = measureWatcherUpdate, readMetadata = watcherMetadata, progress = (phase) => process.stderr.write(`[${new Date().toISOString()}] ${phase}\n`), profile, diagnosticLog, symbol } = {}) => withMirror(sourceRoot, async (root) => {
+  progress('cold index')
   const initialIndex = await coldBuild(root)
-  const mcp = start()
+  progress('start MCP')
+  const mcp = start({ root, profile, ...(diagnosticLog && { diagnosticLog }) })
   return stopAfter(mcp, async () => {
     await mcp.timed('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'codegraph-performance', version: '2' } })
-    const indexed = await runSweep(mcp, root)
+    const workloads = workloadsFor(symbol)
+    progress(samples === 1 ? 'indexed queries' : `sample 1/${samples}: indexed queries`)
+    let indexed = await runSweep(mcp, root, workloads, symbol, Boolean(diagnosticLog))
+    progress('watcher readiness')
     await toolCall(mcp, root, 'codegraph_refresh', {}, 'watcher readiness')
-    const leaf = await watcherUpdate({ root, state: 'leaf', previousGeneration: initialIndex.generation, phase: 'leaf incremental update', readMetadata: (target, generation) => readMetadata(target, generation, 'leaf') })
-    assertGenerationAdvanced(initialIndex.generation, leaf.generation)
-    const leafSweep = await runSweep(mcp, root); assertReceiptsMatch(indexed, leafSweep)
-    const cascade = await watcherUpdate({ root, state: 'cascade', previousGeneration: leaf.generation, phase: 'cascade incremental update', readMetadata: (target, generation) => readMetadata(target, generation, 'cascade') })
-    assertGenerationAdvanced(leaf.generation, cascade.generation); assertCascadeValidation(cascade.validatedFiles)
-    const cascadeSweep = await runSweep(mcp, root); assertReceiptsMatch(indexed, cascadeSweep)
+    const captured = []
+    let generation = initialIndex.generation
+    for (let index = 0; index < samples; index += 1) {
+      if (index) {
+        progress(`sample ${index + 1}/${samples}: indexed queries`)
+        indexed = await runSweep(mcp, root, workloads, symbol, Boolean(diagnosticLog))
+      }
+      progress(samples === 1 ? 'leaf update' : `sample ${index + 1}/${samples}: leaf update`)
+      const leaf = await watcherUpdate({ root, state: 'leaf', previousGeneration: generation, phase: 'leaf incremental update', readMetadata: (target, previous) => readMetadata(target, previous, 'leaf'), afterValidated: async () => { const result = await toolCall(mcp, root, 'codegraph_refs', structuredClone(workloads[0].arguments), 'first complete refs query'); assertWorkloadReceipt(workloads[0], result.text, symbol) } })
+      assertGenerationAdvanced(generation, leaf.generation)
+      const leafSweep = await runSweep(mcp, root, workloads, symbol, Boolean(diagnosticLog)); assertReceiptsMatch(indexed, leafSweep)
+      progress(samples === 1 ? 'cascade update' : `sample ${index + 1}/${samples}: cascade update`)
+      const cascade = await watcherUpdate({ root, state: 'cascade', previousGeneration: leaf.generation, phase: 'cascade incremental update', readMetadata: (target, previous) => readMetadata(target, previous, 'cascade') })
+      assertGenerationAdvanced(leaf.generation, cascade.generation); assertCascadeValidation(cascade.validatedFiles)
+      const cascadeSweep = await runSweep(mcp, root, workloads, symbol, Boolean(diagnosticLog)); assertReceiptsMatch(indexed, cascadeSweep)
+      generation = cascade.generation
+      captured.push({ root, sourceFiles: initialIndex.parsedFiles, sweeps: { indexed, leaf: leafSweep, cascade: cascadeSweep }, updates: { leaf, cascade } })
+    }
+    progress('full reindex')
     const fullReindex = readUpdate(await toolCall(mcp, root, 'codegraph_index', {}, 'full reindex'))
-    return { root, sourceFiles: initialIndex.parsedFiles, sweeps: { indexed, leaf: leafSweep, cascade: cascadeSweep }, updates: { initialIndex, leaf, cascade, fullReindex } }
+    captured[0].updates.initialIndex = initialIndex
+    captured.at(-1).updates.fullReindex = fullReindex
+    return captured
   })
 })
+
+export const captureSample = async (sourceRoot, options = {}) => (await captureLifecycle(sourceRoot, { ...options, samples: 1 }))[0]
 
 export const gitValue = (root, args, fallback) => { const result = spawnSync('git', ['-C', root, ...args], { encoding: 'utf8' }); return result.status === 0 ? result.stdout.trim() || fallback : fallback }
 
@@ -272,21 +502,35 @@ export function assertCompleteReport(report) {
   return report
 }
 
-export async function captureReport(options, { capture = captureSample } = {}) {
-  validateFixtures(options.root)
-  const sourceRoot = fs.realpathSync(options.root)
-  const before = sourceSnapshot(sourceRoot)
-  const samples = []
-  for (let index = 0; index < options.samples; index += 1) samples.push(await capture(sourceRoot))
-  const expectedReceipts = samples[0].sweeps.indexed
-  for (const sample of samples) for (const state of STATES) assertReceiptsMatch(expectedReceipts, sample.sweeps[state])
-  const benchmarks = Object.fromEntries(WORKLOADS.map(({ key }) => [key, Object.fromEntries(STATES.map((state) => [state, summarizeSamples(samples.map((sample) => sample.sweeps[state][key].ms))]))]))
-  const updates = Object.fromEntries(['initialIndex', 'leaf', 'cascade', 'fullReindex'].map((key) => [key, summarizeSamples(samples.map((sample) => sample.updates[key].ms))]))
-  for (const key of ['leaf', 'cascade']) {
-    updates[key].parsedFiles = Math.max(...samples.map((sample) => sample.updates[key].parsedFiles))
-    updates[key].validatedFiles = Math.max(...samples.map((sample) => sample.updates[key].validatedFiles))
-  }
-  return assertCompleteReport({ schemaVersion: 2, provenance: { root: samples[0].root, sourceRoot, repository: path.basename(sourceRoot), sourceFiles: samples[0].sourceFiles, commit: gitValue(sourceRoot, ['rev-parse', 'HEAD'], 'unavailable') }, benchmarks, updates, correctness: { consistent: true, originalRepositoryUnchanged: before === sourceSnapshot(sourceRoot), cleanShutdown: true } })
+export async function captureReport(options, { snapshot = resolvePerformanceSnapshot, capture = captureLifecycle, lock } = {}) {
+  if (!fs.statSync(options.root, { throwIfNoEntry: false })?.isDirectory()) throw new Error(`repository root is not a directory: ${options.root}`)
+  const sourceRoot = path.resolve(options.root)
+  const guard = lock ?? (snapshot === resolvePerformanceSnapshot ? withSnapshotLock : async (_root, operation) => operation())
+  return guard(sourceRoot, async () => {
+    const frozen = await snapshot(sourceRoot, { refresh: options.refreshSnapshot === true })
+    const snapshotRoot = typeof frozen === 'string' ? frozen : frozen.root
+    if (typeof frozen !== 'string') validateFixtures(snapshotRoot)
+    const samples = []
+    for (let index = 0; index < options.samples; index += 1) {
+      const lifecycle = await capture(snapshotRoot, { samples: 1, profile: options.profile, diagnosticLog: options.diagnosticLog, symbol: options.symbol })
+      if (!Array.isArray(lifecycle) || lifecycle.length !== 1) throw new Error(`benchmark lifecycle returned ${lifecycle?.length ?? 0} samples; expected 1`)
+      samples.push(lifecycle[0])
+    }
+    const expectedReceipts = samples[0].sweeps.indexed
+    for (const sample of samples) for (const state of STATES) assertReceiptsMatch(expectedReceipts, sample.sweeps[state])
+    const benchmarks = Object.fromEntries(WORKLOADS.map(({ key }) => [key, Object.fromEntries(STATES.map((state) => [state, summarizeSamples(samples.map((sample) => sample.sweeps[state][key].ms))]))]))
+    const updates = {
+      initialIndex: summarizeSamples(samples.map((sample) => sample.updates.initialIndex.ms)),
+      leaf: summarizeSamples(samples.map((sample) => sample.updates.leaf.ms)),
+      cascade: summarizeSamples(samples.map((sample) => sample.updates.cascade.ms)),
+      fullReindex: summarizeSamples(samples.map((sample) => sample.updates.fullReindex.ms)),
+    }
+    for (const key of ['leaf', 'cascade']) {
+      updates[key].parsedFiles = Math.max(...samples.map((sample) => sample.updates[key].parsedFiles))
+      updates[key].validatedFiles = Math.max(...samples.map((sample) => sample.updates[key].validatedFiles))
+    }
+    return assertCompleteReport({ schemaVersion: 2, provenance: { root: samples[0].root, sourceRoot: frozen.manifest?.sourceRoot ?? sourceRoot, repository: path.basename(sourceRoot), sourceFiles: samples[0].sourceFiles, commit: frozen.manifest?.commit ?? gitValue(sourceRoot, ['rev-parse', 'HEAD'], 'unavailable'), snapshot: { root: snapshotRoot, sha256: frozen.manifest?.sha256 ?? sourceSnapshot(snapshotRoot), createdAt: frozen.manifest?.createdAt ?? 'injected' } }, benchmarks, updates, correctness: { consistent: true, originalRepositoryUnchanged: true, cleanShutdown: true } })
+  })
 }
 
 const formatPair = ({ p50Ms, p90Ms }) => `${p50Ms.toFixed(2)} / ${p90Ms.toFixed(2)} ms`

@@ -40,9 +40,7 @@ export const heatColorFor = (heatRatio = 0) => {
   if (hue < 60) { r = c; g = x }
   else if (hue < 120) { r = x; g = c }
   else if (hue < 180) { g = c; b = x }
-  else if (hue < 240) { g = x; b = c }
-  else if (hue < 300) { r = x; b = c }
-  else { r = c; b = x }
+  else { g = x; b = c }
   const toHex = (n) => Math.round((n + m) * 255).toString(16).padStart(2, "0")
   return "#" + toHex(r) + toHex(g) + toHex(b)
 }
@@ -315,8 +313,6 @@ export const buildLayeredGraph = (rawGraph, options = {}) => {
         visitedArr[unvisitedIdx] = 1
         visitedCount++
         queue[tail++] = unvisitedIdx
-      } else {
-        break
       }
     }
 
@@ -1168,4 +1164,148 @@ export const buildChordData = (rawGraph, options = {}) => {
   }
 
   return { modules, chords, totalCalls, cx, cy, radius }
+}
+
+const COMPLEXITY_BINS = [
+  { label: "1-5", min: 1, max: 5, color: "#22c55e" },
+  { label: "6-10", min: 6, max: 10, color: "#fbbf24" },
+  { label: "11-20", min: 11, max: 20, color: "#f97316" },
+  { label: "21+", min: 21, max: Infinity, color: "#f43f5e" },
+]
+
+export const complexityColorFor = (value = 1) =>
+  (COMPLEXITY_BINS.find((bin) => value >= bin.min && value <= bin.max) ?? COMPLEXITY_BINS[0]).color
+
+const complexityHeatColor = (value, min, middle, max) => {
+  const t = value <= middle
+    ? (value - min) / Math.max(1, middle - min) / 2
+    : .5 + (value - middle) / Math.max(1, max - middle) / 2
+  const upper = t > .5
+  const ratio = upper ? (t - .5) * 2 : t * 2
+  const r1 = upper ? 33 : 68, g1 = upper ? 145 : 1, b1 = upper ? 140 : 84
+  const r2 = upper ? 253 : 33, g2 = upper ? 231 : 145, b2 = upper ? 37 : 140
+  const r = Math.round(r1 + (r2 - r1) * ratio).toString(16).padStart(2, "0")
+  const g = Math.round(g1 + (g2 - g1) * ratio).toString(16).padStart(2, "0")
+  const b = Math.round(b1 + (b2 - b1) * ratio).toString(16).padStart(2, "0")
+  return `#${r}${g}${b}`
+}
+
+export const buildCallTreeData = (summary = {}, options = {}) => {
+  const depth = options.depth ?? 3
+  const owners = Array.isArray(summary.owners) ? summary.owners : []
+  const ownerById = new Map(owners.filter((owner) => owner?.symbolId).map((owner) => [owner.symbolId, owner]))
+  const edges = (Array.isArray(summary.edges) ? summary.edges : [])
+    .filter((edge) => ownerById.has(edge?.from) && ownerById.has(edge?.to))
+  const outgoing = new Map()
+  for (const edge of edges) {
+    if (!outgoing.has(edge.from)) outgoing.set(edge.from, [])
+    outgoing.get(edge.from).push(edge.to)
+  }
+  const roots = (Array.isArray(summary.roots) && summary.roots.length > 0
+    ? summary.roots
+    : owners.filter((owner) => (owner.incomingCallCount ?? 0) === 0 && (owner.outgoingCallCount ?? 0) > 0).map((owner) => owner.symbolId).slice(0, 20))
+    .filter((id) => ownerById.has(id))
+  const distances = new Map(roots.map((id) => [id, 0]))
+  const queue = [...roots]
+  let truncated = Boolean(summary.truncated)
+  for (let cursor = 0; cursor < queue.length; cursor += 1) {
+    const id = queue[cursor]
+    const currentDepth = distances.get(id)
+    for (const target of outgoing.get(id) ?? []) {
+      if (currentDepth >= depth) { truncated = true; continue }
+      if (!distances.has(target)) {
+        distances.set(target, currentDepth + 1)
+        queue.push(target)
+      }
+    }
+  }
+  const visible = new Set(distances.keys())
+  const nodes = owners.filter((owner) => visible.has(owner.symbolId)).map((owner) => ({
+    ...owner,
+    id: owner.symbolId,
+    depth: distances.get(owner.symbolId),
+    area: 1 + (owner.incomingCallCount ?? 0) + (owner.outgoingCallCount ?? 0),
+    color: complexityColorFor(owner.cyclomatic ?? owner.complexity ?? 1),
+  }))
+  return {
+    generation: summary.generation ?? summary.validatedGeneration ?? null,
+    roots,
+    nodes,
+    edges: edges.filter((edge) => visible.has(edge.from) && visible.has(edge.to)),
+    depth,
+    truncated,
+  }
+}
+
+export const layoutCallTree = (items = [], edges = []) => {
+  const rows = new Map()
+  for (const item of items) {
+    const depth = item.depth ?? 0
+    if (!rows.has(depth)) rows.set(depth, [])
+    rows.get(depth).push(item)
+  }
+  const widest = Math.max(1, ...[...rows.values()].map((row) => row.length))
+  const positions = new Map()
+  for (const [depth, row] of rows) {
+    const left = 30 + (widest - row.length) * 120
+    row.forEach((item, index) => positions.set(item.id, { x: left + index * 240, y: 70 + depth * 120 }))
+  }
+  const paths = []
+  for (const edge of edges) {
+    const from = positions.get(edge.from)
+    const to = positions.get(edge.to)
+    if (!from || !to) continue
+    const middleY = (from.y + 48 + to.y) / 2
+    paths.push({ from: edge.from, to: edge.to, d: `M${from.x + 100},${from.y + 48} C${from.x + 100},${middleY} ${to.x + 100},${middleY} ${to.x + 100},${to.y}` })
+  }
+  return { positions, paths }
+}
+
+export const buildComplexityData = (owners = [], options = {}) => {
+  const allFunctions = []
+  for (const owner of Array.isArray(owners) ? owners : []) {
+    if (!owner?.file || (!options.includeTests && isTestFile(owner.file))) continue
+    const complexity = owner.cyclomatic ?? owner.complexity ?? 1
+    allFunctions.push({
+        ownerId: owner.ownerId ?? owner.id,
+        symbolId: owner.symbolId,
+        id: owner.symbolId ?? `${owner.file}:${owner.ownerId ?? owner.id ?? owner.start ?? 0}`,
+        name: owner.name,
+        file: owner.file,
+        start: owner.start,
+        line: owner.line,
+        column: owner.column,
+        complexity,
+        branchCount: owner.branchCount,
+        nestingDepth: owner.nestingDepth,
+    })
+  }
+  const sourceOrder = (a, b) => a.file.localeCompare(b.file) || (a.start ?? 0) - (b.start ?? 0) || a.id.localeCompare(b.id)
+  const selected = (options.maxFunctions == null
+    ? [...allFunctions]
+    : [...allFunctions].sort((a, b) => b.complexity - a.complexity || sourceOrder(a, b)).slice(0, options.maxFunctions))
+    .sort(sourceOrder)
+  const width = options.width ?? 1400
+  const height = options.height ?? 800
+  const columns = Math.max(1, Math.round(Math.sqrt(selected.length * width / height)))
+  const rows = Math.max(1, Math.ceil(selected.length / columns))
+  const cellSize = Math.max(1, Math.floor(Math.min((width - 2 * (columns - 1)) / columns, (height - 2 * (rows - 1)) / rows)))
+  const pitch = cellSize + 2
+  let minComplexity = 1
+  let maxComplexity = 1
+  for (const { complexity } of selected) {
+    if (complexity < minComplexity) minComplexity = complexity
+    if (complexity > maxComplexity) maxComplexity = complexity
+  }
+  const orderedComplexities = allFunctions.map(({ complexity }) => complexity).sort((a, b) => a - b)
+  const middleComplexity = orderedComplexities.length ? orderedComplexities[Math.floor((orderedComplexities.length - 1) / 2)] : 0
+  const functions = selected.map((owner, index) => ({
+    ...owner,
+    x: (index % columns) * pitch,
+    y: Math.floor(index / columns) * pitch,
+    width: cellSize,
+    height: cellSize,
+    color: minComplexity !== maxComplexity ? complexityHeatColor(owner.complexity, minComplexity, middleComplexity, maxComplexity) : "#21918c",
+  }))
+  return { generation: options.generation ?? null, totalFunctionCount: allFunctions.length, medianComplexity: middleComplexity, rows, columns, functions }
 }

@@ -1,5 +1,5 @@
 ---
-modified: 2026-09-02
+modified: 2026-09-12
 dependencies:
   - parsing-and-resolution.md
   - storage-and-query.md
@@ -102,15 +102,17 @@ framework-invoked export from an unused one. Each tool description is written to
 away from those failure modes — `codegraph_dead`'s description is mostly a warning that its
 output is not a deletion list (`mcp.mjs:68`).
 
+`codegraph_internals` inspects one file's executable structure at a validated generation. It can return a normalized map, search structural nodes, find bounded intraprocedural paths, or report cyclomatic complexity, branch count, and nesting depth without reparsing the repository.
+
 The server is in-process rather than a CLI shell-out because an MCP session is long-lived: it can
 afford to keep a warm engine, a persistent index and a filesystem watcher per repository, so the
 second query costs a memory read instead of a parse. A successful mapped query returns from the
 validated mmap cache immediately, then starts the existing per-root runtime asynchronously. That
 runtime hydrates the semantic worker from the stored generation, so later edits reuse warm semantic
-state instead of paying worker hydration on the edit path. The full runtime sets
-`retainSemanticState: true`: initial indexing or persisted-generation hydration creates the one
-complete semantic project in `SemanticCheckerWorker`, and later edits validate against that
-retained state without a second main-thread project or a cold-worker first-edit carve-out. That
+state instead of paying worker hydration on the edit path. Every `CodeGraphEngine` uses the same
+worker-owned pipeline: initial indexing or persisted-generation hydration creates the one complete
+semantic project in `SemanticCheckerWorker`, and later edits validate against that retained state
+without a second main-thread project. That
 warmth is staged. A first query
 installs a cheap watcher only (`watchForChanges`, `mcp.mjs:183-195`) that loads no parser; the
 first accepted change promotes it to the full `McpProjectRuntime` (`promoteRuntime`,
@@ -138,7 +140,7 @@ MCP client ──stdio JSON-RPC──> mcp.mjs
                                  ├── watchForChanges(root)  light fs.watch  (mcp.mjs:183)
                                  │     └── startPollingWatcher  chokidar    (mcp.mjs:158)
                                  └── runtimeFor(root) ──> McpProjectRuntime (mcp-runtime.mjs)
-                                                            ├── CodeGraphEngine(retainSemanticState)
+                                                            ├── CodeGraphEngine
                                                             │     └── SemanticCheckerWorker
                                                             │          index / hydrate / validate / reference-overlay
                                                             ├── engine.reconcile()
@@ -210,6 +212,7 @@ Tool implementations (`mcp.mjs:238-286`) — the real request each builds:
 | `codegraph_index` | 270 | `(await runtimeFor(root)).engine.build()` |
 | `codegraph_refresh` | 272-275 | `runtime.engine.reconcile()` |
 | `codegraph_query` | 276-286 | Passes the caller's `query` through with a resolved `consistency` and a clamped `limit` |
+| `codegraph_internals` | 329 | Returns generation-pinned `map`, `search`, `paths`, or `metrics` records for one file |
 
 ### `cli.mjs`
 
@@ -229,37 +232,28 @@ adjacency; `cmdRefs` (102-115), `cmdDeps` (117-127, restricted to `fn`/`method`/
 
 ### `tool-engine.mjs` (consistency mechanism)
 
-- `applyChanges` / `applyFileChanges` (194-211) run the file-local resolver and tag the result
-  `freshness: 'provisional'`, `coverage: 'module-linked-syntax'` with `revision =
-  resolver.revision + 1`.
-- `#publishProvisional` (212-222) invalidates the cached provisional view, records the changed
-  paths in `validationChanges`, and schedules background validation.
+- `applyChanges` / `applyFileChanges` record changed sources and schedule worker validation.
 - `#scheduleValidation` (468-478) allows at most one active plus one pending validation; a
   superseded pending request resolves `null`.
 - `#runValidation` hands the pinned generation, source ids, changes, and (until the worker is
   hydrated) partition ids to `SemanticCheckerWorker.validate`. Direct reconcile and daemon-driven
   refresh use this same validation path.
-- With `retainSemanticState`, `build` delegates initial parsing to worker `index`, while unchanged
-  reconcile delegates state adoption to worker `hydrate`. The coordinator accepts only exact
-  source/partition membership and matching file/source hashes; it retains `workspace = null` on
-  this path. The default engine still builds locally.
+- `build` delegates initial parsing to worker `index`, while unchanged reconcile delegates state
+  adoption to worker `hydrate`. The coordinator accepts only exact source/partition membership and
+  matching file/source hashes.
 - `#acceptValidation` discards stale revisions/epochs, independently validates the worker's full
   or delta contract against the pinned generation, requires delta keys to equal the exact reverse
   dependency closure, writes only returned partitions, and publishes a complete manifest. It
   returns `validationMode` and sorted `validatedFiles` diagnostics.
-- `pinQuery` (275-285) is the mode switch: with `consistency === 'latest'` and no `generation` it
-  serves `#provisionalQueryView()` (415-420) and reports the provisional metadata; otherwise it
-  serves `#validatedQueryView(generation, 'calls')`, preferring a cached `complete` view for
-  `refs`/`graph`, and reports `freshness: 'validated'`.
+- `pinQuery` serves a published validated generation, preferring a cached `complete` view for
+  `refs`/`graph`.
 - `#completeQueryView` (253-274) materializes non-call edges lazily via
   `#buildReferenceOverlay` (427-448), deduplicating concurrent builds through `overlayBuilds`.
-- For the current worker-owned generation, `#buildReferenceOverlay` asks the warm worker for only
-  stale fragments, validates exact fragment membership and every edge before writing, and reuses
-  donor fragments. Cold, historical, cache-mismatch, and legacy-worker paths use the existing
-  whole-project builder. Malformed worker output publishes no partial overlay.
-- `build` (80-111) always publishes `edgeCoverage: 'calls'`; `#incremental` (112-148) forces a
-  full `#build` when a control file changed (115) and uses the apartment-backed parser pool path
-  when ≥2 disk-backed files change and a worker exists (134).
+- `#buildReferenceOverlay` asks the worker for only stale fragments, hydrating it from the requested
+  persisted generation when needed. It validates exact fragment membership and every edge before
+  writing and reuses donor fragments. Malformed worker output publishes no partial overlay.
+- `build` always publishes `edgeCoverage: 'calls'`; `#incremental` forces a full build when a
+  control file changed and otherwise submits the changed source text to worker validation.
 
 ### `tool.mjs`
 
@@ -307,24 +301,14 @@ string; the type is `object` in all cases.
 - `codegraph_index` — `JSON.stringify(engine.build())`: `{ generation, edgeCoverage: 'calls',
   parsedFiles, reusedFiles }` (`tool-engine.mjs:109`).
 - `codegraph_refresh` — `JSON.stringify(engine.reconcile())`: `{ generation, edgeCoverage,
-  parsedFiles, reusedFiles, validationMode?, validatedFiles? }`. With the apartment-backed
-  multi-file parser path, validation completes asynchronously and fills these diagnostics on the
-  returned result after its `validation` promise resolves.
+  parsedFiles, reusedFiles, validationMode?, validatedFiles? }`. Validation completes
+  asynchronously and fills these diagnostics after its `validation` promise resolves.
 - `codegraph_query` — line 1 is `{ freshness, coverage, revision, validatedGeneration }`
   (`mcp.mjs:283-285`), then one JSON row per line.
 
-**Consistency modes (the real names).** The selector is `query.consistency`, values `'latest'`
-and `'validated'`, defaulting to `'validated'` (`mcp.mjs:279`). A present `query.generation`
-forces `'validated'`; `generation` + `'latest'` throws (`mcp.mjs:280`). The two resulting
-metadata shapes:
-
-| | `latest` | `validated` |
-| --- | --- | --- |
-| `freshness` | `'provisional'` | `'validated'` |
-| `coverage` | `'module-linked-syntax'` | `'calls'` or `'complete'` |
-| `revision` | resolver revision (integer) | `null` |
-| `validatedGeneration` | last published generation | the served generation |
-| source | `FileLocalResolver` snapshot (`tool-engine.mjs:415-420`) | published generation + optional reference overlay (`tool-engine.mjs:393-414`, `253-274`) |
+**Consistency modes.** `query.consistency` accepts `'latest'` and `'validated'`, defaulting to
+`'validated'`. Both serve a published worker-validated generation; an explicit `generation` pins
+that generation and cannot be combined with `'latest'`.
 
 **Watch event.** `{ type: 'add' | 'change' | 'unlink', path: <repo-relative posix> }`, optionally
 carrying `source` (`mcp-runtime.mjs:95`, `tool-engine.mjs:129`).
@@ -535,8 +519,8 @@ args }`, with `<field>Before/After/Delta` for `rss heapUsed heapTotal external a
     first and delegates to `#build` if they moved (`tool-engine.mjs:154-157`); otherwise it
     diffs the scan against the stored partitions by content hash and, if any events result, runs
     `#incremental` with the already-read sources (`tool-engine.mjs:164-176`); with no events it
-    hydrates the persistent semantic worker from the exact stored sources and partitions, then
-    points the resolver and validated generation at that generation.
+    hydrates the semantic worker from the exact stored sources and partitions, then adopts that
+    validated generation.
   - **CLI `codegraph index`.** `cli.mjs:202-206` execs `tool.mjs build --root ROOT` with inherited
     stdio and exits — deliberately forwarding `--root` so `tool.mjs` does not index cwd.
   - A profiler is configured (`tool.mjs --profile <path>`) — the result carries
@@ -546,7 +530,7 @@ args }`, with `<field>Before/After/Delta` for `rss heapUsed heapTotal external a
   - Worker index/hydrate rejects or returns malformed membership — the operation fails, readiness
     is cleared, and `CURRENT` remains absent or byte-identical; an existing validated generation
     remains queryable. Persistent reconcile does not silently create a main-thread fallback project.
-  - A default short-lived `#reconcile` failure may fall back to its local full build path.
+  - If no stored generation exists, `#reconcile` runs the same worker-owned full build.
   - The engine is disposed — `codegraph engine is disposed` (`tool-engine.mjs:463`).
   - `--profile` with no path (CLI/`tool.mjs`) — exits 1 with
     `codegraph: --profile requires a file path` (`tool.mjs:10-13`).
@@ -555,10 +539,8 @@ args }`, with `<field>Before/After/Delta` for `rss heapUsed heapTotal external a
 
 ### 6. Query the graph with an explicit consistency mode (`codegraph_query`)
 
-- **Goal.** Read the graph either at the last checker-validated generation or at the immediate
-  provisional syntax revision, knowing which one was served.
-- **Stakeholders.** Any consumer that must not mistake provisional syntax data for
-  checker-validated data.
+- **Goal.** Read a checker-validated graph, optionally pinned to a stored generation.
+- **Stakeholders.** Consumers that need stable graph generation metadata.
 - **Actors.** An MCP client calling `codegraph_query`.
 - **Preconditions.** `root` resolves; `query` is an object with a `type` the engine understands
   (`symbols`, `refs`, `deps`, `graph` — `tool-engine.mjs:308-316`).
@@ -569,15 +551,12 @@ args }`, with `<field>Before/After/Delta` for `rss heapUsed heapTotal external a
   4. `consistency` is resolved: `'validated'` if `query.generation` is present, else
      `query.consistency ?? 'validated'` (`mcp.mjs:279`).
   5. `limit` is clamped to `min(query.limit ?? 2000, 2000)` (`mcp.mjs:281`).
-  6. `pinQuery` picks the provisional or validated view per mode
-     (`tool-engine.mjs:275-285`).
+  6. `pinQuery` picks the requested validated generation.
   7. `cappedRows` drains the rows (`mcp.mjs:282`).
   8. Line 1 is `{ freshness, coverage, revision, validatedGeneration }`; each subsequent line is
      one JSON row (`mcp.mjs:283-285`).
 - **Alternate Flows.**
-  - `consistency: 'latest'` — the provisional resolver snapshot is served with
-    `freshness: 'provisional'`, `coverage: 'module-linked-syntax'` and a non-null `revision`
-    (`tool-engine.mjs:277-279`).
+  - `consistency: 'latest'` — the latest published worker-validated generation is served.
   - `query.generation` pinned — always validated, and the pinned generation is echoed back as
     `validatedGeneration` (`tool-engine.mjs:284`).
   - `type: 'refs'` or `'graph'` under `validated` — a cached complete-coverage view is preferred,
@@ -639,9 +618,8 @@ args }`, with `<field>Before/After/Delta` for `rss heapUsed heapTotal external a
     back to `!fs.existsSync(file) && policy.isSourceRelative(rel)` (`mcp.mjs:156`); the runtime
     enqueues `unlink` only when the path is registered or already pending
     (`mcp-runtime.mjs:95`).
-  - Two or more disk-backed files change at once with a live parser worker — the
-    apartment-backed path runs and validation is returned to the caller rather than awaited
-    (`tool-engine.mjs:134-146`).
+  - Multiple disk-backed files change at once — their source text is submitted together for
+    worker validation.
   - A `.sql`, `.prisma`, `.json` (non-control) or other non-listed file changes — no event is
     accepted anywhere and nothing is re-indexed.
   - A newer change arrives while validation is in flight — the pending validation is superseded

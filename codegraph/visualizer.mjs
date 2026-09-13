@@ -4,7 +4,7 @@ import http from 'node:http'
 import path from 'node:path'
 import { streamQuery } from './query-client.mjs'
 import { QUERY_VIEW_CACHE_FILE } from './query-cache-schema.mjs'
-import { buildLayeredGraph, buildHeatmapData, buildSunburstData, buildChordData } from './visualizer-graph.mjs'
+import { buildLayeredGraph, buildHeatmapData, buildSunburstData, buildChordData, buildCallTreeData, buildComplexityData, layoutCallTree } from './visualizer-graph.mjs'
 
 const args = process.argv.slice(2)
 const rootAt = args.indexOf('--root')
@@ -263,7 +263,7 @@ const page = `<!doctype html>
       will-change: transform;
     }
     .sidebar {
-      width: 320px;
+      flex: 0 0 320px;
       background: var(--card-bg);
       border-left: 1px solid var(--border);
       padding: 16px;
@@ -271,8 +271,12 @@ const page = `<!doctype html>
       flex-direction: column;
       gap: 14px;
       overflow-y: auto;
+      overflow-x: hidden;
       font-size: 13px;
     }
+    #selection-details { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+    .complexity-metric-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; min-width: 0; }
+    .complexity-contents-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px; min-width: 0; }
     .sidebar-title {
       font-size: 14px;
       font-weight: 700;
@@ -288,7 +292,8 @@ const page = `<!doctype html>
       padding: 6px 8px;
       border-radius: 4px;
       border: 1px solid var(--border);
-      word-break: break-all;
+      overflow-wrap: anywhere;
+      word-break: normal;
     }
     .explanation-banner {
       background: rgba(56, 189, 248, 0.08);
@@ -320,6 +325,7 @@ const page = `<!doctype html>
       border-radius: 50%;
       animation: spin 0.8s linear infinite;
     }
+    @keyframes spin { to { transform: rotate(360deg); } }
     .ctrl-group {
       display: flex;
       align-items: center;
@@ -371,7 +377,15 @@ const page = `<!doctype html>
       border: 1px solid rgba(255, 255, 255, 0.08);
       color: #f8fafc;
       transition: all 0.15s ease;
+      width: 100%;
+      height: auto;
+      min-width: 0;
+      text-align: left;
+      overflow-wrap: anywhere;
     }
+    .sidebar-item-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .complexity-call-link { flex-direction: column; align-items: flex-start; justify-content: flex-start; }
+    .unavailable-target { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
     .sidebar-item-link:hover {
       background: #334155;
       color: var(--accent);
@@ -550,6 +564,8 @@ const page = `<!doctype html>
       <button class="tab" data-view="heatmap">Heat Map</button>
       <button class="tab" data-view="sunburst">Sunburst</button>
       <button class="tab" data-view="chord">Chord</button>
+      <button class="tab" data-view="calltree">Call Tree</button>
+      <button class="tab" data-view="complexity">Complexity</button>
     </div>
     <div class="stats-wrapper">
       <div class="stats" id="stats-layered">
@@ -581,6 +597,14 @@ const page = `<!doctype html>
         <div class="badge">Modules: <strong id="stat-ch-modules">0</strong></div>
         <div class="badge">Interactions: <strong id="stat-ch-chords">0</strong></div>
         <div class="badge warn">Cross Calls: <strong id="stat-ch-calls">0</strong></div>
+      </div>
+      <div class="stats" id="stats-calltree" style="display: none;">
+        <div class="badge">Functions: <strong id="stat-ct-functions">0</strong></div>
+        <div class="badge">Calls: <strong id="stat-ct-calls">0</strong></div>
+      </div>
+      <div class="stats" id="stats-complexity" style="display: none;">
+        <div class="badge">Functions: <strong id="stat-cx-functions">0</strong></div>
+        <div class="badge warn">Median: <strong id="stat-cx-median">0</strong></div>
       </div>
     </div>
   </header>
@@ -652,9 +676,12 @@ const page = `<!doctype html>
   </div>
 
   <script>
+    const layoutCallTree = ${layoutCallTree.toString()};
     let currentView = "layered";
     let graphData = null;
     let heatmapData = null;
+    let calltreeData = null;
+    let complexityData = null;
     let currentFilter = "all";
     let transform = { x: 40, y: 40, k: 0.85 };
     let isMouseDown = false;
@@ -662,10 +689,84 @@ const page = `<!doctype html>
     let startPan = { x: 0, y: 0 };
     let startMouse = { x: 0, y: 0 };
     let rafPending = false;
+    let summaryItems = [];
+    let summaryMode = "";
+    let selectionHistory = [];
+    let selectionVersion = 0;
+    let summaryTargetMap = new Map();
+    let pinnedComplexityIndex = -1;
+    let hoveredComplexityIndex = -1;
 
     const svg = document.getElementById("viewport");
     const canvas = document.getElementById("canvas");
     const progress = document.getElementById("progress");
+
+    function selectSummaryItem(item, mode, pushHistory = true) {
+      const details = document.getElementById("selection-details");
+      details.textContent = "Loading internal control flow...";
+      if (pushHistory && selectionHistory.at(-1)?.item !== item) selectionHistory.push({ item, mode });
+      selectionVersion++;
+      const requestVersion = selectionVersion;
+      const generation = (mode === "calltree" ? calltreeData : complexityData)?.generation || "";
+      fetchViewData("/internals?file=" + encodeURIComponent(item.file || "") + "&ownerId=" + encodeURIComponent(item.ownerId ?? item.id ?? 0) + "&generation=" + encodeURIComponent(generation))
+        .then(data => {
+          if (requestVersion !== selectionVersion) return;
+          const records = data.records || [];
+          const nodes = records.filter(record => record.record === "node").map(record => record.node);
+          const forLoops = records.filter(record => record.record === "node" && record.node.flags & 1).length;
+          const calls = records.filter(record => record.record === "relation" && record.relation.kind === "call").map(record => record.relation);
+          const field = value => { const wrapper = document.createElement("div"); wrapper.className = "node-detail-field"; const label = document.createElement("div"); label.className = "node-detail-label"; const content = document.createElement("div"); content.className = "node-detail-val"; content.textContent = value; wrapper.append(label, content); return wrapper; };
+          const filename = field(item.file || "unknown"); filename.firstChild.textContent = "Filename";
+          const functionName = field((item.name || "anonymous") + ":" + (item.line ?? "?")); functionName.firstChild.textContent = "Function name:line";
+          const cyclomatic = field(item.cyclomatic ?? item.complexity ?? 1); cyclomatic.firstChild.textContent = "Cyclomatic";
+          const nesting = field(item.nestingDepth ?? 0); nesting.firstChild.textContent = "Nesting";
+          const branching = field(item.branchCount ?? 0); branching.firstChild.textContent = "Branching";
+          const metrics = document.createElement("div"); metrics.className = "complexity-metric-grid"; metrics.append(cyclomatic, nesting, branching);
+          const contents = document.createElement("div"); contents.className = "node-detail-field";
+          const contentsLabel = document.createElement("div"); contentsLabel.className = "node-detail-label"; contentsLabel.textContent = "What's in there";
+          const loopCount = field(forLoops); loopCount.firstChild.textContent = "For loops";
+          const callCount = field(calls.length); callCount.firstChild.textContent = "Function calls";
+          const contentsGrid = document.createElement("div"); contentsGrid.className = "complexity-contents-grid"; contentsGrid.append(loopCount, callCount);
+          contents.append(contentsLabel, contentsGrid);
+          const navigation = document.createElement("div"); navigation.className = "node-detail-field";
+          if (selectionHistory.length > 1) { const previous = selectionHistory.at(-2).item; const back = document.createElement("button"); back.className = "sidebar-item-link"; back.textContent = "← Back to " + (previous.name || "anonymous") + ":" + (previous.line ?? "?"); back.onclick = () => { selectionHistory.pop(); const previous = selectionHistory.at(-1); if (previous) selectSummaryItem(previous.item, previous.mode, false); }; navigation.appendChild(back); }
+          const calledHeading = document.createElement("div"); calledHeading.className = "node-detail-label"; navigation.appendChild(calledHeading);
+          const seenTargets = new Set();
+          for (const call of calls) {
+            if (seenTargets.has(call.targetSymbolId)) continue;
+            seenTargets.add(call.targetSymbolId);
+            const target = summaryTargetMap.get(String(call.targetSymbolId));
+            if (target) { const button = document.createElement("button"); button.className = "sidebar-item-link complexity-call-link"; const name = document.createElement("span"); name.textContent = (target.name || call.targetSymbolId) + ":" + (target.line ?? "?"); button.appendChild(name); if (target.file) { const file = document.createElement("span"); file.className = "node-detail-label"; file.textContent = target.file; button.appendChild(file); } button.title = target.symbolId || call.targetSymbolId; button.onclick = () => selectSummaryItem(target, mode); navigation.appendChild(button); }
+            else { const unavailable = document.createElement("span"); unavailable.className = "unavailable-target muted"; unavailable.textContent = call.targetSymbolId + " (unavailable)"; unavailable.title = call.targetSymbolId; navigation.appendChild(unavailable); }
+          }
+          calledHeading.dataset.totalCalls = calls.length; calledHeading.textContent = "Called functions (" + seenTargets.size + ")";
+          if (!seenTargets.size) { const empty = document.createElement("span"); empty.className = "node-detail-val"; empty.textContent = "No internal function calls"; navigation.appendChild(empty); }
+          details.replaceChildren(filename, functionName, metrics, contents, navigation);
+        })
+        .catch(err => { if (requestVersion === selectionVersion) details.textContent = "Internal map unavailable: " + err.message; });
+    }
+
+    canvas.addEventListener("click", event => {
+      const card = event.target.closest("[data-summary-index]");
+      if (card && summaryMode !== "complexity") { selectionHistory.length = 0; selectSummaryItem(summaryItems[Number(card.dataset.summaryIndex)], summaryMode); }
+    });
+    canvas.addEventListener("keydown", event => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      if (summaryMode === "complexity" && summaryItems.length) {
+        event.preventDefault();
+        pinnedComplexityIndex = pinnedComplexityIndex >= 0 ? pinnedComplexityIndex : Math.max(0, hoveredComplexityIndex);
+        selectionHistory.length = 0;
+        selectSummaryItem(summaryItems[pinnedComplexityIndex], summaryMode);
+        return;
+      }
+      const card = event.target.closest("[data-summary-index]");
+      if (!card) return;
+      event.preventDefault();
+      const index = Number(card.dataset.summaryIndex);
+      if (summaryMode === "complexity") pinnedComplexityIndex = index;
+      selectionHistory.length = 0;
+      selectSummaryItem(summaryItems[index], summaryMode);
+    });
 
     // Fast indexed maps for O(1) lookups
     let activeSelectedId = null;
@@ -746,6 +847,15 @@ const page = `<!doctype html>
         const x = (vw / 2) - 500 * k;
         const y = (vh / 2) - 500 * k;
         transform = { x, y, k };
+      } else if (viewName === "calltree" || viewName === "complexity") {
+        const bounds = canvas.getBBox();
+        const pad = 30;
+        const k = Math.min(1, (vw - pad * 2) / Math.max(1, bounds.width), (vh - pad * 2) / Math.max(1, bounds.height));
+        transform = {
+          x: (vw / 2) - (bounds.x + bounds.width / 2) * k,
+          y: (vh / 2) - (bounds.y + bounds.height / 2) * k,
+          k
+        };
       } else if (viewName === "heatmap") {
         const modules = heatmapData?.modules || [];
         const files = heatmapData?.files || [];
@@ -943,23 +1053,31 @@ const page = `<!doctype html>
         heatmapData = null;
         sunburstData = null;
         chordData = null;
+        calltreeData = null;
+        complexityData = null;
       }
 
       const isLayered = currentView === "layered";
       const isHeatmap = currentView === "heatmap";
       const isSunburst = currentView === "sunburst";
       const isChord = currentView === "chord";
+      const isCalltree = currentView === "calltree";
+      const isComplexity = currentView === "complexity";
 
       document.getElementById("stats-layered").style.display = isLayered ? "flex" : "none";
       document.getElementById("stats-heatmap").style.display = isHeatmap ? "flex" : "none";
       document.getElementById("stats-sunburst").style.display = isSunburst ? "flex" : "none";
       document.getElementById("stats-chord").style.display = isChord ? "flex" : "none";
+      document.getElementById("stats-calltree").style.display = isCalltree ? "flex" : "none";
+      document.getElementById("stats-complexity").style.display = isComplexity ? "flex" : "none";
 
       const titles = {
         layered: "Layered Call Flow",
         heatmap: "Codebase Heat Map",
         sunburst: "Sunburst Hierarchy",
-        chord: "Module Coupling Chord"
+        chord: "Module Coupling Chord",
+        calltree: "Function Call Tree",
+        complexity: "Complexity"
       };
       const explanations = {
         layered: {
@@ -977,7 +1095,9 @@ const page = `<!doctype html>
         chord: {
           title: "Module Coupling Chord:",
           body: "Radial dependency diagram visualizing cross-module caller and callee coupling. Outer perimeter arcs represent modules, and internal flow ribbons represent call volume and bidirectional interactions between packages."
-        }
+        },
+        calltree: { title: "Function Call Tree:", body: "Function calls are arranged by depth. Card size reflects call traffic and color reflects cyclomatic complexity." },
+        complexity: { title: "Complexity:", body: "Each equal-sized cell is one function in source order. Color shows cyclomatic complexity; hover or click a cell for details." }
       };
 
       document.getElementById("explanation-title").textContent = explanations[currentView]?.title || "";
@@ -994,6 +1114,12 @@ const page = `<!doctype html>
       } else if (isChord) {
         if (!chordData) loadChord(includeTests);
         else renderChord();
+      } else if (isCalltree) {
+        if (!calltreeData) loadCalltree(includeTests);
+        else renderCalltree();
+      } else if (isComplexity) {
+        if (!complexityData) loadComplexity(includeTests);
+        else renderComplexity();
       } else {
         if (!graphData) loadGraph(includeTests);
         else renderGraph();
@@ -1019,6 +1145,110 @@ const page = `<!doctype html>
       });
       inFlightFetches.set(url, p);
       return p;
+    }
+
+    function showProject(project, viewTitle) {
+      if (!project) return;
+      document.getElementById("project-name").textContent = project.name || "";
+      document.getElementById("project-path").textContent = project.root || "";
+      document.getElementById("project-pill").title = project.root || "";
+      document.getElementById("project-pill").style.display = "inline-flex";
+      document.title = "⚡ " + (project.name || "CodeGraph") + " — " + viewTitle;
+    }
+
+    function loadCalltree(includeTests = false) {
+      progress.style.display = "flex";
+      document.getElementById("progress-msg").textContent = "Loading function call summaries...";
+      fetchViewData("/calltree?depth=3&includeTests=" + (includeTests ? "1" : "0"))
+        .then(data => {
+          calltreeData = data;
+          showProject(data.project, "Call Tree");
+          document.getElementById("stat-ct-functions").textContent = (data.nodes || []).length;
+          document.getElementById("stat-ct-calls").textContent = (data.edges || []).length;
+          renderCalltree();
+          progress.style.display = "none";
+        })
+        .catch(err => { document.getElementById("progress-msg").textContent = "Error: " + err.message; });
+    }
+
+    function loadComplexity(includeTests = false) {
+      progress.style.display = "flex";
+      document.getElementById("progress-msg").textContent = "Loading complexity summaries...";
+      const width = Math.max(1, Math.min(4096, Math.floor(svg.clientWidth || 1400)));
+      const height = Math.max(1, Math.min(4096, Math.floor(svg.clientHeight || 800)));
+      fetchViewData("/complexity?includeTests=" + (includeTests ? "1" : "0") + "&width=" + width + "&height=" + height)
+        .then(data => {
+          complexityData = data;
+          showProject(data.project, "Complexity");
+          const functionCount = (data.functions || []).length;
+          document.getElementById("stat-cx-functions").textContent = "Showing " + functionCount + " of " + (data.totalFunctionCount ?? functionCount);
+          document.getElementById("stat-cx-median").textContent = data.medianComplexity ?? 0;
+          renderComplexity();
+          progress.style.display = "none";
+        })
+        .catch(err => { document.getElementById("progress-msg").textContent = "Error: " + err.message; });
+    }
+
+    function renderSummaryCards(items, mode) {
+      canvas.innerHTML = "";
+      canvas.onmouseover = null; canvas.onmouseout = null; canvas.onpointermove = null; canvas.onpointerleave = null; canvas.onclick = null;
+      summaryItems = items;
+      summaryMode = mode;
+      summaryTargetMap = new Map([...(complexityData?.functions || []), ...summaryItems].filter(item => item.symbolId != null).map(item => [String(item.symbolId), item]));
+      if (items.length === 0) {
+        const empty = document.createElementNS("http://www.w3.org/2000/svg", "text");
+        empty.setAttribute("x", "40"); empty.setAttribute("y", "60"); empty.setAttribute("fill", "#94a3b8");
+        empty.textContent = mode === "calltree" ? "No function calls found" : "No complexity data found";
+        canvas.appendChild(empty); return;
+      }
+      const calltreeLayout = mode === "calltree" ? layoutCallTree(items, calltreeData?.edges || []) : null;
+      const positionFor = (item, index) => calltreeLayout?.positions.get(item.id) || ({ x: (index % 5) * 220 + 30, y: Math.floor(index / 5) * 72 + 90 });
+      if (mode === "calltree") {
+        const edgeLayer = document.createElementNS("http://www.w3.org/2000/svg", "g");
+        edgeLayer.setAttribute("fill", "none"); edgeLayer.setAttribute("stroke", "#64748b"); edgeLayer.setAttribute("stroke-width", "2");
+        for (const edge of calltreeLayout.paths) {
+          const path = document.createElementNS("http://www.w3.org/2000/svg", "path"); path.setAttribute("d", edge.d); edgeLayer.appendChild(path);
+        }
+        canvas.appendChild(edgeLayer);
+      }
+      items.forEach((item, index) => {
+        const { x, y } = positionFor(item, index);
+        const group = document.createElementNS("http://www.w3.org/2000/svg", "g");
+        group.setAttribute("tabindex", "0"); group.setAttribute("role", "button");
+        group.dataset.summaryIndex = index;
+        group.setAttribute("aria-label", (item.name || "anonymous") + ", complexity " + (item.cyclomatic ?? item.complexity ?? 1));
+        const rect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+        rect.setAttribute("x", x); rect.setAttribute("y", y); rect.setAttribute("width", "200"); rect.setAttribute("height", "48"); rect.setAttribute("rx", "7");
+        rect.setAttribute("fill", item.color); rect.setAttribute("opacity", ".82");
+        const label = document.createElementNS("http://www.w3.org/2000/svg", "text");
+        const fullName = item.name || "anonymous"; const fullMetric = "Complexity " + (item.cyclomatic ?? item.complexity ?? 1) + " · " + (item.file || "");
+        label.setAttribute("x", x + 10); label.setAttribute("y", y + 21); label.setAttribute("fill", "#f8fafc"); label.textContent = fullName.length > 28 ? fullName.slice(0, 27) + "…" : fullName;
+        const metric = document.createElementNS("http://www.w3.org/2000/svg", "text");
+        metric.setAttribute("x", x + 10); metric.setAttribute("y", y + 38); metric.setAttribute("fill", "#e2e8f0"); metric.setAttribute("font-size", "10");
+        metric.textContent = fullMetric.length > 46 ? fullMetric.slice(0, 45) + "…" : fullMetric;
+        const title = document.createElementNS("http://www.w3.org/2000/svg", "title"); title.textContent = fullName + " — " + fullMetric;
+        group.appendChild(title);
+        group.append(rect, label, metric); canvas.appendChild(group);
+      });
+      centerView();
+    }
+
+    function renderCalltree() { renderSummaryCards(calltreeData?.nodes || [], "calltree"); }
+    function renderComplexity() {
+      canvas.innerHTML = ""; summaryItems = complexityData?.functions || []; summaryMode = "complexity"; pinnedComplexityIndex = -1; hoveredComplexityIndex = -1;
+      summaryTargetMap = new Map(summaryItems.filter(item => item.symbolId != null).map(item => [String(item.symbolId), item]));
+      const cells = document.createElementNS("http://www.w3.org/2000/svg", "g");
+      cells.setAttribute("tabindex", "0"); cells.setAttribute("role", "grid"); cells.setAttribute("aria-label", "Function complexity heatmap");
+      const paths = new Map();
+      for (const item of summaryItems) paths.set(item.color, (paths.get(item.color) || "") + "M" + item.x + "," + item.y + "h" + item.width + "v" + item.height + "h-" + item.width + "Z");
+      for (const [color, d] of paths) { const path = document.createElementNS("http://www.w3.org/2000/svg", "path"); path.setAttribute("d", d); path.setAttribute("fill", color); path.setAttribute("stroke", "#0f172a"); path.setAttribute("stroke-width", ".5"); cells.appendChild(path); }
+      canvas.appendChild(cells);
+      const preview = item => { const details = document.getElementById("selection-details"); const heading = document.createElement("strong"); heading.textContent = item.name || "anonymous"; const summary = document.createElement("div"); summary.className = "node-detail-val"; summary.textContent = "Cyclomatic " + item.complexity + " · Branches " + (item.branchCount ?? 0) + " · Nesting " + (item.nestingDepth ?? 0) + " · " + item.file; details.replaceChildren(heading, summary); };
+      const cellAt = event => { if (!summaryItems.length) return -1; const bounds = cells.getBoundingClientRect(); const columns = complexityData?.columns || 1; const rows = complexityData?.rows || 1; const column = Math.floor((event.clientX - bounds.left) / bounds.width * columns); const row = Math.floor((event.clientY - bounds.top) / bounds.height * rows); const index = row * columns + column; return column < 0 || column >= columns || row < 0 || row >= rows || index >= summaryItems.length ? -1 : index; };
+      canvas.onpointermove = event => { if (pinnedComplexityIndex >= 0) return; hoveredComplexityIndex = cellAt(event); if (hoveredComplexityIndex >= 0) preview(summaryItems[hoveredComplexityIndex]); };
+      canvas.onpointerleave = () => { hoveredComplexityIndex = -1; if (pinnedComplexityIndex < 0) document.getElementById("selection-details").textContent = "Hover or click a cell to inspect its function."; };
+      canvas.onclick = event => { const index = cellAt(event); if (index < 0) return; pinnedComplexityIndex = index; selectionHistory.length = 0; selectSummaryItem(summaryItems[index], "complexity"); };
+      centerView("complexity");
     }
 
     function loadSunburst(includeTests = false) {
@@ -1134,10 +1364,10 @@ const page = `<!doctype html>
 
     try {
       const hashTab = (window.location.hash || "").replace("#", "").trim();
-      const savedTab = (hashTab && ["layered", "heatmap", "sunburst", "chord"].includes(hashTab))
+      const savedTab = (hashTab && ["layered", "heatmap", "sunburst", "chord", "calltree", "complexity"].includes(hashTab))
         ? hashTab
         : localStorage.getItem("codegraph_active_tab");
-      if (savedTab && ["layered", "heatmap", "sunburst", "chord"].includes(savedTab)) {
+      if (savedTab && ["layered", "heatmap", "sunburst", "chord", "calltree", "complexity"].includes(savedTab)) {
         currentView = savedTab;
         document.querySelectorAll(".tab").forEach(t => {
           if (t.dataset.view === currentView) t.classList.add("active");
@@ -1148,7 +1378,7 @@ const page = `<!doctype html>
 
     window.addEventListener("hashchange", () => {
       const hashTab = (window.location.hash || "").replace("#", "").trim();
-      if (hashTab && ["layered", "heatmap", "sunburst", "chord"].includes(hashTab) && hashTab !== currentView) {
+      if (hashTab && ["layered", "heatmap", "sunburst", "chord", "calltree", "complexity"].includes(hashTab) && hashTab !== currentView) {
         currentView = hashTab;
         document.querySelectorAll(".tab").forEach(t => {
           if (t.dataset.view === currentView) t.classList.add("active");
@@ -1165,6 +1395,8 @@ const page = `<!doctype html>
       if (currentView === "heatmap") loadHeatmap(incTests);
       else if (currentView === "sunburst") loadSunburst(incTests);
       else if (currentView === "chord") loadChord(incTests);
+      else if (currentView === "calltree") loadCalltree(incTests);
+      else if (currentView === "complexity") loadComplexity(incTests);
       else loadGraph(incTests);
     };
 
@@ -1765,6 +1997,12 @@ const page = `<!doctype html>
       }
     };
 
+    function isNodeInSelectedZone(selected, target) {
+      if (!selected || !target) return false;
+      const contains = (outer, inner) => outer.a0 <= inner.a0 + 0.0001 && outer.a1 >= inner.a1 - 0.0001;
+      return contains(selected, target) || contains(target, selected);
+    }
+
     function renderSunburst() {
       if (!sunburstData) return;
       canvas.innerHTML = "";
@@ -1789,19 +2027,6 @@ const page = `<!doctype html>
         nodeElements.set(node.id, path);
         frag.appendChild(path);
 
-        if (node.depth === 0) {
-          const rootText = document.createElementNS("http://www.w3.org/2000/svg", "text");
-          rootText.setAttribute("x", sunburstData.cx || 500);
-          rootText.setAttribute("y", sunburstData.cy || 500);
-          rootText.setAttribute("text-anchor", "middle");
-          rootText.setAttribute("dominant-baseline", "central");
-          rootText.setAttribute("fill", "#f8fafc");
-          rootText.setAttribute("font-size", "12px");
-          rootText.setAttribute("font-weight", "800");
-          rootText.setAttribute("pointer-events", "none");
-          rootText.textContent = (sunburstData.project?.name || "Codebase");
-          frag.appendChild(rootText);
-        }
       }
 
       // Zone highlight overlay spanning full radius
@@ -1837,26 +2062,6 @@ const page = `<!doctype html>
         return "M " + x0a + " " + y0a + " A " + r1 + " " + r1 + " 0 " + largeArc + " 1 " + x1a + " " + y1a + " L " + x0b + " " + y0b + " A " + r0 + " " + r0 + " 0 " + largeArc + " 0 " + x1b + " " + y1b + " Z";
       }
 
-      function isNodeInSelectedZone(target) {
-        if (!activeSelectedSunburstId) return true;
-        const sel = sunburstNodeMap.get(activeSelectedSunburstId);
-        if (!sel || !target) return false;
-        if (target.id === sel.id) return true;
-        if (sel.type === "directory" || sel.type === "module") {
-          const p = sel.fullPath || sel.name;
-          return (target.fullPath && (target.fullPath === p || target.fullPath.startsWith(p + "/"))) ||
-                 (target.module && (target.module === p || target.module.startsWith(p + "/"))) ||
-                 (target.file && target.file.startsWith(p + "/"));
-        }
-        if (sel.type === "file") {
-          return target.fullPath === sel.fullPath || target.file === sel.fullPath;
-        }
-        if (sel.type === "symbol") {
-          return target.id === sel.id || target.id === ("file:" + sel.file);
-        }
-        return false;
-      }
-
       function clearSunburstHover() {
         for (let i = 0; i < hoveredArcElements.length; i++) {
           hoveredArcElements[i].classList.remove("hovered");
@@ -1873,7 +2078,8 @@ const page = `<!doctype html>
 
       function highlightSunburstHover(node) {
         if (!node) return;
-        if (activeSelectedSunburstId && !isNodeInSelectedZone(node)) return;
+        const selected = sunburstNodeMap.get(activeSelectedSunburstId);
+        if (selected && !isNodeInSelectedZone(selected, node)) return;
 
         clearSunburstHover();
 
@@ -1988,7 +2194,8 @@ const page = `<!doctype html>
         lastHoveredId = id;
         if (id) {
           const target = sunburstNodeMap.get(id);
-          if (target && isNodeInSelectedZone(target)) {
+          const selected = sunburstNodeMap.get(activeSelectedSunburstId);
+          if (target && (!selected || isNodeInSelectedZone(selected, target))) {
             highlightSunburstHover(target);
           } else {
             clearSunburstHover();
@@ -2039,63 +2246,18 @@ const page = `<!doctype html>
       }
 
       svg.classList.add("has-selection");
-      if (zoneEl && typeof node.a0 === "number" && typeof node.a1 === "number") {
-        const cx = sunburstData.cx || 500;
-        const cy = sunburstData.cy || 500;
-        const r0 = (node.depth === 0 ? 0 : 95);
-        const r1 = 425;
-        const isFull = Math.abs(node.a1 - node.a0) >= 2 * Math.PI - 0.0001;
-        const a1 = isFull ? (node.a0 + 2 * Math.PI - 0.0001) : node.a1;
-        const x0a = cx + r1 * Math.cos(node.a0);
-        const y0a = cy + r1 * Math.sin(node.a0);
-        const x1a = cx + r1 * Math.cos(a1);
-        const y1a = cy + r1 * Math.sin(a1);
-        const largeArc = a1 - node.a0 > Math.PI ? 1 : 0;
-        let d = "";
-        if (r0 <= 0.001) {
-          d = "M " + cx + " " + cy + " L " + x0a + " " + y0a + " A " + r1 + " " + r1 + " 0 " + largeArc + " 1 " + x1a + " " + y1a + " Z";
-        } else {
-          const x0b = cx + r0 * Math.cos(a1);
-          const y0b = cy + r0 * Math.sin(a1);
-          const x1b = cx + r0 * Math.cos(node.a0);
-          const y1b = cy + r0 * Math.sin(node.a0);
-          d = "M " + x0a + " " + y0a + " A " + r1 + " " + r1 + " 0 " + largeArc + " 1 " + x1a + " " + y1a + " L " + x0b + " " + y0b + " A " + r0 + " " + r0 + " 0 " + largeArc + " 0 " + x1b + " " + y1b + " Z";
-        }
-        zoneEl.setAttribute("d", d);
-        zoneEl.style.opacity = "1";
-      }
-
-      const el = nodeElements.get(node.id);
-      if (el) {
-        el.classList.add("active-branch");
-        activeHighlighted.push(el);
-      }
-
       const nodes = sunburstData?.nodes || [];
-      if (node.type === "symbol") {
-        if (node.file) {
-          const fEl = nodeElements.get("file:" + node.file);
-          if (fEl) { fEl.classList.add("active-branch"); activeHighlighted.push(fEl); }
-        }
-        if (node.module) {
-          const mEl = nodeElements.get("mod:" + node.module);
-          if (mEl) { mEl.classList.add("active-branch"); activeHighlighted.push(mEl); }
-        }
-      } else if (node.type === "file") {
-        if (node.module) {
-          const mEl = nodeElements.get("mod:" + node.module);
-          if (mEl) { mEl.classList.add("active-branch"); activeHighlighted.push(mEl); }
-        }
-        const syms = nodes.filter(n => n.type === "symbol" && (n.file === node.fullPath || n.file === node.name));
-        syms.forEach(sn => {
-          const sEl = nodeElements.get(sn.id);
-          if (sEl) { sEl.classList.add("active-branch"); activeHighlighted.push(sEl); }
-        });
-      } else if (node.type === "module") {
-        nodes.filter(n => n.module === node.name).forEach(cn => {
-          const cEl = nodeElements.get(cn.id);
-          if (cEl) { cEl.classList.add("active-branch"); activeHighlighted.push(cEl); }
-        });
+      const r0 = node.r0;
+      let r1 = node.r1;
+      for (const target of nodes) {
+        if (!isNodeInSelectedZone(node, target)) continue;
+        if (target.depth >= node.depth) r1 = Math.max(r1, target.r1);
+        const targetEl = nodeElements.get(target.id);
+        if (targetEl) { targetEl.classList.add("active-branch"); activeHighlighted.push(targetEl); }
+      }
+      if (zoneEl) {
+        zoneEl.setAttribute("d", describeArc(sunburstData.cx || 500, sunburstData.cy || 500, r0, r1, node.a0, node.a1));
+        zoneEl.style.opacity = "1";
       }
 
       renderSunburstDetails(node);
@@ -2473,12 +2635,32 @@ const page = `<!doctype html>
 
 export function createVisualizerServer(rootPath = root, options = {}) {
   const queryStreamFn = options.streamQuery ?? streamQuery
+  const watchFn = options.watch ?? fs.watch
   const sseClients = new Set()
 
   let inFlightGraphQuery = null
   let inFlightController = null
   let inFlightWaiters = 0
   let cachedRawGraph = null
+
+  async function queryRows(query, signal = null) {
+    const rows = []
+    for await (const row of queryStreamFn(rootPath, query, signal ? { signal } : {})) rows.push(row)
+    return rows
+  }
+
+  function summaryFromRows(rows) {
+    if (rows.length === 1 && Array.isArray(rows[0]?.owners)) return rows[0]
+    const summary = { owners: [], edges: [] }
+    for (const row of rows) {
+      if (row?.record === 'owner' || row?.record === 'summary') summary.owners.push(row.owner ?? row.summary ?? row)
+      else if (row?.record === 'edge' || row?.from) summary.edges.push(row.edge ?? row)
+      if (row?.generation || row?.validatedGeneration) summary.generation = row.generation ?? row.validatedGeneration
+      if (Array.isArray(row?.roots)) summary.roots = row.roots
+      if (row?.truncated) summary.truncated = true
+    }
+    return summary
+  }
 
   function fetchRawGraph(forceFresh = false, signal = null) {
     if (cachedRawGraph && !forceFresh) return Promise.resolve(cachedRawGraph)
@@ -2531,6 +2713,7 @@ export function createVisualizerServer(rootPath = root, options = {}) {
   })()
   const codegraphDir = path.join(resolvedRoot, '.codegraph')
   const debounceMs = options.debounceMs ?? 1500
+  const ssePingMs = options.ssePingMs ?? 25000
   let debounceTimer = null
   let isDebouncing = false
 
@@ -2570,7 +2753,7 @@ export function createVisualizerServer(rootPath = root, options = {}) {
   try {
     // ONE recursive watch on the root — it already contains .codegraph/CURRENT, so the three
     // former watch paths collapse into a single handle instead of an fd per watched file.
-    watcher = fs.watch(resolvedRoot, { recursive: true, persistent: true }, (evt, name) => {
+    watcher = watchFn(resolvedRoot, { recursive: true, persistent: true }, (evt, name) => {
       if (!name) return
       const file = path.join(resolvedRoot, name)
       if (isIgnoredWatchPath(file)) return
@@ -2594,31 +2777,23 @@ export function createVisualizerServer(rootPath = root, options = {}) {
         'cache-control': 'no-cache',
         'connection': 'keep-alive',
       })
-      res.write('data: {"status":"connected"}\n\n')
       sseClients.add(res)
       console.log(`[CodeGraph Server] SSE client connected to /events (active clients: ${sseClients.size})`)
       const pingTimer = setInterval(() => {
         if (!res.writableEnded) {
           try { res.write('data: {"status":"ping"}\n\n') } catch {}
         }
-      }, 25000)
+      }, ssePingMs)
       req.on('close', () => {
         clearInterval(pingTimer)
         sseClients.delete(res)
         console.log(`[CodeGraph Server] SSE client disconnected (active clients: ${sseClients.size})`)
       })
+      res.write('data: {"status":"connected"}\n\n')
       return
     }
     if (parsedUrl.pathname === '/') {
       res.setHeader('content-type', 'text/html; charset=utf-8')
-      try {
-        const fileContent = fs.readFileSync(new URL(import.meta.url).pathname, 'utf8')
-        const sIdx = fileContent.search(/<!doctype html>/i)
-        const eIdx = fileContent.search(/<\/html>/i)
-        if (sIdx !== -1 && eIdx !== -1) {
-          return res.end(fileContent.slice(sIdx, eIdx + 7))
-        }
-      } catch {}
       return res.end(page)
     }
     if (parsedUrl.pathname === '/graph') {
@@ -2689,6 +2864,70 @@ export function createVisualizerServer(rootPath = root, options = {}) {
         return res.end(JSON.stringify({ error: error.message }))
       }
     }
+    if (parsedUrl.pathname === '/calltree') {
+      const rawDepth = parsedUrl.searchParams.get('depth') ?? '3'
+      const depth = Number(rawDepth)
+      if (!/^\d+$/.test(rawDepth) || !Number.isInteger(depth) || depth < 1 || depth > 6) {
+        res.statusCode = 400
+        return res.end(JSON.stringify({ error: 'depth must be an integer from 1 through 6' }))
+      }
+      try {
+        const rootSymbolId = parsedUrl.searchParams.get('root') || undefined
+        const includeTests = parsedUrl.searchParams.get('includeTests') === '1'
+        const generation = parsedUrl.searchParams.get('generation') || undefined
+        const summary = summaryFromRows(await queryRows({ type: 'internal-summaries', root: rootSymbolId, depth, includeTests, generation }))
+        const calltree = buildCallTreeData(summary, { depth })
+        calltree.project = { name: path.basename(rootPath), root: rootPath }
+        res.setHeader('content-type', 'application/json')
+        return res.end(JSON.stringify(calltree))
+      } catch (error) {
+        res.statusCode = 500
+        return res.end(JSON.stringify({ error: error.message }))
+      }
+    }
+    if (parsedUrl.pathname === '/complexity') {
+      try {
+        const includeTests = parsedUrl.searchParams.get('includeTests') === '1'
+        const generation = parsedUrl.searchParams.get('generation') || undefined
+        const widthParam = parsedUrl.searchParams.get('width')
+        const heightParam = parsedUrl.searchParams.get('height')
+        const hasDimensions = widthParam !== null || heightParam !== null
+        if (hasDimensions && (!/^\d+$/.test(widthParam ?? '') || !/^\d+$/.test(heightParam ?? '') || Number(widthParam) < 1 || Number(heightParam) < 1 || Number(widthParam) > 4096 || Number(heightParam) > 4096)) {
+          res.statusCode = 400
+          return res.end(JSON.stringify({ error: 'width and height must be positive integers no greater than 4096' }))
+        }
+        const summary = summaryFromRows(await queryRows({ type: 'internal-summaries', metricsOnly: true, includeTests, generation }))
+        const complexity = buildComplexityData(summary.owners, { includeTests, generation: summary.generation, ...(hasDimensions ? { width: Number(widthParam), height: Number(heightParam) } : {}) })
+        complexity.project = { name: path.basename(rootPath), root: rootPath }
+        res.setHeader('content-type', 'application/json')
+        return res.end(JSON.stringify(complexity))
+      } catch (error) {
+        res.statusCode = 500
+        return res.end(JSON.stringify({ error: error.message }))
+      }
+    }
+    if (parsedUrl.pathname === '/internals') {
+      const file = parsedUrl.searchParams.get('file')
+      const ownerId = parsedUrl.searchParams.get('ownerId')
+      const generation = parsedUrl.searchParams.get('generation') || undefined
+      const resolvedFile = file ? path.resolve(resolvedRoot, file) : ''
+      if (!file || path.isAbsolute(file) || (resolvedFile !== resolvedRoot && !resolvedFile.startsWith(resolvedRoot + path.sep))) {
+        res.statusCode = 400
+        return res.end(JSON.stringify({ error: 'file path must stay inside the repository root' }))
+      }
+      if (!/^\d+$/.test(ownerId ?? '')) {
+        res.statusCode = 400
+        return res.end(JSON.stringify({ error: 'ownerId must be an unsigned integer' }))
+      }
+      try {
+        const records = await queryRows({ type: 'internals', operation: 'map', file, owner: { id: Number(ownerId) }, generation, view: 'combined', limit: 2000 })
+        res.setHeader('content-type', 'application/json')
+        return res.end(JSON.stringify({ generation, records }))
+      } catch (error) {
+        res.statusCode = 500
+        return res.end(JSON.stringify({ error: error.message }))
+      }
+    }
     res.statusCode = 404
     res.end('not found')
   })
@@ -2696,8 +2935,12 @@ export function createVisualizerServer(rootPath = root, options = {}) {
   return server
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(import.meta.url).pathname)) {
-  createVisualizerServer(root).listen(port, '127.0.0.1', () => {
-    process.stderr.write(`⚡ CodeGraph visualizer: http://127.0.0.1:${port}\n`)
+export function startVisualizer(rootPath = root, listenPort = port, options = {}) {
+  const server = createVisualizerServer(rootPath, options)
+  const listen = options.listen ?? ((target, requestedPort, host, ready) => target.listen(requestedPort, host, ready))
+  return listen(server, listenPort, '127.0.0.1', () => {
+    process.stderr.write(`⚡ CodeGraph visualizer: http://127.0.0.1:${server.address().port}\n`)
   })
 }
+
+if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(import.meta.url).pathname)) startVisualizer()

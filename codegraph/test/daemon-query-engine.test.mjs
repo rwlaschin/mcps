@@ -23,6 +23,51 @@ test.afterEach(async () => {
   temporaryRoots.clear()
 })
 
+test('MCP root shares one mmap cache between query and semantic engines and disposes it once', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-mcp-shared-cache-'))
+  const loaderRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-mcp-shared-cache-loader-'))
+  temporaryRoots.add(root); temporaryRoots.add(loaderRoot)
+  const loaderPath = path.join(loaderRoot, 'shared-cache-loader.mjs')
+  fs.writeFileSync(loaderPath, `
+export async function load(url, context, nextLoad) {
+  if (url.endsWith('/mmap-query-cache.mjs')) return { format: 'module', shortCircuit: true, source: \`
+    export class MmapQueryCache {
+      constructor() { this.id = 'root-cache'; this.disposed = false; process.stderr.write('CACHE_CREATED\\\\n') }
+      dispose() { if (this.disposed) throw new Error('cache disposed twice'); this.disposed = true; process.stderr.write('CACHE_DISPOSED\\\\n') }
+    }
+  \` }
+  if (url.endsWith('/query-cache-schema.mjs')) return { format: 'module', shortCircuit: true, source: \`export const prepareQueryViewCache = () => 'cache.bin'\` }
+  if (url.endsWith('/native/mmap-adapter.mjs')) return { format: 'module', shortCircuit: true, source: \`export const nativeMmapAdapter = {}\` }
+  if (url.endsWith('/source-policy.mjs')) return { format: 'module', shortCircuit: true, source: \`
+    export const controlFileHashes = () => ({})
+    export const fileContentHash = () => ''
+    export const createSourcePolicy = () => ({ scan: () => [], normalize: () => '', acceptWatchPath: () => false, isSourceRelative: () => false })
+  \` }
+  if (url.endsWith('/store.mjs')) return { format: 'module', shortCircuit: true, source: \`export class GraphStore { readGeneration() { return { sources: {}, controlHashes: {} } } }\` }
+  if (url.endsWith('/daemon-query-engine.mjs')) return { format: 'module', shortCircuit: true, source: \`
+    export class DaemonQueryEngine {
+      constructor(root, options) { this.cache = options.cache; this.engineFactory = options.engineFactory; process.stderr.write('QUERY_CACHE ' + this.cache.id + '\\\\n') }
+      async pinQuery() { return { metadata: { freshness: 'validated', coverage: 'calls', revision: null, validatedGeneration: 'g' }, rows: [] } }
+      async dispose() {}
+    }
+  \` }
+  if (url.endsWith('/mcp-runtime.mjs')) return { format: 'module', shortCircuit: true, source: \`
+    export class McpProjectRuntime {
+      constructor(root, options) { process.stderr.write('ENGINE_CACHE ' + options.queryCache.id + '\\\\n'); this.engine = { mmapQueryCache: options.queryCache, dispose: async () => {} } }
+      async start() {}
+      async index() { return { generation: 'g', parsedFiles: [], reusedFiles: [] } }
+      async close() { await this.engine.dispose() }
+    }
+  \` }
+  return nextLoad(url, context)
+}
+`)
+  const request = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'codegraph_query', arguments: { root, query: { type: 'symbols' } } } }) + '\n' + JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'codegraph_index', arguments: { root } } }) + '\n'
+  const result = spawnSync(process.execPath, ['--no-warnings', '--experimental-loader', loaderPath, 'mcp-server.mjs'], { cwd: path.resolve(import.meta.dirname, '..'), encoding: 'utf8', input: request, timeout: 10_000 })
+
+  assert.deepEqual(result.stderr.trim().split('\n'), ['CACHE_CREATED', 'QUERY_CACHE root-cache', 'ENGINE_CACHE root-cache', 'CACHE_DISPOSED'])
+})
+
 test('domain analysis: default-generation symbol queries pin CURRENT and acquire the calls page without constructing GraphStore', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-light-current-symbols-'))
   temporaryRoots.add(root)
@@ -638,6 +683,18 @@ test('domain analysis: tsconfig content changed before the first MCP read labels
     { indexedStatus: indexed.status, primedStatus: primed.status, status: result.status, isError: response.result?.isError, metadata: JSON.parse(metadata), row },
     { indexedStatus: 0, primedStatus: 0, status: 0, isError: undefined, metadata: { revision: null, freshness: 'validated', coverage: 'calls', validatedGeneration }, row: 'src/calls.ts:2 -> src/calls.ts:1 call' },
   )
+})
+
+test('internal query contract: validated metrics are read directly without constructing the parser fallback', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-internals-direct-'))
+  temporaryRoots.add(root)
+  fs.mkdirSync(path.join(root, '.codegraph'), { recursive: true })
+  fs.writeFileSync(path.join(root, '.codegraph', 'CURRENT'), 'generation-internal')
+  let fallbackCreations = 0
+  const engine = new DaemonQueryEngine(root, { cacheFactory: () => ({ acquireInternal: () => ({ value: { metrics: () => [{ record: 'metrics', metrics: { cyclomatic: 1, branchCount: 0, nestingDepth: 0 } }] }, release() {} }), acquire: () => null, dispose() {} }), engineFactory: () => { fallbackCreations += 1; throw new Error('parser fallback forbidden') } })
+  openEngines.add(engine)
+  const rows = await engine.queryBatch({ type: 'internals', operation: 'metrics', file: 'src/a.ts', owner: { id: 0 }, generation: 'generation-internal', limit: 1 })
+  assert.deepEqual({ fallbackCreations, rows }, { fallbackCreations: 0, rows: [{ record: 'metrics', metrics: { cyclomatic: 1, branchCount: 0, nestingDepth: 0 } }] })
 })
 
 test('domain analysis: daemon does not accept a socket connection until its async query engine is ready', async () => {

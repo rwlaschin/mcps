@@ -1,7 +1,9 @@
 import path from 'node:path'
+import fs from 'node:fs'
 import crypto from 'node:crypto'
+import { isMainThread, threadId } from 'node:worker_threads'
 import { controlFileHashes, createSourcePolicy } from './source-policy.mjs'
-import { GraphStore, OVERLAY_VERSION } from './store.mjs'
+import { decodeInternalPartition, decodeSymbolPartition, GraphStore, OVERLAY_VERSION, openInternalPartition, readSymbolPartitionIdentity } from './store.mjs'
 import { EDGE_COVERAGE, coverageCode, coverageName } from './edge-coverage.mjs'
 
 // Generations before version 3 predate the field and were always complete. Was copy-pasted at
@@ -11,19 +13,45 @@ const manifestCoverage = (manifest) =>
 import { createTraceProfiler } from './trace-profile.mjs'
 import { readSources } from './source-reader.mjs'
 import { FileIdRegistry } from './file-index.mjs'
-import { FileLocalResolver } from './incremental-resolver.mjs'
-import { SemanticCheckerWorker } from './semantic-checker-worker.mjs'
+import { advanceJournalPointer, SemanticCheckerWorker } from './semantic-checker-worker.mjs'
 import { MmapQueryCache } from './mmap-query-cache.mjs'
 import { prepareQueryViewCache } from './query-cache-schema.mjs'
 import { nativeMmapAdapter } from './native/mmap-adapter.mjs'
 
 const contentHash = (text) => crypto.createHash('sha256').update(text).digest('hex')
+const POOL_JOB_COUNT = 300
+const POOL_CANCELLED = 0
+const POOL_READ_SEQUENCE = 2
+const POOL_READ_CURSOR = 5
+const POOL_HEADER_BYTES = 4096
+const POOL_ARENA_BYTES = POOL_JOB_COUNT * 65536
+const POOL_BYTES = POOL_HEADER_BYTES + POOL_ARENA_BYTES
+const DEBUG_POOL = process.env.CODEGRAPH_DEBUG_POOL === '1'
+let poolDebugSequence = 0
+const debugPool = (event, detail) => {
+  if (DEBUG_POOL) process.stderr.write(`${JSON.stringify({ timestamp: new Date().toISOString(), epochMs: Date.now(), monotonicMs: performance.now(), pid: process.pid, threadId, side: 'main', event, ...detail })}\n`)
+}
+const createPartitionPool = () => {
+  const buffer = new SharedArrayBuffer(POOL_BYTES)
+  const metadata = new Int32Array(buffer, 0, POOL_HEADER_BYTES / 4)
+  const payload = new Uint8Array(buffer, POOL_HEADER_BYTES)
+  return { buffer, metadata, payload, memoryBuffer: payload, insertionPointer: 0, oldestActivePartition: 0, debugId: DEBUG_POOL ? `${process.pid}:${Date.now()}:${++poolDebugSequence}` : null }
+}
+const cancelPartitionPool = (pool) => {
+  if (!pool) return
+  Atomics.store(pool.metadata, POOL_CANCELLED, 1)
+}
+const completePartitionJob = (pool) => { advanceJournalPointer(pool); pool.metadata[POOL_READ_CURSOR] = pool.oldestActivePartition; Atomics.add(pool.metadata, POOL_READ_SEQUENCE, 1) }
 const unresolvedCandidateMatches = (partitions, changedFiles) => {
   const changed = new Set(changedFiles.map((file) => file.split(path.sep).join('/')))
   return Object.values(partitions).some((partition) => partition.unresolved?.some((row) => row.candidates?.some((candidate) => changed.has(candidate))))
 }
-let semanticParser
-const loadSemanticParser = () => semanticParser ??= import('./parser.mjs')
+const persistPartition = (store, partition, profiler) => {
+  const { internalPartition, internalFingerprint, ...symbolPartition } = partition
+  return { partition: store.writePartition(symbolPartition, profiler), internal: internalPartition ? store.writeInternalPartition(internalPartition) : null, internalFingerprint }
+}
+
+const internalFingerprints = (store, manifest) => Object.fromEntries(Object.entries(manifest.internalPartitions ?? {}).map(([file, id]) => [file, openInternalPartition(store.readInternalPartition(id)).compilerFingerprint]))
 
 const slash = (p) => p.split(path.sep).join('/')
 const uniqueEvents = (events) => [...new Map(events.map((event) => [`${event.type}:${slash(event.path)}`, { ...event, path: slash(event.path) }])).values()]
@@ -83,8 +111,9 @@ export class CodeGraphEngine {
     this.root = path.resolve(root)
     this.policy = createSourcePolicy(this.root)
     this.store = new GraphStore(this.root, options.cacheDir)
+    this.ownsMmapQueryCache = options.queryCache == null
     const mmapOptions = options.mmapQueryCache ?? {}
-    this.mmapQueryCache = new MmapQueryCache({
+    this.mmapQueryCache = options.queryCache ?? new MmapQueryCache({
       filePath: prepareQueryViewCache(this.store.dir),
       root: this.root,
       adapter: mmapOptions.adapter === undefined ? nativeMmapAdapter : mmapOptions.adapter,
@@ -102,13 +131,9 @@ export class CodeGraphEngine {
     this.overlayEdgeCache = null
     this.validatedQueryViews = new Map()
     this.provisionalQueryView = null
-    this.workspace = null
     this.operationTail = Promise.resolve()
     this.disposed = false
-    this.resolver = new FileLocalResolver(this.root, null, { ...(options.parserPool ? { parserPool: options.parserPool } : {}), parserPoolOptions: options.parserPoolOptions })
-    this.parserPool = this.resolver.parserPool
     this.validationWorker = options.validationWorkerFactory?.() ?? new SemanticCheckerWorker()
-    this.retainSemanticState = options.retainSemanticState === true
     this.validationPayloadObserver = options.validationPayloadObserver ?? null
     this.validationWorkerHydrated = false
     this.validationBasePartitions = null
@@ -116,65 +141,106 @@ export class CodeGraphEngine {
     // differently from one reached through DaemonQueryEngine: the query-view cache is keyed by
     // generation, so a null one missed on every call and every query silently re-read all
     // partitions from disk instead of using the mapped page. Two entry points, two speeds.
-    this.validatedGeneration = (() => { try { return this.store.readGeneration().generation ?? null } catch { return null } })()
-    this.validatedSourceBlobs = {}
+    const adoptedGeneration = (() => { try { return this.store.readGeneration() } catch { return null } })()
+    this.validatedGeneration = adoptedGeneration?.generation ?? null
+    this.validatedSourceBlobs = adoptedGeneration?.sources ?? {}
     this.validationChanges = new Map()
+    this.validationRevision = 0
+    this.publishedValidationRevision = 0
     this.validationEpoch = 0
     this.activeValidation = null
     this.pendingValidation = null
+    this.activePartitionPool = null
   }
   build() { return this.#enqueueOperation(() => this.#build()) }
   incremental(events, prefetched = null) { return this.#enqueueOperation(() => this.#incremental(events, prefetched)) }
   reconcile() { return this.#enqueueOperation(() => this.#reconcile()) }
   async #build() {
-    this.#discardWorkspace()
-    if (this.retainSemanticState) { this.validationWorkerHydrated = false; this.validationBasePartitions = null }
+    this.validationWorkerHydrated = false
+    this.validationBasePartitions = null
     this.policy = createSourcePolicy(this.root)
     const profile = this.#beginOperation('build')
+    let buildPool = null
     try {
     const scan = this.profiler?.begin('scan', undefined, { memory: true })
-    const files = this.policy.scan(); this.#synchronizeFileIds(files); const known = new Set(files); const partitions = {}; const parsedFiles = []
+    const files = this.policy.scan(); this.#synchronizeFileIds(files); const partitions = {}; const internalPartitions = {}; const parsedFiles = []
     if (scan) this.profiler.end(scan)
     const sources = await this.#readSources(files, profile)
     const sourceBlobs = Object.fromEntries([...sources].map(([file, source]) => [file, this.store.writeSource(source)]))
     const semantic = this.profiler?.begin('semantic-project', undefined, { memory: true })
-    let workspace = null; let ownedPartitions = null; let context = null; let parser = null
-    if (this.retainSemanticState) {
-      const result = await this.validationWorker.index({ root: this.root, sources: [...sources], sourceBlobs, edgeCoverage: EDGE_COVERAGE.CALLS })
-      this.#validateOwnedResult(result, sourceBlobs)
-      ownedPartitions = result.partitions
-      Object.assign(partitions, result.partitions)
-    } else {
-      parser = await loadSemanticParser()
-      context = parser.prepareSemanticProject(parser.createSemanticProject(this.root, sources), this.root, this.profiler)
-      workspace = { project: context.project, host: context.project.__codegraphHost, context, sources }
+    {
+      const expectedFiles = [...sources.keys()].sort()
+      const engineReceipts = new Map()
+      buildPool = createPartitionPool()
+      this.activePartitionPool = buildPool
+      let persistenceMs = 0
+      const onPartition = ({ partitions: completed, poolBatch }) => {
+        if (poolBatch) { debugPool('Main Receive Batch', poolBatch); debugPool('Main Start Batch', poolBatch) }
+        for (const job of completed) {
+          const persistenceStarted = performance.now()
+          const { file, ordinal, offset, symbolLength, internalLength } = job
+          if (file !== expectedFiles[ordinal]) throw new Error(`invalid semantic partition job: ${file}`)
+          this.instrument?.({ phase: 'parse', file })
+          if (this.activeProfile) this.activeProfile.args.filesParsed += 1
+          this.#validateOwnedIdentity(file, readSymbolPartitionIdentity(buildPool.payload, offset, symbolLength), sourceBlobs)
+          const partitionId = this.store.writePackedPartitionRange(buildPool.payload, offset, symbolLength, file, this.profiler)
+          const internalPartitionId = this.store.writeInternalPartitionRange(buildPool.payload, offset + symbolLength, internalLength)
+          engineReceipts.set(file, { file, sourceHash: sourceBlobs[file], writer: 'engine', serializedLength: job.length, chunkCount: 1, symbolLength, internalLength, symbolChunkCount: 1, internalChunkCount: 0, partitionId, internalPartitionId, internalFingerprint: null })
+          completePartitionJob(buildPool)
+          persistenceMs += performance.now() - persistenceStarted
+        }
+        if (poolBatch) debugPool('Main Complete Batch', poolBatch)
+      }
+      const result = await this.validationWorker.index({
+        root: this.root,
+        sources: expectedFiles.map((file) => [file, sources.get(file)]),
+        sourceBlobs,
+        cacheDir: path.relative(this.root, this.store.dir),
+        edgeCoverage: EDGE_COVERAGE.CALLS,
+        partitionPool: buildPool.buffer,
+        ...(buildPool?.debugId ? { partitionPoolDebugId: buildPool.debugId } : {}),
+      }, onPartition)
+      if (result.poolDiagnostics) {
+        const { parseMs: workerParseMs, ...diagnostics } = result.poolDiagnostics
+        debugPool('Main Shared Memory Summary', { mode: result.mode, ...diagnostics, workerParseMs, persistenceMs })
+        delete result.poolDiagnostics
+      }
+      if (this.disposed) throw new Error('codegraph engine is disposed')
+      for (const receipt of result.partitionReceipts ?? []) if (receipt.writer === 'engine' && engineReceipts.has(receipt.file)) engineReceipts.get(receipt.file).internalFingerprint = receipt.internalFingerprint
+      const receipts = this.#validateOwnedReceipts(result, sourceBlobs, expectedFiles, engineReceipts)
+      for (const file of expectedFiles.slice().sort()) {
+        const receipt = receipts.get(file)
+        partitions[file] = receipt.partitionId
+        internalPartitions[file] = receipt.internalPartitionId
+      }
     }
     if (semantic) this.profiler.end(semantic)
     const parseIndex = this.profiler?.begin('parse-index', undefined, { memory: true })
-    for (const rel of files) { partitions[rel] = this.store.writePartition(this.retainSemanticState ? partitions[rel] : this.#parse(rel, sources, known, context, parser.parsePartition), this.profiler); parsedFiles.push(rel) }
+    for (const rel of files) {
+      if (typeof partitions[rel] !== 'string') throw new Error(`semantic ownership omitted partition: ${rel}`)
+      parsedFiles.push(rel)
+    }
     if (parseIndex) this.profiler.end(parseIndex)
+    if (this.disposed) throw new Error('codegraph engine is disposed')
     const publish = this.profiler?.begin('publish', undefined, { memory: true })
-    const generation = this.store.publish({ version: 3, root: this.root, edgeCoverage: coverageName(EDGE_COVERAGE.CALLS), controlHashes: controlFileHashes(this.root), sources: sourceBlobs, partitions, partitionHashes: partitions })
-    if (workspace) workspace.generation = generation.generation
-    this.workspace = workspace
-    this.resolver = new FileLocalResolver(this.root, sources, { parserPool: this.parserPool })
+    const generation = this.store.publish({ version: 3, root: this.root, edgeCoverage: coverageName(EDGE_COVERAGE.CALLS), controlHashes: controlFileHashes(this.root), sources: sourceBlobs, partitions, internalPartitions, partitionHashes: partitions })
     this.validatedGeneration = generation.generation
     this.validatedSourceBlobs = sourceBlobs
-    this.validationWorkerHydrated = this.retainSemanticState
-    this.validationBasePartitions = this.retainSemanticState ? { generation: generation.generation, partitions: ownedPartitions } : null
+    this.validationWorkerHydrated = true
+    this.validationBasePartitions = null
     this.validationChanges.clear()
     this.validationEpoch += 1
+    this.activePartitionPool = null
     if (publish) this.profiler.end(publish)
     return this.#finishOperation(profile, { generation: generation.generation, edgeCoverage: coverageName(EDGE_COVERAGE.CALLS), parsedFiles, reusedFiles: [] })
-    } catch (error) { this.#discardWorkspace(); await this.#failOperation(profile, error); throw error }
+    } catch (error) { cancelPartitionPool(buildPool); this.activePartitionPool = null; await this.#failOperation(profile, error); throw error }
   }
   async #incremental(events, prefetched = null) {
     {
     const normalizedEvents = uniqueEvents(events)
     if (normalizedEvents.some((event) => this.policy.isControlRelative(this.policy.normalize(path.resolve(this.root, event.path))))) return this.#build()
     const previous = this.store.readGeneration()
-    if (!this.validatedGeneration || this.validatedGeneration !== previous.generation || !this.resolver.sourceEntries().length) {
-      this.resolver = new FileLocalResolver(this.root, new Map(Object.entries(previous.sources ?? {}).map(([file, id]) => [file, this.store.readSource(id)])), { parserPool: this.parserPool })
+    if (!this.validatedGeneration || this.validatedGeneration !== previous.generation) {
       this.validatedGeneration = previous.generation
       this.validatedSourceBlobs = previous.sources ?? {}
       this.validationWorkerHydrated = false
@@ -190,27 +256,18 @@ export class CodeGraphEngine {
       else if (event.source !== undefined) accepted.push({ type: event.type, path: rel, source: event.source })
       else if (this.policy.acceptWatchPath(path.join(this.root, rel))) accepted.push({ type: event.type, path: rel })
     }
-    const diskBacked = !prefetched && accepted.some((event) => event.type !== 'unlink' && event.source === undefined)
-    const diskFileCount = accepted.filter((event) => event.type !== 'unlink' && event.source === undefined).length
-    const apartmentBacked = diskBacked && diskFileCount >= 2 && this.parserPool.snapshot().workerCount > 0 && accepted.every((event) => event.type === 'unlink' || event.source === undefined)
-    let changes; let refreshed
-    if (apartmentBacked) {
-      changes = accepted.map((event) => ({ ...event, fileId: event.path }))
-      refreshed = await this.applyFileChanges(changes)
-    } else {
-      const needRead = accepted.filter((event) => event.type !== 'unlink' && event.source === undefined).map((event) => event.path)
-      const read = prefetched?.sources ?? await this.#readSources(needRead, null)
-      changes = accepted.map((event) => event.type === 'unlink' ? event : { ...event, source: event.source ?? read.get(event.path) })
-      refreshed = this.applyChanges(changes)
-    }
-    const result = { generation: this.validatedGeneration, edgeCoverage: coverageName(EDGE_COVERAGE.CALLS), parsedFiles: changes.filter((event) => event.type !== 'unlink').map((event) => event.path).sort(), reusedFiles: this.resolver.snapshot().files.filter((file) => !changes.some((event) => event.path === file)), ...(this.profiler ? { profile: { path: this.profilePath, format: 'chrome-trace-event' } } : {}) }
-    if (apartmentBacked) {
-      result.validation = refreshed.validation.then((validated) => { result.validationMode = validated?.validationMode; result.validatedFiles = validated?.validatedFiles; result.generation = validated?.generation ?? result.generation; return validated })
-    } else {
-      const validated = await refreshed.validation
+    const needRead = accepted.filter((event) => event.type !== 'unlink' && event.source === undefined).map((event) => event.path)
+    const read = prefetched?.sources ?? await this.#readSources(needRead, null)
+    const changes = accepted.map((event) => event.type === 'unlink' ? event : { ...event, source: event.source ?? read.get(event.path) })
+    const refreshed = this.#publishWorkerChanges(changes)
+    const result = { generation: this.validatedGeneration, edgeCoverage: coverageName(EDGE_COVERAGE.CALLS), parsedFiles: changes.filter((event) => event.type !== 'unlink').map((event) => event.path).sort(), reusedFiles: Object.keys(previous.partitions).filter((file) => !changes.some((event) => event.path === file)).sort(), ...(this.profiler ? { profile: { path: this.profilePath, format: 'chrome-trace-event' } } : {}) }
+    const applyValidation = (validated) => {
       result.validationMode = validated?.validationMode; result.validatedFiles = validated?.validatedFiles; result.generation = validated?.generation ?? result.generation
+      result.internalBuildCount = validated?.internalBuildCount; result.internalRebuiltFiles = validated?.internalRebuiltFiles; result.internalReusedFiles = validated?.internalReusedFiles
+      return validated
     }
-    return result
+    result.validation = refreshed.validation.then(applyValidation)
+    return this.#profileResult(result, null)
     }
   }
   async #reconcile() {
@@ -243,68 +300,60 @@ export class CodeGraphEngine {
       for (const file of indexed) if (!files.has(file)) events.push({ type: 'unlink', path: file })
       if (profile) this.profiler.end(profile.operation)
       if (events.length) return this.#incremental(events, { files: fileList, ...readResult })
-      if (this.retainSemanticState && (!this.validationWorkerHydrated || this.validatedGeneration !== generation.generation)) {
+      if (!this.validationWorkerHydrated || this.validatedGeneration !== generation.generation) {
         const persistedPartitions = Object.fromEntries(Object.entries(generation.partitions).map(([file, id]) => [file, this.store.readPartition(id)]))
-        const hydrated = await this.validationWorker.hydrate({ root: this.root, generation: generation.generation, sources: [...readResult.sources], sourceBlobs: generation.sources ?? {}, partitions: persistedPartitions })
+        const hydrated = await this.validationWorker.hydrate({ root: this.root, generation: generation.generation, sources: [...readResult.sources], sourceBlobs: generation.sources ?? {}, partitions: persistedPartitions, internalFingerprints: internalFingerprints(this.store, generation) })
         this.#validateOwnedResult(hydrated, generation.sources ?? {})
-        this.#discardWorkspace()
         this.validationWorkerHydrated = true
         this.validationBasePartitions = { generation: generation.generation, partitions: persistedPartitions }
-      } else if (!this.retainSemanticState && (!this.workspace || this.workspace.generation !== generation.generation)) {
-        this.#discardWorkspace()
-        this.workspace = await this.#createWorkspace(readResult.sources, generation.generation)
       }
-      this.resolver = new FileLocalResolver(this.root, readResult.sources, { parserPool: this.parserPool })
       this.validatedGeneration = generation.generation
       this.validatedSourceBlobs = generation.sources ?? {}
-      if (!this.retainSemanticState) { this.validationWorkerHydrated = false; this.validationBasePartitions = null }
       this.validationChanges.clear()
       this.validationEpoch += 1
       return this.#profileResult({ generation: generation.generation, edgeCoverage: coverageName(manifestCoverage(generation)), parsedFiles: [], reusedFiles: [...files] }, profile)
     } catch (error) {
       if (profile) await this.#failOperation(profile, error)
-      if (this.retainSemanticState && existingGeneration) { this.validationWorkerHydrated = false; this.validationBasePartitions = null; throw error }
+      if (existingGeneration) { this.validationWorkerHydrated = false; this.validationBasePartitions = null; throw error }
       return this.#build()
     }
   }
   readGeneration(generation) { return this.store.readGeneration(generation) }
-  provisionalSnapshot() { return this.resolver.snapshot() }
+  provisionalSnapshot() {
+    const graph = this.#validatedQueryView(this.validatedGeneration, EDGE_COVERAGE.CALLS).graph
+    return { ...graph, revision: this.publishedValidationRevision, freshness: 'validated', coverage: graph.edgeCoverage, validatedGeneration: graph.generation }
+  }
   applyChanges(changes, options = {}) {
     if (this.disposed) throw new Error('codegraph engine is disposed')
-    const args = { revision: this.resolver.revision + 1, freshness: 'provisional', coverage: 'module-linked-syntax', status: 'ok' }
-    const token = this.profiler?.begin('codegraph.provisional-refresh', args)
-    let snapshot
-    try { snapshot = this.resolver.applyChanges(changes, options) } catch (error) { args.status = 'error'; if (token) this.profiler.end(token); throw error }
-    if (token) this.profiler.end(token)
-    return this.#publishProvisional(snapshot, changes)
+    return this.#publishWorkerChanges(changes, options)
   }
   async applyFileChanges(changes, options = {}) {
     if (this.disposed) throw new Error('codegraph engine is disposed')
-    const args = { revision: this.resolver.revision + 1, freshness: 'provisional', coverage: 'module-linked-syntax', status: 'ok' }
-    const token = this.profiler?.begin('codegraph.provisional-refresh', args)
-    let snapshot
-    try { snapshot = await this.resolver.applyFileChanges(changes, options) } catch (error) { args.status = 'error'; if (token) this.profiler.end(token); throw error }
-    if (token) this.profiler.end(token)
-    return this.#publishProvisional(snapshot, changes)
+    const normalized = changes.map((change) => ({ ...change, path: slash(change.path) }))
+    const needRead = normalized.filter((change) => change.type !== 'unlink' && change.source === undefined).map((change) => change.path)
+    const sources = await this.#readSources(needRead, null)
+    return this.#publishWorkerChanges(normalized.map((change) => change.type === 'unlink' ? change : { ...change, source: change.source ?? sources.get(change.path) }), options)
   }
-  #publishProvisional(snapshot, changes) {
+  #publishWorkerChanges(changes, options = {}) {
+    if (options.baseRevision !== undefined && options.baseRevision !== this.validationRevision) throw new Error(`stale base revision ${options.baseRevision}; latest is ${this.validationRevision}`)
     this.provisionalQueryView = null
     for (const change of changes) {
       const normalized = { ...change, path: slash(change.path) }
-      if (normalized.type !== 'unlink' && normalized.source === undefined) normalized.expectedDigest = this.resolver.files.get(normalized.path)?.digest
+      if (normalized.type !== 'unlink' && typeof normalized.source === 'string') normalized.expectedDigest = contentHash(`${normalized.path}\0${normalized.source}`)
       this.validationChanges.set(normalized.path, normalized)
     }
-    const validatedGeneration = this.validatedGeneration ?? (() => { try { return this.store.readGeneration().generation } catch { return null } })()
-    const validation = this.#scheduleValidation(snapshot.revision)
-    return { ...snapshot, validatedGeneration, validation }
+    const revision = ++this.validationRevision
+    const snapshot = this.provisionalSnapshot()
+    return { ...snapshot, revision, validatedGeneration: this.validatedGeneration, validation: this.#scheduleValidation(revision) }
   }
   registeredFiles() {
-    const files = new Set(this.workspace?.sources.keys() ?? Object.keys(this.store.readGeneration().partitions))
+    const files = new Set(Object.keys(this.store.readGeneration().partitions))
     for (const [file, hash] of Object.entries(controlFileHashes(this.root))) if (hash) files.add(file)
     return files
   }
   async dispose() {
     this.disposed = true
+    cancelPartitionPool(this.activePartitionPool)
     this.validationEpoch += 1
     if (this.activeValidation) this.activeValidation.resolve(null)
     if (this.pendingValidation) this.pendingValidation.resolve(null)
@@ -315,10 +364,8 @@ export class CodeGraphEngine {
     this.overlayBuilds.clear()
     for (const entry of this.validatedQueryViews.values()) for (const coverage of [EDGE_COVERAGE.CALLS, EDGE_COVERAGE.COMPLETE]) entry[coverage]?.release?.()
     this.validatedQueryViews.clear()
-    this.mmapQueryCache.dispose()
+    if (this.ownsMmapQueryCache) this.mmapQueryCache.dispose()
     this.provisionalQueryView = null
-    this.#discardWorkspace()
-    await this.parserPool.dispose()
     await this.validationWorker.dispose()
   }
   snapshot(generation) {
@@ -338,15 +385,12 @@ export class CodeGraphEngine {
     return edges
   }
   async #completeQueryView(generation, options = {}) {
+    const target = generation ?? this.validatedGeneration
+    const complete = this.#cachedValidatedQueryView(target, EDGE_COVERAGE.COMPLETE)
+    if (complete) return complete
     const baseView = this.#validatedQueryView(generation, EDGE_COVERAGE.CALLS)
     const base = baseView.mapped ? { generation: baseView.generation, edgeCoverage: baseView.edgeCoverage } : baseView.graph
     if (coverageCode(base.edgeCoverage) === EDGE_COVERAGE.COMPLETE) return baseView
-    // A mapped base carries no edges — the page is a call-coverage projection. Merging an overlay
-    // onto it needs the real base edges, so read them from the generation's partitions rather than
-    // from the stub, which is undefined here and used to throw inside mergeOrdered.
-    const baseEdges = () => baseView.mapped
-      ? this.#graphFromPartitions(baseView.manifest ?? this.store.readGeneration(base.generation), EDGE_COVERAGE.CALLS).edges
-      : base.edges
     const cached = this.#cachedValidatedQueryView(base.generation, EDGE_COVERAGE.COMPLETE)
     if (cached) return cached
     if (options.signal?.aborted) return null
@@ -362,8 +406,8 @@ export class CodeGraphEngine {
       overlay = await pending
     }
     if (options.signal?.aborted) return null
-    const merged = mergeOrdered(baseEdges(), this.#orderedOverlayEdges(base.generation, overlay))
     const full = baseView.mapped ? this.#graphFromPartitions(manifest, EDGE_COVERAGE.CALLS) : base
+    const merged = mergeOrdered(full.edges, this.#orderedOverlayEdges(base.generation, overlay))
     const graph = { ...full, edgeCoverage: coverageName(EDGE_COVERAGE.COMPLETE), edges: merged }
     return this.#rememberValidatedQueryView(base.generation, EDGE_COVERAGE.COMPLETE, this.queryViewFactory(graph, manifest), manifest)
   }
@@ -371,7 +415,7 @@ export class CodeGraphEngine {
     if (!request.generation && request.consistency === 'latest') {
       const view = this.#provisionalQueryView()
       const graph = view.graph
-      return { metadata: { revision: graph.revision, freshness: graph.freshness, coverage: graph.coverage, validatedGeneration: graph.validatedGeneration }, graph, rows: this.query(request, { ...options, queryViewPin: view }) }
+      return { metadata: { revision: null, freshness: 'validated', coverage: graph.edgeCoverage, validatedGeneration: graph.generation }, graph, rows: this.query(request, { ...options, queryViewPin: view }) }
     }
     const baseView = this.#validatedQueryView(request.generation, EDGE_COVERAGE.CALLS)
     const view = request.type === 'refs' || request.type === 'graph' ? (this.#cachedValidatedQueryView(baseView.graph.generation, EDGE_COVERAGE.COMPLETE) ?? baseView) : baseView
@@ -381,18 +425,29 @@ export class CodeGraphEngine {
   async queryBatch(request, options = {}) {
     const { signal } = options; const maxQueue = Math.max(1, options.maxQueue ?? 64)
     if (signal?.aborted) return []
+    const semanticTiming = DEBUG_POOL && request.type === 'refs' ? { cache: this.validatedQueryViews.get(request.generation ?? this.validatedGeneration)?.[EDGE_COVERAGE.COMPLETE] ? 'warm' : 'cold', completeEdgeMaterializationMs: 0, refsLookupMs: 0 } : null
     const latest = !request.generation && request.consistency === 'latest'
     let view = options.queryViewPin
     if (view && (request.type === 'refs' || request.type === 'graph') && coverageCode(view.graph.edgeCoverage) !== EDGE_COVERAGE.COMPLETE) view = null
     if (!view) {
       if (latest) view = this.#provisionalQueryView()
       else if (request.type === 'refs' || request.type === 'graph') {
+        const started = semanticTiming && performance.now()
         view = await this.#completeQueryView(request.generation, options)
+        if (semanticTiming) semanticTiming.completeEdgeMaterializationMs = performance.now() - started
       } else view = this.#validatedQueryView(request.generation, EDGE_COVERAGE.CALLS)
     }
     if (!view || signal?.aborted) return []
-    if (view.mapped) return this.#queryMapped(view, request, signal)
+    const lookupStarted = semanticTiming && performance.now()
     const graph = view.graph
+    const metadata = latest ? { revision: null, freshness: 'validated', coverage: graph.edgeCoverage, validatedGeneration: graph.generation } : null
+    if (view.mapped) {
+      const rows = this.#queryMapped(view, request, signal)
+      if (semanticTiming) { semanticTiming.refsLookupMs = performance.now() - lookupStarted; debugPool('Main Semantic Timing Summary', { operation: 'refs', ...semanticTiming }) }
+      if (!metadata) return rows
+      if (request.type === 'graph') return rows.map((row) => ({ ...metadata, files: row.files, symbols: row.symbols, edges: row.edges, unresolvedEdges: row.unresolvedEdges }))
+      return rows.map((row) => ({ ...row, ...metadata }))
+    }
     let rows
     const matches = (symbol) => (!request.name || symbol.name === request.name) && (!request.file || symbol.file === request.file || symbol.file.endsWith(request.file))
     const matchingSymbols = () => {
@@ -406,14 +461,13 @@ export class CodeGraphEngine {
     } else if (request.type === 'deps') {
       rows = matchingSymbols().flatMap((symbol) => view.outgoingByFrom.get(symbol.id) ?? [])
     } else if (request.type === 'graph') rows = [latest
-      ? { revision: graph.revision, freshness: graph.freshness, coverage: graph.coverage, validatedGeneration: graph.validatedGeneration, files: graph.files, symbols: graph.symbols, edges: graph.edges, unresolvedEdges: graph.unresolvedEdges }
+      ? { ...metadata, files: graph.files, symbols: graph.symbols, edges: graph.edges, unresolvedEdges: graph.unresolvedEdges }
       : { generation: graph.generation, edgeCoverage: graph.edgeCoverage, files: graph.files, symbols: graph.symbols, edges: graph.edges }]
     else throw new Error(`unknown query type: ${request.type}`)
     // Async generators are pull-based: there are zero prefetched rows, so the bounded queue
     // cannot exceed one row regardless of consumer speed.
     if (!Number.isInteger(maxQueue)) throw new Error('maxQueue must be an integer')
     const limit = Math.min(request.limit ?? rows.length, rows.length)
-    const metadata = latest ? { revision: graph.revision, freshness: graph.freshness, coverage: graph.coverage, validatedGeneration: graph.validatedGeneration } : null
     const resolved = request.resolved === true && (request.type === 'refs' || request.type === 'deps')
     const result = resolved ? [] : new Array(limit)
     for (let i = 0; i < limit; i++) {
@@ -427,6 +481,7 @@ export class CodeGraphEngine {
         result.push(metadata ? { ...row, ...metadata } : row)
       } else result[i] = metadata && request.type !== 'graph' ? { ...row, ...metadata } : row
     }
+    if (semanticTiming) { semanticTiming.refsLookupMs = performance.now() - lookupStarted; debugPool('Main Semantic Timing Summary', { operation: 'refs', ...semanticTiming }) }
     return signal?.aborted ? [] : result
   }
   async *query(request, options = {}) {
@@ -481,7 +536,12 @@ export class CodeGraphEngine {
     entry[coverage] = view
     this.validatedQueryViews.delete(generation)
     this.validatedQueryViews.set(generation, entry)
-    while (this.validatedQueryViews.size > 2) this.validatedQueryViews.delete(this.validatedQueryViews.keys().next().value)
+    while (this.validatedQueryViews.size > 2) {
+      const oldest = this.validatedQueryViews.keys().next().value
+      const evicted = this.validatedQueryViews.get(oldest)
+      for (const kind of [EDGE_COVERAGE.CALLS, EDGE_COVERAGE.COMPLETE]) evicted[kind]?.release?.()
+      this.validatedQueryViews.delete(oldest)
+    }
     if (publishMapped) this.mmapQueryCache.publish({ generation, coverage: coverageName(coverage), view: { graph: view.graph, manifest } })
     return view
   }
@@ -521,16 +581,7 @@ export class CodeGraphEngine {
     return view
   }
   #provisionalQueryView() {
-    if (this.provisionalQueryView?.graph.revision === this.resolver.revision) return this.provisionalQueryView
-    const graph = { ...this.provisionalSnapshot(), validatedGeneration: this.validatedGeneration }
-    this.provisionalQueryView = this.queryViewFactory(graph)
-    return this.provisionalQueryView
-  }
-  #parse(rel, sources, known, context, parsePartition) {
-    if (this.instrument) this.instrument({ phase: 'parse', file: rel })
-    const source = sources.get(rel)
-    if (this.activeProfile) this.activeProfile.args.filesParsed += 1
-    return parsePartition(rel, source, known, context, this.profiler, EDGE_COVERAGE.CALLS)
+    return this.#validatedQueryView(this.validatedGeneration, EDGE_COVERAGE.CALLS)
   }
   // A file's resolved reference edges depend on its own text and on the text of everything it can
   // reach through imports — a renamed export changes the edge's target id without touching the
@@ -568,39 +619,31 @@ export class CodeGraphEngine {
         else stale.push(rel)
       }
       if (stale.length) {
-        let fragments = null
-        let usedWorker = false
-        if (manifest.generation === this.validatedGeneration && this.validationWorkerHydrated && typeof this.validationWorker.referenceOverlay === 'function') {
-          try { fragments = await this.validationWorker.referenceOverlay({ generation: manifest.generation, sourceBlobs: manifest.sources, staleFiles: stale }); usedWorker = true }
-          catch { fragments = null }
+        if (manifest.generation !== this.validatedGeneration || !this.validationWorkerHydrated) {
+          const sources = Object.entries(manifest.sources).map(([file, id]) => [file, this.store.readSource(id)])
+          const persistedPartitions = Object.fromEntries(Object.entries(manifest.partitions).map(([file, id]) => [file, this.store.readPartition(id)]))
+          const hydrated = await this.validationWorker.hydrate({ root: this.root, generation: manifest.generation, sources, sourceBlobs: manifest.sources, partitions: persistedPartitions, internalFingerprints: internalFingerprints(this.store, manifest) })
+          this.#validateOwnedResult(hydrated, manifest.sources)
+          this.validationWorkerHydrated = true
+          this.validationBasePartitions = { generation: manifest.generation, partitions: persistedPartitions }
         }
-        if (usedWorker) {
-          if (!fragments || typeof fragments !== 'object' || fragments.generation !== manifest.generation || !fragments.files || typeof fragments.files !== 'object' || Array.isArray(fragments.files)) throw new Error('malformed semantic worker overlay result')
-          const returned = Object.keys(fragments.files).sort(); const expected = [...stale].sort()
-          if (returned.length !== expected.length || returned.some((file, index) => file !== expected[index])) throw new Error('semantic worker overlay fragment membership mismatch')
-          const partitions = this.#readPartitions(manifest); const symbols = new Map(partitions.flatMap((partition) => partition.symbols).map((symbol) => [symbol.id, symbol]))
-          for (const rel of stale) {
-            const fragment = fragments.files[rel]
-            if (!fragment || !Array.isArray(fragment.edges)) throw new Error(`malformed semantic worker overlay fragment: ${rel}`)
-            for (const edge of fragment.edges) {
-              if (!edge || Object.keys(edge).length !== 4 || !['call', 'from', 'line', 'to'].every((key) => Object.hasOwn(edge, key)) || typeof edge.from !== 'string' || typeof edge.to !== 'string' || !Number.isInteger(edge.line) || edge.line < 1 || edge.call !== false) throw new Error(`malformed semantic worker overlay edge: ${rel}`)
-              const from = symbols.get(edge.from); const to = symbols.get(edge.to)
-              if (!from || !to) throw new Error(`semantic worker overlay edge endpoint is absent: ${rel}`)
-              if (from.file !== rel) throw new Error(`semantic worker overlay edge belongs to wrong fragment: ${rel}`)
-            }
-            files[rel] = { key: keys.get(rel) ?? null, edges: fragment.edges }
+        const fragments = await this.validationWorker.referenceOverlay({ generation: manifest.generation, sourceBlobs: manifest.sources, staleFiles: stale })
+        if (!fragments || typeof fragments !== 'object' || fragments.generation !== manifest.generation || !fragments.files || typeof fragments.files !== 'object' || Array.isArray(fragments.files)) throw new Error('malformed semantic worker overlay result')
+        const returned = Object.keys(fragments.files).sort(); const expected = [...stale].sort()
+        if (returned.length !== expected.length || returned.some((file, index) => file !== expected[index])) throw new Error('semantic worker overlay fragment membership mismatch')
+        const partitions = this.#readPartitions(manifest); const symbols = new Map(partitions.flatMap((partition) => partition.symbols).map((symbol) => [symbol.id, symbol]))
+        for (const rel of stale) {
+          const fragment = fragments.files[rel]
+          if (!fragment || !Array.isArray(fragment.edges)) throw new Error(`malformed semantic worker overlay fragment: ${rel}`)
+          for (const edge of fragment.edges) {
+            if (!edge || Object.keys(edge).length !== 4 || !['call', 'from', 'line', 'to'].every((key) => Object.hasOwn(edge, key)) || typeof edge.from !== 'string' || typeof edge.to !== 'string' || !Number.isInteger(edge.line) || edge.line < 1 || edge.call !== false) throw new Error(`malformed semantic worker overlay edge: ${rel}`)
+            const from = symbols.get(edge.from); const to = symbols.get(edge.to)
+            if (!from || !to) throw new Error(`semantic worker overlay edge endpoint is absent: ${rel}`)
+            if (from.file !== rel) throw new Error(`semantic worker overlay edge belongs to wrong fragment: ${rel}`)
           }
-        } else {
-          // A cold or mismatched worker keeps the historical whole-project path.
-          const { createSemanticProject, parsePartition, prepareSemanticProject } = await loadSemanticParser()
-          const sources = new Map(Object.entries(manifest.sources).map(([file, id]) => [file, this.store.readSource(id)]))
-          const context = prepareSemanticProject(createSemanticProject(this.root, sources), this.root, this.profiler)
-          const known = new Set(sources.keys())
-          for (const rel of stale) {
-            const partition = parsePartition(rel, sources.get(rel), known, context, this.profiler, EDGE_COVERAGE.COMPLETE)
-            files[rel] = { key: keys.get(rel) ?? null, edges: partition.edges.filter((edge) => !edge.call) }
-          }
+          files[rel] = { key: keys.get(rel) ?? null, edges: fragment.edges }
         }
+        if (manifest.generation !== this.validatedGeneration) { this.validationWorkerHydrated = false; this.validationBasePartitions = null }
       }
       const overlay = { generation: manifest.generation, edgeCoverage: coverageName(EDGE_COVERAGE.COMPLETE), version: OVERLAY_VERSION, files, ordered: true, edges: Object.values(files).flatMap((entry) => entry.edges).sort(edgeOrder) }
       if (this.disposed) throw new Error('codegraph engine is disposed')
@@ -631,14 +674,44 @@ export class CodeGraphEngine {
       if (!Array.isArray(partition.symbols) || !Array.isArray(partition.edges) || !Array.isArray(partition.dependencies) || !Array.isArray(partition.unresolved)) throw new Error(`malformed semantic ownership partition: ${file}`)
     }
   }
-  async #createWorkspace(sources, generation = null) {
-    const { createSemanticProject, prepareSemanticProject } = await loadSemanticParser()
-    const context = prepareSemanticProject(createSemanticProject(this.root, sources), this.root, this.profiler)
-    return { project: context.project, host: context.project.__codegraphHost, context, sources: new Map(sources), generation }
+  #validateOwnedPartition(file, partition, sourceBlobs) {
+    if (!sourceBlobs[file]) throw new Error(`semantic ownership returned unknown partition: ${file}`)
+    if (!partition || partition.file !== file || partition.sourceHash !== sourceBlobs[file]) throw new Error(`semantic ownership partition file/source mismatch: ${file}`)
+    if (!Array.isArray(partition.symbols) || !Array.isArray(partition.edges) || !Array.isArray(partition.dependencies) || !Array.isArray(partition.unresolved)) throw new Error(`malformed semantic ownership partition: ${file}`)
   }
-  #discardWorkspace() {
-    if (!this.workspace) return
-    this.workspace = null
+  #validateOwnedIdentity(file, partition, sourceBlobs) {
+    if (partition.file !== file || sourceBlobs[file] && partition.sourceHash !== sourceBlobs[file]) throw new Error(`semantic ownership partition file/source mismatch: ${file}`)
+  }
+  #validateOwnedReceipts(result, sourceBlobs, expectedFiles, engineReceipts) {
+    if (!result || result.mode !== 'full' || !result.sourceBlobs || !Array.isArray(result.partitionReceipts)) throw new Error('malformed semantic ownership receipt result')
+    const files = expectedFiles.slice().sort()
+    const returned = Object.keys(result.sourceBlobs).sort()
+    if (returned.length !== files.length || returned.some((file, index) => file !== files[index] || result.sourceBlobs[file] !== sourceBlobs[file])) throw new Error('semantic ownership source membership mismatch')
+    if (result.partitionReceipts.length !== files.length) throw new Error('semantic ownership partition receipt membership mismatch')
+    const receipts = new Map()
+    for (let index = 0; index < result.partitionReceipts.length; index += 1) {
+      const receipt = result.partitionReceipts[index]
+      const file = files[index]
+      const workerOwned = receipt?.writer === 'worker'
+      const validLengths = Number.isInteger(receipt?.symbolLength) && receipt.symbolLength > 0 && Number.isInteger(receipt?.internalLength) && receipt.internalLength > 0 && (workerOwned ? receipt.symbolChunkCount === 0 && receipt.internalChunkCount === 0 && receipt.chunkCount === 0 : receipt.symbolChunkCount === 1 && receipt.internalChunkCount === 0 && receipt.chunkCount === 1) && receipt.serializedLength === receipt.symbolLength + receipt.internalLength
+      if (!receipt || receipt.file !== file || receipt.sourceHash !== sourceBlobs[file] || !validLengths || !['engine', 'worker'].includes(receipt.writer) || receipts.has(file)) throw new Error(`semantic ownership partition receipt mismatch: ${file}`)
+      const durable = workerOwned ? receipt : engineReceipts.get(file)
+      if (!durable || !/^[a-f0-9]{64}$/.test(durable.partitionId) || !/^[a-f0-9]{64}$/.test(durable.internalPartitionId) || typeof durable.internalFingerprint !== 'string') throw new Error(`semantic ownership partition receipt is not durable: ${file}`)
+      if (durable.serializedLength !== receipt.serializedLength || durable.chunkCount !== receipt.chunkCount || durable.symbolLength !== receipt.symbolLength || durable.internalLength !== receipt.internalLength) throw new Error(`semantic ownership partition receipt length mismatch: ${file}`)
+      if (durable.internalFingerprint !== receipt.internalFingerprint) throw new Error(`semantic ownership internal fingerprint mismatch: ${file}`)
+      if (workerOwned) {
+        const symbolBytes = fs.readFileSync(path.join(this.store.partitions, `${durable.partitionId}.bin`))
+        const internalBytes = fs.readFileSync(path.join(this.store.internalPartitions, `${durable.internalPartitionId}.bin`))
+        if (contentHash(symbolBytes) !== durable.partitionId || contentHash(internalBytes) !== durable.internalPartitionId || symbolBytes.byteLength !== receipt.symbolLength || internalBytes.byteLength !== receipt.internalLength) throw new Error(`semantic ownership partition receipt durable content mismatch: ${file}`)
+        const partition = decodeSymbolPartition(symbolBytes)
+        this.#validateOwnedPartition(file, partition, sourceBlobs)
+        const internal = decodeInternalPartition(internalBytes, { compilerFingerprint: receipt.internalFingerprint })
+        if (internal.owners.some((owner) => owner.file !== file)) throw new Error(`semantic ownership internal partition file mismatch: ${file}`)
+      } else if (!fs.existsSync(path.join(this.store.partitions, `${durable.partitionId}.bin`)) || !fs.existsSync(path.join(this.store.internalPartitions, `${durable.internalPartitionId}.bin`))) throw new Error(`semantic ownership partition receipt is missing durable content: ${file}`)
+      receipts.set(file, durable)
+    }
+    for (const receipt of result.partitionReceipts) if (engineReceipts.has(receipt.file) && receipt.writer !== 'engine') throw new Error('semantic ownership engine partition membership mismatch')
+    return receipts
   }
   #enqueueOperation(operation) {
     if (this.disposed) return Promise.reject(new Error('codegraph engine is disposed'))
@@ -663,22 +736,68 @@ export class CodeGraphEngine {
     this.#runValidation(request)
   }
   async #runValidation(request) {
+    let validationPool = null
     try {
       const changes = [...this.validationChanges.values()]
       const changedFiles = changes.map((change) => change.path)
+      const expectedSourceBlobs = { ...this.validatedSourceBlobs }
+      for (const change of changes) change.type === 'unlink' || change.source === undefined ? delete expectedSourceBlobs[change.path] : expectedSourceBlobs[change.path] = contentHash(change.source)
       const base = this.store.readGeneration(this.validatedGeneration)
-      const payload = { revision: request.revision, root: this.root, changedFiles, changes, baseGeneration: base.generation, baseSourceBlobs: this.validatedSourceBlobs, ...(!this.validationWorkerHydrated ? { basePartitionIds: base.partitions, partitionDir: this.store.partitions } : {}), sourceDir: this.store.sources }
+      validationPool = createPartitionPool()
+      this.activePartitionPool = validationPool
+      const payload = { revision: request.revision, root: this.root, cacheDir: path.relative(this.root, this.store.dir), changedFiles, changes, baseGeneration: base.generation, baseSourceBlobs: this.validatedSourceBlobs, ...(!this.validationWorkerHydrated ? { basePartitionIds: base.partitions, baseInternalFingerprints: internalFingerprints(this.store, base), partitionDir: this.store.partitions } : {}), sourceDir: this.store.sources, partitionPool: validationPool.buffer, ...(validationPool.debugId ? { partitionPoolDebugId: validationPool.debugId } : {}) }
       this.validationPayloadObserver?.(payload)
-      const result = await this.validationWorker.validate(payload)
-      request.resolve(await this.#acceptValidation(result, request.epoch, base, changedFiles))
+      const partitions = new Map(); const transported = new Map()
+      let persistenceMs = 0
+      const onProgress = ({ partitions: completed, poolBatch }) => {
+        if (poolBatch) { debugPool('Main Receive Batch', poolBatch); debugPool('Main Start Batch', poolBatch) }
+        for (const job of completed) {
+          const persistenceStarted = performance.now()
+          const { file, offset, symbolLength, internalLength } = job
+          this.#validateOwnedIdentity(file, readSymbolPartitionIdentity(validationPool.payload, offset, symbolLength), expectedSourceBlobs)
+          const partitionId = this.store.writePackedPartitionRange(validationPool.payload, offset, symbolLength, file, this.profiler)
+          const internalPartitionId = internalLength ? this.store.writeInternalPartitionRange(validationPool.payload, offset + symbolLength, internalLength) : null
+          transported.set(file, { partitionId, internalPartitionId })
+          completePartitionJob(validationPool)
+          persistenceMs += performance.now() - persistenceStarted
+        }
+        if (poolBatch) debugPool('Main Complete Batch', poolBatch)
+      }
+      const result = await this.validationWorker.validate(payload, onProgress)
+      if (result?.poolDiagnostics) {
+        const { parseMs: workerParseMs, ...diagnostics } = result.poolDiagnostics
+        debugPool('Main Shared Memory Summary', { mode: result.mode, ...diagnostics, workerParseMs, persistenceMs })
+        delete result.poolDiagnostics
+      }
+      if (!result || !['full', 'delta'].includes(result.mode)) throw new Error(`unknown semantic validation mode: ${result?.mode}`)
+      if (!result.baseGeneration || result.baseGeneration !== base.generation || result.baseGeneration !== this.validatedGeneration) throw new Error('semantic validation base generation mismatch')
+      if (!Array.isArray(result.partitionReceipts)) throw new Error('semantic validation returned incomplete partition results')
+      for (const receipt of result.partitionReceipts) {
+        const durable = receipt.writer === 'worker' ? receipt : transported.get(receipt.file)
+        if (!durable) throw new Error(`semantic validation partition receipt mismatch: ${receipt.file}`)
+        const partition = this.store.readPartition(durable.partitionId)
+        partition.internalFingerprint = receipt.internalFingerprint
+        partitions.set(receipt.file, partition)
+        transported.set(receipt.file, { partitionId: durable.partitionId, internalPartitionId: durable.internalPartitionId })
+      }
+      if (result.partitionReceipts.length !== partitions.size) throw new Error('semantic validation returned incomplete partition results')
+      for (const receipt of result.partitionReceipts) {
+        const partition = partitions.get(receipt.file)
+        if (!partition || !['engine', 'worker'].includes(receipt.writer) || receipt.sourceHash !== result.sourceBlobs?.[receipt.file] || receipt.internalFingerprint !== partition.internalFingerprint) throw new Error(`semantic validation partition receipt mismatch: ${receipt.file}`)
+      }
+      result.partitions = Object.fromEntries(partitions)
+      request.resolve(await this.#acceptValidation(result, request.epoch, base, changedFiles, transported))
     } catch (error) {
       if (!this.disposed) {
+        this.validationWorkerHydrated = false
+        this.validationBasePartitions = null
         const failure = this.profiler?.begin('codegraph.background-validation', { revision: request.revision, freshness: 'validated', coverage: coverageName(EDGE_COVERAGE.CALLS), status: 'error', error: error.message })
         if (failure) this.profiler.end(failure)
         try { await this.profiler?.write() } catch {}
         request.reject(error)
       }
     } finally {
+      if (this.activePartitionPool === validationPool) this.activePartitionPool = null
       if (this.activeValidation !== request) return
       this.activeValidation = null
       const pending = this.pendingValidation
@@ -686,9 +805,9 @@ export class CodeGraphEngine {
       if (pending) this.#startValidation(pending)
     }
   }
-  async #acceptValidation(result, epoch = this.validationEpoch, base = this.store.readGeneration(this.validatedGeneration), changedFiles = []) {
+  async #acceptValidation(result, epoch = this.validationEpoch, base = this.store.readGeneration(this.validatedGeneration), changedFiles = [], transported = null) {
     const revision = result.revision
-    if (epoch !== this.validationEpoch || revision !== this.resolver.revision || this.disposed) { this.validationWorkerHydrated = false; this.validationBasePartitions = null; return null }
+    if (epoch !== this.validationEpoch || revision !== this.validationRevision || this.disposed) { this.validationWorkerHydrated = false; this.validationBasePartitions = null; return null }
     const args = { revision, freshness: 'validated', coverage: coverageName(EDGE_COVERAGE.CALLS), status: 'ok' }
     const token = this.profiler?.begin('codegraph.background-validation', args)
     try {
@@ -701,21 +820,17 @@ export class CodeGraphEngine {
       for (const change of this.validationChanges.values()) change.type === 'unlink' ? expectedFiles.delete(change.path) : expectedFiles.add(change.path)
       const sourceFiles = Object.keys(productionBlobs).sort()
       if (sourceFiles.length !== expectedFiles.size || sourceFiles.some((file) => !expectedFiles.has(file))) throw new Error('semantic validation returned incomplete source membership')
-      const sources = productionBlobs ? null : new Map(result.sources ?? this.resolver.sourceEntries())
-      const snapshot = result.partitions ? null : (result.files ? result : this.resolver.snapshot())
-      const partitionsByFile = result.partitions ?? Object.fromEntries(snapshot.files.map((file) => [file, {
-        file,
-        sourceHash: contentHash(sources.get(file) ?? ''),
-        symbols: snapshot.symbols.filter((symbol) => symbol.file === file).map(({ start, end, bodyStart, parent, ...symbol }) => symbol),
-        edges: snapshot.edges.filter((edge) => edge.fromFile === file).map(({ fromFile, fromName, toFile, toName, toLine, ...edge }) => edge),
-        dependencies: [], unresolved: [],
-      }]))
+      if (!result.partitions) throw new Error('semantic validation omitted shared partition results')
+      const partitionsByFile = result.partitions
       const validatedFiles = Object.keys(partitionsByFile).sort()
       if (result.mode === 'full' && (validatedFiles.length !== sourceFiles.length || validatedFiles.some((file, index) => file !== sourceFiles[index]))) throw new Error('full semantic validation returned incomplete partition membership')
       if (result.mode === 'delta' && (validatedFiles.length === 0 || changedFiles.some((file) => !validatedFiles.includes(file)))) throw new Error('delta semantic validation omitted a changed partition')
+      let basePartitions = null
       if (result.mode === 'delta') {
-        const basePartitions = this.validationBasePartitions?.generation === base.generation
+        basePartitions = this.validationBasePartitions?.generation === base.generation
           ? this.validationBasePartitions.partitions
+          : this.partitionCache?.generation === base.generation
+            ? Object.fromEntries(this.partitionCache.partitions.map((partition) => [partition.file, partition]))
           : Object.fromEntries(Object.entries(base.partitions).map(([file, id]) => [file, this.store.readPartition(id)]))
         if (unresolvedCandidateMatches(basePartitions, changedFiles)) throw new Error('delta semantic validation is unsafe with an unresolved candidate matching a changed path')
         const requiredFiles = [...reverseClosure(basePartitions, changedFiles)].sort()
@@ -728,29 +843,47 @@ export class CodeGraphEngine {
         if (change.expectedDigest !== undefined && contentHash(`${change.path}\0${source}`) !== change.expectedDigest) throw new Error(`semantic validation provisional source mismatch: ${change.path}`)
       }
       const partitionIds = { ...base.partitions }
+      const internalPartitionIds = { ...(base.internalPartitions ?? {}) }
       for (const [file, partition] of Object.entries(partitionsByFile)) {
         if (!expectedFiles.has(file)) throw new Error(`semantic validation returned unknown partition: ${file}`)
         if (!partition || partition.file !== file) throw new Error(`semantic validation partition key/file mismatch: ${file}`)
         if (contentHash(this.store.readSource(productionBlobs[file])) !== partition.sourceHash) throw new Error(`semantic validation partition source mismatch: ${file}`)
-        partitionIds[file] = this.store.writePartition(partition, this.profiler)
+        const bytes = transported?.get(file)
+        const { internalPartition, internalFingerprint, ...symbolPartition } = partition
+        const persisted = bytes?.partitionId
+          ? { partition: bytes.partitionId, internal: bytes.internalPartitionId, internalFingerprint }
+          : bytes
+          ? { partition: this.store.writePartitionBytes(bytes.symbol, this.profiler, symbolPartition), internal: bytes.internal ? this.store.writeInternalPartition(bytes.internal) : null, internalFingerprint }
+          : persistPartition(this.store, partition, this.profiler)
+        partitionIds[file] = persisted.partition
+        if (persisted.internal) internalPartitionIds[file] = persisted.internal
+        else {
+          if (productionBlobs[file] !== base.sources[file]) throw new Error(`semantic validation omitted changed internal partition: ${file}`)
+          const existing = base.internalPartitions?.[file]
+          if (!existing) throw new Error(`semantic validation cannot reuse missing internal partition: ${file}`)
+          openInternalPartition(this.store.readInternalPartition(existing), { compilerFingerprint: persisted.internalFingerprint })
+          internalPartitionIds[file] = existing
+        }
       }
-      for (const file of Object.keys(partitionIds)) if (!expectedFiles.has(file)) delete partitionIds[file]
+      for (const file of Object.keys(partitionIds)) if (!expectedFiles.has(file)) { delete partitionIds[file]; delete internalPartitionIds[file] }
       if (Object.keys(partitionIds).length !== sourceFiles.length) throw new Error('semantic validation would publish incomplete partitions')
-      if (epoch !== this.validationEpoch || revision !== this.resolver.revision || this.disposed) return null
+      if (epoch !== this.validationEpoch || revision !== this.validationRevision || this.disposed) return null
       if (this.store.readGeneration().generation !== base.generation) throw new Error('semantic validation base generation advanced before publication')
-      const sourceIds = productionBlobs ?? Object.fromEntries([...sources].map(([file, source]) => [file, this.store.writeSource(source)]))
-      const generation = this.store.publish({ version: 3, root: this.root, edgeCoverage: coverageName(EDGE_COVERAGE.CALLS), controlHashes: controlFileHashes(this.root), sources: sourceIds, partitions: partitionIds, partitionHashes: partitionIds })
+      const sourceIds = productionBlobs
+      const generation = this.store.publish({ version: 3, root: this.root, edgeCoverage: coverageName(EDGE_COVERAGE.CALLS), controlHashes: controlFileHashes(this.root), sources: sourceIds, partitions: partitionIds, internalPartitions: internalPartitionIds, partitionHashes: partitionIds })
       this.validatedGeneration = generation.generation
+      this.publishedValidationRevision = revision
       this.validatedSourceBlobs = sourceIds
       this.validationWorkerHydrated = true
       const cachedPartitions = result.mode === 'full' ? {} : this.validationBasePartitions?.generation === base.generation
         ? { ...this.validationBasePartitions.partitions }
-        : Object.fromEntries(Object.entries(base.partitions).map(([file, id]) => [file, this.store.readPartition(id)]))
+        : { ...basePartitions }
       Object.assign(cachedPartitions, partitionsByFile)
       for (const file of Object.keys(cachedPartitions)) if (!expectedFiles.has(file)) delete cachedPartitions[file]
       this.validationBasePartitions = { generation: generation.generation, partitions: cachedPartitions }
+      this.partitionCache = { generation: generation.generation, partitions: Object.values(cachedPartitions).sort((left, right) => left.file.localeCompare(right.file)) }
       this.validationChanges.clear()
-      return { ...generation, validationMode: result.mode, validatedFiles }
+      return { ...generation, validationMode: result.mode, validatedFiles, internalBuildCount: result.internalBuildCount ?? validatedFiles.length, internalRebuiltFiles: result.internalRebuiltFiles ?? validatedFiles, internalReusedFiles: result.internalReusedFiles ?? [] }
     } catch (error) { this.validationWorkerHydrated = false; this.validationBasePartitions = null; args.status = 'error'; args.error = error.message; throw error } finally { if (token) this.profiler.end(token); try { await this.profiler?.write() } catch {} }
   }
   async #readSources(files, profile) {

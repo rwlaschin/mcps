@@ -1,0 +1,33 @@
+{
+  "manifest": {
+    "version": 3,
+    "root": "<root>",
+    "edgeCoverage": "calls",
+    "controlHashes": {
+      ".codegraphignore": null,
+      ".gitignore": null,
+      "jsconfig.json": null,
+      "tsconfig.json": "1a22b637accf1f26f81e94ab1258c0db7170540528901798e2fd3092e1316c02"
+    },
+    "sources": {
+      "src/consumer.js": "c5e915d0fb921a3d7bd814f8d3177644d74739bf813158718a4987fefb0ef56b",
+      "src/value.ts": "2a9e716674599fe9c4ea3cd995dfd5f129e256308e13ca7c551e17b61e01bec0"
+    },
+    "partitions": {
+      "src/consumer.js": "849ee047909a4557a845b2e97d556a37a0b8e6d91326035c0ff3504da2502bf5",
+      "src/value.ts": "b047deb7df477a1f30935838c8a190ef37384e76b1f49b473e1f6a921d1b4cb9"
+    },
+    "partitionHashes": {
+      "src/consumer.js": "849ee047909a4557a845b2e97d556a37a0b8e6d91326035c0ff3504da2502bf5",
+      "src/value.ts": "b047deb7df477a1f30935838c8a190ef37384e76b1f49b473e1f6a921d1b4cb9"
+    }
+  },
+  "partitionBase64": {
+    "src/consumer.js": "eyJmaWxlIjoic3JjL2NvbnN1bWVyLmpzIiwic291cmNlSGFzaCI6ImM1ZTkxNWQwZmI5MjFhM2Q3YmQ4MTRmOGQzMTc3NjQ0ZDc0NzM5YmY4MTMxNTg3MThhNDk4N2ZlZmIwZWY1NmIiLCJzeW1ib2xzIjpbeyJpZCI6IjgwYTkwYjFhZmEzNjQ2ZjVhMWVmZjEwNCIsImZpbGUiOiJzcmMvY29uc3VtZXIuanMiLCJuYW1lIjoiYW5zd2VyIiwia2luZCI6ImZ1bmN0aW9uIiwibGluZSI6MywicXVhbGlmaWVkUGF0aCI6Ijxtb2R1bGU+Iiwic2lnbmF0dXJlIjoiPD4oKToiLCJvcmRpbmFsIjowLCJleHBvcnRlZCI6dHJ1ZX1dLCJlZGdlcyI6W3siZnJvbSI6IjgwYTkwYjFhZmEzNjQ2ZjVhMWVmZjEwNCIsInRvIjoiODRlZGYyMWFlZWY1YzY2M2NjZWQ1ZTEzIiwibGluZSI6NCwiY2FsbCI6dHJ1ZX1dLCJkZXBlbmRlbmNpZXMiOlsic3JjL3ZhbHVlLnRzIl0sInVucmVzb2x2ZWQiOltdfQ==",
+    "src/value.ts": "eyJmaWxlIjoic3JjL3ZhbHVlLnRzIiwic291cmNlSGFzaCI6IjJhOWU3MTY2NzQ1OTlmZTljNGVhM2NkOTk1ZGZkNWYxMjllMjU2MzA4ZTEzY2E3YzU1MWUxN2I2MWUwMWJlYzAiLCJzeW1ib2xzIjpbeyJpZCI6Ijg0ZWRmMjFhZWVmNWM2NjNjY2VkNWUxMyIsImZpbGUiOiJzcmMvdmFsdWUudHMiLCJuYW1lIjoiaW5jcmVtZW50Iiwia2luZCI6ImZ1bmN0aW9uIiwibGluZSI6MywicXVhbGlmaWVkUGF0aCI6Ijxtb2R1bGU+Iiwic2lnbmF0dXJlIjoiPD4oaW5wdXQ6bnVtYmVyKTpudW1iZXIiLCJvcmRpbmFsIjowLCJleHBvcnRlZCI6dHJ1ZX0seyJpZCI6ImEwMGE0NzRjNDBlYjY4N2UzODJhZWZmYyIsImZpbGUiOiJzcmMvdmFsdWUudHMiLCJuYW1lIjoidmFsdWUiLCJraW5kIjoidmFyaWFibGUiLCJsaW5lIjoxLCJxdWFsaWZpZWRQYXRoIjoiPG1vZHVsZT4iLCJzaWduYXR1cmUiOiI8PigpOiIsIm9yZGluYWwiOjAsImV4cG9ydGVkIjp0cnVlfV0sImVkZ2VzIjpbXSwiZGVwZW5kZW5jaWVzIjpbXSwidW5yZXNvbHZlZCI6W119"
+  },
+  "mcpReceipts": {
+    "refs": "src/consumer.js:3 -> src/value.ts:1",
+    "deps": "src/consumer.js:3 -> src/value.ts:3 call"
+  }
+}

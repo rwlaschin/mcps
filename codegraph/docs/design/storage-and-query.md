@@ -1,5 +1,5 @@
 ---
-modified: 2026-08-31
+modified: 2026-09-12
 dependencies:
   - parsing-and-resolution.md
   - mcp-and-cli.md
@@ -53,6 +53,8 @@ The fallback is what makes the fast path safe to be strict. `DaemonQueryEngine.#
 
 Validated incremental publication reuses the pinned generation's unchanged partition ids. The main thread independently computes the required reverse dependency closure, accepts a delta only when its partition keys match that closure exactly, verifies every returned partition and source blob against the pinned base, then publishes a complete manifest assembled from the sparse replacements plus unchanged ids. Any stale base, malformed result, failed write, or failed publication invalidates worker hydration so the next attempt rehydrates instead of trusting partial state.
 
+Validated generations publish content-addressed binary internal partitions beside their symbol partitions. The same atomic manifest publication binds control flow and complexity data to the matching symbol generation.
+
 ## Architecture
 
 ```
@@ -87,6 +89,7 @@ Process topology: one daemon per canonical root, spawned detached and `unref`'d 
 - `constructor(root, cacheDir = '.codegraph')` — derives the four subdirectory paths. Touches no disk.
 - `initialize()` — `mkdirSync(recursive)` for all four subdirectories. Called defensively at the top of most write/read methods.
 - `writePartition(partition, profiler = null)` — stringifies, SHA-256s the serialized bytes for the id, writes `partitions/<id>.json` only if missing, returns the id. Emits `partition-hash` and `partition-write` profiler spans, the latter carrying `cacheWrite: 0|1`.
+- `writeInternalPartition(bytes)` / `readInternalPartition(id)` — persist and read binary internal partitions by content hash.
 - `readPartition(id)` — `JSON.parse` of `partitions/<id>.json`.
 - `writeSource(source)` / `readSource(id)` — same content-addressed pattern under `sources/`, no `.json` extension.
 - `readOverlay(generation)` — returns the parsed overlay, or `null` on `ENOENT`, rethrowing every other error.
@@ -251,19 +254,23 @@ Sort order: string-keyed indexes by `key.localeCompare` with the original array 
 
 **Graph shape** (`MappedQueryView.graph`): `{generation, edgeCoverage, files: string[], symbols: Symbol[], edges: Edge[]}`, where `files` is the deduplicated sorted set of symbol file paths.
 
+**Generation internals:** `internalPartitions` maps each source file to the binary internal-partition id published with that generation.
+
 ## Use Cases
 
-### UC-1 — Answer a symbol query from the memory-mapped view
+### 1. Answer a symbol query from the memory-mapped view
 
-**Goal.** A caller resolves a symbol lookup against the current generation without loading or parsing the graph.
+**Goal:** A caller resolves a symbol lookup against the current generation without loading or parsing the graph.
 
-**Stakeholders.** The agent or developer waiting on the answer; whoever owns query latency.
+**Stakeholders:** The agent or developer waiting on the answer; whoever owns query latency.
 
-**Actors.** An MCP tool or CLI invocation acting through `streamQuery`/`QueryDaemonClient`; the `QueryDaemon`; the `DaemonQueryEngine`; the `MmapQueryCache`.
+**Actors:** An MCP tool or CLI invocation acting through `streamQuery`/`QueryDaemonClient`; the `QueryDaemon`; the `DaemonQueryEngine`; the `MmapQueryCache`.
 
-**Preconditions.** `<root>/.codegraph/CURRENT` exists and names a generation. `query-view-cache.bin` holds a page for that generation with matching coverage, whose CRC and `VERSION` validate. The native mmap adapter loaded. A daemon for the canonical root is running, or can be started.
+**Preconditions:** `<root>/.codegraph/CURRENT` exists and names a generation. `query-view-cache.bin` holds a page for that generation with matching coverage, whose CRC and `VERSION` validate. The native mmap adapter loaded. A daemon for the canonical root is running, or can be started.
 
-**Basic Course of Events.**
+**Postconditions:** The caller holds the matching rows. No lease is outstanding. The cache file is unmodified.
+
+**Basic Course of Events:**
 1. The caller calls `streamQuery(root, {type: 'symbols', name})`, which calls `connectQueryDaemon(root)`.
 2. `QueryDaemonClient.connect()` connects to `daemonSocketPath(root)`.
 3. `client.query` delegates to `queryBatch`, which writes one line: `{op: 'queryBatch', id, query, maxQueue}`.
@@ -277,13 +284,13 @@ Sort order: string-keyed indexes by `key.localeCompare` with the original array 
 11. The client's line handler calls `pending.setRows` then `pending.finish`, resolving `queryBatch`; `query` yields each row.
 12. `streamQuery`'s `finally` closes the client.
 
-**Alternate Flows.**
+**Alternate Flows:**
 - *No live daemon.* `client.connect()` rejects; `connectQueryDaemon` catches and calls `connectAfterStart`, which spawns a detached daemon (deduplicated per socket path), polls until it accepts a connection, then connects. The postcondition is unchanged.
 - *Coverage miss on a `symbols` query.* `acquire` on `calls` returns `null`; `pinQuery` immediately retries with coverage `complete` (`daemon-query-engine.mjs:50`) and proceeds from step 8.
 - *Id-selected query.* With `request.id`, `matchingSymbols` uses the footer-located id index instead of the name/file indexes and post-filters on name/file.
 - *Streaming op.* A caller sending `op: 'query'` gets one `{id, row}` line per row plus a terminal `{id, done}`, with backpressure handled by `await once(socket, 'drain')`.
 
-**Exceptions.**
+**Exceptions:**
 - *`CURRENT` missing or unreadable.* `#currentGeneration()` returns `null`; `pinQuery` routes to `#pinFallback` (see UC-2).
 - *Page invalid, absent, or leased-out generation mismatch.* `acquire` returns `null` (or throws and is swallowed by the `try {}` at `:49-51`); `#pinFallback` answers instead.
 - *Unknown `type`.* `#queryMapped` throws `unknown query type: <type>`; `#run` catches it and writes `{id, error, done: true}`; the client rejects `queryBatch` with that message.
@@ -291,19 +298,19 @@ Sort order: string-keyed indexes by `key.localeCompare` with the original array 
 - *Connection dies mid-request.* The daemon's socket-close handler aborts the request's controller; the client's close handler fails every pending record bound to that socket with `CodeGraph daemon connection closed`. `queryBatch` retries once when `startDaemon` is available and the message matches `/connection|EPIPE|ECONN/`.
 - *Caller aborts.* The client writes `{op: 'cancel', id}`; the daemon aborts the matching controller; `#queryMapped`/`queryBatch` return `[]` at their next signal check.
 
-**Postconditions.** The caller holds the matching rows. No lease is outstanding. The cache file is unmodified.
+### 2. Answer a query when the mapped view cannot serve it
 
-### UC-2 — Answer a query when the mapped view cannot serve it
+**Goal:** A caller gets a correct answer even though the memory-mapped fast path is unavailable, stale, or deliberately bypassed.
 
-**Goal.** A caller gets a correct answer even though the memory-mapped fast path is unavailable, stale, or deliberately bypassed.
+**Stakeholders:** Anyone depending on query correctness across an index rebuild, a non-macOS host, or a failed native build.
 
-**Stakeholders.** Anyone depending on query correctness across an index rebuild, a non-macOS host, or a failed native build.
+**Actors:** The `DaemonQueryEngine`; the lazily-constructed `CodeGraphEngine` fallback.
 
-**Actors.** The `DaemonQueryEngine`; the lazily-constructed `CodeGraphEngine` fallback.
+**Preconditions:** A `DaemonQueryEngine` exists and is not disposed. `options.engineFactory` (default: `import('./tool-engine.mjs')`) can produce a working engine.
 
-**Preconditions.** A `DaemonQueryEngine` exists and is not disposed. `options.engineFactory` (default: `import('./tool-engine.mjs')`) can produce a working engine.
+**Postconditions:** The caller holds a correct answer. `this.fallback` is populated, so the mapped path stays available for later requests while the fallback engine remains resident until `dispose()`.
 
-**Basic Course of Events.**
+**Basic Course of Events:**
 1. `pinQuery` is entered with a request whose `consistency` is `'latest'`, or whose generation cannot be resolved, or for which `cache.acquire` yields no lease.
 2. `pinQuery` calls `#pinFallback(request, options)`.
 3. `#fallback()` memoizes `engineFactory()` so the heavyweight engine is built at most once per `DaemonQueryEngine`.
@@ -312,30 +319,30 @@ Sort order: string-keyed indexes by `key.localeCompare` with the original array 
 6. Otherwise `engine.queryBatch(request, options)` is wrapped as `{metadata: {}, graph: null, rows}`.
 7. The rows travel back out through `queryBatch`/`query` and the daemon exactly as in UC-1.
 
-**Alternate Flows.**
+**Alternate Flows:**
 - *Native bridge absent.* `nativeMmapAdapter` is `null` (non-macOS, or the optional build failed), so `MmapQueryCache`'s constructor returns early with `mapping === null` and every `acquire` returns `null` — the fallback becomes the only path, permanently, with no error surfaced.
 - *Cache file present but from another root or another `VERSION`.* `#readHeader` rejects on the root fingerprint or version check and `acquire` returns `null`; behaviour is identical to no cache at all.
 - *Explicit freshness request.* `consistency: 'latest'` reaches `#pinFallback` at step 1 without any cache access.
 
-**Exceptions.**
+**Exceptions:**
 - *Engine disposed.* `pinQuery` throws `daemon query engine is disposed` before any work.
 - *Signal already aborted.* `pinQuery` returns `{metadata: {}, graph: null, rows: []}` without touching the cache or the fallback.
 - *`engineFactory` rejects.* The rejection propagates out of `pinQuery` to `#run`, which writes `{id, error, done: true}`. The memoized `this.fallback` retains the rejected promise, so subsequent fallback queries fail the same way until the engine is recreated; `dispose()` guards against it with `.catch(() => null)`.
 - *No generation exists at all.* The fallback's own read path raises (`GraphStore.readGeneration` throws `no codegraph generation; run build`), which reaches the client as that error message.
 
-**Postconditions.** The caller holds a correct answer. `this.fallback` is populated, so the mapped path stays available for later requests while the fallback engine remains resident until `dispose()`.
+### 3. Publish a new generation and its memory-mapped query page
 
-### UC-3 — Publish a new generation and its memory-mapped query page
+**Goal:** The indexer makes a freshly built graph queryable without interrupting in-flight readers.
 
-**Goal.** The indexer makes a freshly built graph queryable without interrupting in-flight readers.
+**Stakeholders:** Readers mid-query (must not see a torn or mixed page); the next reader (must get the new generation).
 
-**Stakeholders.** Readers mid-query (must not see a torn or mixed page); the next reader (must get the new generation).
+**Actors:** The indexer/resolver ([parsing-and-resolution.md](parsing-and-resolution.md)) as `GraphStore` caller; `GraphStore`; `MmapQueryCache`; the `mmap_bridge` native module.
 
-**Actors.** The indexer/resolver ([parsing-and-resolution.md](parsing-and-resolution.md)) as `GraphStore` caller; `GraphStore`; `MmapQueryCache`; the `mmap_bridge` native module.
+**Preconditions:** `<root>/.codegraph` is writable. The graph view to encode is in hand. For the cache write, the mapping is live and `capacity >= HEADER_BYTES + SCRATCH_BYTES + 2`.
 
-**Preconditions.** `<root>/.codegraph` is writable. The graph view to encode is in hand. For the cache write, the mapping is live and `capacity >= HEADER_BYTES + SCRATCH_BYTES + 2`.
+**Postconditions:** `generations/<generation>.json` exists and `CURRENT` names it. On a `true` return, the cache header's active page holds the new generation with a valid CRC and an incremented serial, and the previously active page is intact as the other buffer.
 
-**Basic Course of Events.**
+**Basic Course of Events:**
 1. The caller writes each partition via `writePartition`, which content-addresses it and skips the write when `partitions/<id>.json` already exists.
 2. The caller calls `store.publish(manifest)`.
 3. `publish` mints `<base36 time>-<digest12>-<random12>`, stamps `createdAt`, and atomically writes `generations/<generation>.json`.
@@ -352,12 +359,12 @@ Sort order: string-keyed indexes by `key.localeCompare` with the original array 
 14. `#writeHeader` writes the 256-byte header with its trailing CRC, and `adapter.flush` `msync`s it.
 15. `publish` returns `true`. The next `acquire` for that `(generation, coverage)` succeeds.
 
-**Alternate Flows.**
+**Alternate Flows:**
 - *Virgin file.* `#readHeader` returns `null`, `#emptyHeader()` is used, page 0 is the target, and `serial` becomes 1.
 - *Short mapping at open.* The constructor unmaps, `resize`s the file to capacity, and remaps once before any publish happens.
 - *Both `refs`/`graph` and call-only coverage wanted.* Separate `publish` calls with different `coverage` strings occupy the two pages; `acquire` matches on coverage, and a `symbols` request accepts either via the `complete` retry.
 
-**Exceptions.**
+**Exceptions:**
 - *Target page leased.* Step 8 returns `false`; nothing is written. Retrying after the reader releases succeeds.
 - *Payload too large for the page.* Step 9 returns `false`; the existing page remains valid and active.
 - *Abort signal fires.* Checked before encoding (`:209`), after encoding (`:215`), and after the page flush (`:222`); an abort returns `false` before `active` is flipped, so the old page stays authoritative.
@@ -365,19 +372,19 @@ Sort order: string-keyed indexes by `key.localeCompare` with the original array 
 - *Any thrown error inside `publish`.* Caught and turned into `false` (`:227`); no exception escapes into the indexer.
 - *`overlay.generation` mismatch on `writeOverlay`.* Throws `overlay generation mismatch` before writing.
 
-**Postconditions.** `generations/<generation>.json` exists and `CURRENT` names it. On a `true` return, the cache header's active page holds the new generation with a valid CRC and an incremented serial, and the previously active page is intact as the other buffer.
+### 4. Bring up a query daemon for a repository root
 
-### UC-4 — Bring up a query daemon for a repository root
+**Goal:** Exactly one daemon serves queries for a given canonical root, and clients reach it.
 
-**Goal.** Exactly one daemon serves queries for a given canonical root, and clients reach it.
+**Stakeholders:** Every query caller (latency); the host (one daemon per root, not per query).
 
-**Stakeholders.** Every query caller (latency); the host (one daemon per root, not per query).
+**Actors:** `connectQueryDaemon` / `QueryDaemonClient` as the initiator; `defaultStartDaemon`'s detached `node tool.mjs daemon --root <root>` child; `QueryDaemon` inside that child.
 
-**Actors.** `connectQueryDaemon` / `QueryDaemonClient` as the initiator; `defaultStartDaemon`'s detached `node tool.mjs daemon --root <root>` child; `QueryDaemon` inside that child.
+**Preconditions:** `os.tmpdir()` is writable. `tool.mjs` is present next to `query-daemon.mjs`. The root resolves to a stable canonical path.
 
-**Preconditions.** `os.tmpdir()` is writable. `tool.mjs` is present next to `query-daemon.mjs`. The root resolves to a stable canonical path.
+**Postconditions:** One daemon listens on `codegraph-<hash24>.sock` in `os.tmpdir()` with `ownsSocket === true`, holding a live `DaemonQueryEngine`. The client has an attached socket and a reply reader. On `QueryDaemon.close()`, in-flight requests are aborted, client sockets destroyed, the socket file unlinked, and the engine disposed.
 
-**Basic Course of Events.**
+**Basic Course of Events:**
 1. The caller calls `connectQueryDaemon(root)`, which defaults `startDaemon` to `defaultStartDaemon`.
 2. `QueryDaemonClient` resolves the root and derives the socket path from its SHA-256 prefix.
 3. `client.connect()` attempts `connectSocket` against that path and fails because nothing is listening.
@@ -389,20 +396,18 @@ Sort order: string-keyed indexes by `key.localeCompare` with the original array 
 9. `connectAfterStart` connects for real; `client._attach(socket)` installs the NDJSON reply reader.
 10. `connectQueryDaemon` returns the connected client, ready for UC-1.
 
-**Alternate Flows.**
+**Alternate Flows:**
 - *Daemon already running.* Step 3 succeeds and steps 4–9 never happen; `connect()` returns the client directly.
 - *Externally started daemon.* Because `startDaemon` is injectable and nullable (`query-daemon.mjs:207`) and `connect()` only ever attempts a plain `connectSocket`, a process constructed with `startDaemon: null` connects to a daemon it did not spawn and never attempts to spawn one.
 - *Stale socket file.* `QueryDaemon.start()` probes it, gets no answer, `fs.rmSync`es it, and listens on the same path.
 - *Concurrent spawns in one process.* Both callers await the same `startupBySocket` promise; only one child is spawned.
 
-**Exceptions.**
+**Exceptions:**
 - *Another live daemon owns the socket.* `QueryDaemon.start()` throws `an active CodeGraph daemon already owns <path>`; the child exits and the original daemon keeps serving. The client's connect succeeds against that original.
 - *Daemon never becomes ready within 15s.* `waitForDaemon` throws `CodeGraph daemon failed to become ready for <root>` with the last connect error as `cause`; `connectQueryDaemon` propagates it.
 - *Spawn itself fails.* The child's `'error'` event rejects `defaultStartDaemon`, and `startOnce` wraps non-readiness errors in `readinessError`.
 - *Engine construction fails inside `start()`.* The server is closed, the engine disposed, and the error rethrown; no socket is left listening, and `ownsSocket` stays false so the socket file is not unlinked spuriously.
 - *Client closed before or during connect.* `connect()` throws `CodeGraph daemon client is closed`, and `_attach` destroys any socket handed to it after close.
-
-**Postconditions.** One daemon listens on `codegraph-<hash24>.sock` in `os.tmpdir()` with `ownsSocket === true`, holding a live `DaemonQueryEngine`. The client has an attached socket and a reply reader. On `QueryDaemon.close()`, in-flight requests are aborted, client sockets destroyed, the socket file unlinked, and the engine disposed.
 
 ## Tests
 

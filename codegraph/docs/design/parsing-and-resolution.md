@@ -1,11 +1,11 @@
 ---
-modified: 2026-08-31
+modified: 2026-09-12
 dependencies: [storage-and-query.md, mcp-and-cli.md]
 ---
 
 # Parsing and Resolution
 
-This subsystem turns files on disk into the graph's raw material: it decides which files count as source, reads them, parses them into symbol rows, and resolves identifier references into edges. It owns two independent parse paths — a full-fidelity semantic path built on `ts-morph`/`Project` (`parser.mjs`, run inside `semantic-checker-worker.mjs`) and a fast syntax-only path built on bare `ts.createSourceFile` (`incremental-resolver.mjs`, fed by `parser-apartment-pool.mjs` and `incremental-parser-worker.mjs`).
+This subsystem turns files on disk into the graph's raw material: it decides which files count as source, reads them, and sends semantic parsing and identifier resolution to `semantic-checker-worker.mjs`.
 
 Read this if you are changing what gets indexed, what kinds of symbols exist, or why an expected edge is missing from the graph. Consult it before adding a language, a symbol kind, or an edge attribute — the constraints below are the ones people trip over. Storage and query of the resulting rows are [storage-and-query.md](storage-and-query.md); the tools that invoke indexing are [mcp-and-cli.md](mcp-and-cli.md).
 
@@ -14,19 +14,14 @@ Read this if you are changing what gets indexed, what kinds of symbols exist, or
 - **There are no property/field symbols, so property access produces no edge.** `declarationKinds` (`parser.mjs:10-15`) is exactly seven `SyntaxKind`s: `FunctionDeclaration`→`function`, `MethodDeclaration`→`method`, `ClassDeclaration`→`class`, `InterfaceDeclaration`→`interface`, `TypeAliasDeclaration`→`type`, `EnumDeclaration`→`enum`, `VariableDeclaration`→`variable`. No `PropertyDeclaration`, `PropertySignature`, or `PropertyAssignment` kind exists anywhere in the map, so `user.email` has nothing to point at and yields no edge.
 - **Unresolvable references are dropped silently into a counter.** `identityForSymbol` (`parser.mjs:143-150`) looks a symbol's declarations up in `context.byDeclaration`, which only ever contains nodes of those seven kinds (`parser.mjs:134`). Anything else resolves to `null` and is discarded at `parser.mjs:183` (`if (!target) { identifierArgs.targetMissing += 1; continue }`). There is no warning, no unresolved row, no log — the only trace is the `targetMissing` field of the profiler args. A large `targetMissing` count is the expected symptom of the property gap above, not a bug in resolution.
 - **`SOURCE_EXTENSIONS` is not extensible.** `source-policy.mjs:8` is a module-level `const SOURCE_EXTENSIONS = new Set(['.ts', '.tsx', '.js', '.jsx', '.mts', '.cts', '.mjs', '.cjs'])`, and `createSourcePolicy(root)` (`source-policy.mjs:19`) takes only `root` — no options object, no injection point. Ignore files and `tsconfig`/`jsconfig` `include`/`exclude` can only SUBTRACT from that set (`sourceCandidateRelative` at `source-policy.mjs:74` ANDs `configured(rel)` with the extension test); nothing at runtime can add an extension. Adding a language means editing that line.
-- **Only one edge attribute exists: `call: boolean`.** `parser.mjs:185` pushes `{ from, to, line, call }`; the syntax path at `incremental-resolver.mjs:248` always sets `call: true`. There is no read/write distinction, no import-vs-invoke distinction, and no way to ask "who assigns to this".
-- **In the syntax path, only functions and static methods own edges.** `declarationParent` (`incremental-resolver.mjs:131`) and the `nextOwner` computation (`incremental-resolver.mjs:161`) accept only `kind === 'function' || kind === 'method'`, and property access is inspected solely as a call callee, guarded by `ts.isCallExpression` (`incremental-resolver.mjs:162-165`). A call made at module top level or inside a class field initializer has no owner and produces nothing.
+- **Only one edge attribute exists: `call: boolean`.** `parser.mjs` pushes `{ from, to, line, call }`. There is no read/write distinction, no import-vs-invoke distinction, and no way to ask "who assigns to this".
 - **Prefetched sources shadow disk and refuse mutation.** `PrefetchedFileSystemHost` answers reads from its in-memory map and throws on any write/delete/move/copy touching a mapped path (`prefetched-file-system.mjs:66-70`). Every mapped path is checked for root escape at construction (`prefetched-file-system.mjs:21-23`), and case-insensitive hosts collapse keys via `toLocaleLowerCase` (`prefetched-file-system.mjs:36`), so two sources differing only in case collide and throw.
-- **Worker paths are re-validated after `realpath`.** `incremental-parser-worker.mjs:19-20` and `semantic-checker-worker.mjs:24-25` both reject a path that escapes the root through a symlink, and `source-policy.mjs:98-108` refuses to watch anything under a symlinked directory. Weakening any of these reintroduces a read-outside-root path.
+- **Worker paths are re-validated after `realpath`.** `semantic-checker-worker.mjs` rejects a path that escapes the root through a symlink, and `source-policy.mjs` refuses to watch anything under a symlinked directory. Weakening either check reintroduces a read-outside-root path.
 
 ## Design Constraints
 
-- **Two parse paths must agree on identity semantics but not on ids.** The semantic path hashes identity to a 24-hex-char id (`parser.mjs:116`); the syntax path uses a NUL-joined composite string id (`incremental-resolver.mjs:128`). They are not interchangeable.
-- **Persistent semantic parsing is worker-owned.** `McpProjectRuntime` selects `retainSemanticState`, so initial `index`, persisted `hydrate`, delta `validate`, and warm `reference-overlay` work run in one `SemanticCheckerWorker`. Default short-lived engines keep the local semantic build path, and mmap-only queries do not spawn the worker.
+- **Semantic parsing is worker-owned.** Every `CodeGraphEngine` sends initial `index`, persisted `hydrate`, delta `validate`, and warm `reference-overlay` work through one `SemanticCheckerWorker`.
 - **Sparse semantic validation is deliberately narrow.** A delta is allowed only for one edit to an existing module-scoped file when both the old and new source remain module-scoped and contain no global/ambient or triple-slash constructs. Adds, deletes, multi-file changes, scripts, unresolved dependencies, and cache/base mismatches use full validation.
-- **Incremental parse requests are revision-ordered and cancellable.** `ParserApartmentPool.parse` resolves `null` for any request whose revision is below the latest recorded for that file (`parser-apartment-pool.mjs:50`, re-checked at `:88` and `:98`), and `FileLocalResolver.applyFileChanges` rejects a stale `baseRevision` (`incremental-resolver.mjs:206, 216-217`).
-- **Per-file worker affinity.** A file is pinned to one apartment (`parser-apartment-pool.mjs:64-70`) so the retained `SourceFile` in that worker can be reused via `sourceFile.update` (`incremental-parser-worker.mjs:32`).
-- **Bounded caches everywhere.** Parse cache: 32 entries / 1 MiB (`incremental-resolver.mjs:193`). AST cache: 32 entries / 1 MiB, only retained for sources ≥ 64 KiB that took > 8 ms to parse (`incremental-resolver.mjs:176, 183`). Worker retention: 32 entries / 1 MiB (`incremental-parser-worker.mjs:11-12`). Graph cache: 32 entries (`incremental-resolver.mjs:252`).
 - **Read concurrency is validated, not clamped.** `readSources` throws unless concurrency is an integer in 1..128 (`source-reader.mjs:8`), default 16.
 - **Worker requests time out at 30 s** and the worker is replaced (`parser-apartment-pool.mjs:7, 90`).
 - **`allowJs` is always on and `jsconfig.json` is accepted.** `parser.mjs:64-66` finds `tsconfig.json` or `jsconfig.json` and creates the `Project` with `compilerOptions: { allowJs: true }` and `skipAddingFilesFromTsConfig: true`.
@@ -35,15 +30,15 @@ Read this if you are changing what gets indexed, what kinds of symbols exist, or
 
 ## Feature Overview
 
-Everything downstream — queries, dead-code detection, the visualizer — consumes symbol rows and edge rows. This subsystem is where those rows come from, and it exists in two forms because the two consumers want opposite trade-offs.
+Everything downstream — queries, dead-code detection, the visualizer — consumes symbol rows and edge rows. This subsystem is where those rows come from.
 
 The **semantic path** wants correctness: it needs the TypeScript checker to know that `helper` in this file is the `helper` exported from three modules over. That requires a real `Project` with a type checker over the whole workspace, which is expensive to build. `createSemanticProject` pays that cost against an in-memory source map, `prepareSemanticProject` does a single descendant walk per prepared file, and `parsePartition` resolves per-file without re-walking. In a persistent MCP runtime, the worker creates and retains that project during initial `index` or reconstructs it once during `hydrate`; the coordinator validates exact source and partition membership before adopting the result and retains no second semantic workspace. A safe one-file edit then refreshes only that file and its reverse transitive dependent closure. Unsafe edits rebuild the worker's full validated state.
 
-Complete-reference overlays reuse the same warm worker for only the stale files when its source-blob membership exactly matches the current generation. The coordinator validates returned fragment membership, edge shape, endpoints, and owning file before atomically writing the overlay. Cold workers, historical generations, cache mismatches, and legacy injected workers retain the whole-project overlay builder as the safe fallback; malformed accepted worker output is rejected without publishing a partial overlay.
+Complete-reference overlays use the semantic worker for only the stale files, hydrating the requested persisted generation when needed. The coordinator validates returned fragment membership, edge shape, endpoints, and owning file before atomically writing the overlay.
 
-The **syntax path** wants latency: after a single keystroke-level file change, re-running a whole-project checker is unacceptable. `FileLocalResolver` (`incremental-resolver.mjs:175`) therefore uses no checker at all. It extracts facts per file with `ts.forEachChild` and links them afterwards by module-specifier candidate resolution and export-name lookup (`incremental-resolver.mjs:235-236`), which is why its snapshots are labelled `freshness: 'provisional', coverage: 'module-linked-syntax'` (`incremental-resolver.mjs:253`). Where linkage is genuinely ambiguous it records the fact rather than guessing: unresolved property calls become `unresolvedEdges` with `reason: 'ambiguous-property-call'` (`incremental-resolver.mjs:249`).
+That semantic walk also produces a compact internal partition for each source file. It records executable owners, normalized syntax nodes, control-flow edges, semantic relations, and summary metrics without retaining a second repository-sized object graph. Cold builds move bounded partition payloads through one reusable shared-memory pool; oversized payloads are persisted by the worker directly.
 
-Reading and file selection are separated from both paths so the policy is decided once. `createSourcePolicy` (`source-policy.mjs:19`) is the single answer to "is this a source file", used both for the initial `scan()` and for watch-event filtering (`acceptWatchPath`); `readSources` (`source-reader.mjs:6`) turns that list into the `Map<relPath, text>` both parse paths take as input, while measuring bytes, wall time and peak concurrency. `PrefetchedFileSystemHost` then hands that same map to `ts-morph` so the checker never re-reads a file the indexer already read.
+Reading and file selection are separated from semantic analysis so the policy is decided once. `createSourcePolicy` (`source-policy.mjs:19`) is the single answer to "is this a source file", used both for the initial `scan()` and for watch-event filtering (`acceptWatchPath`); `readSources` (`source-reader.mjs:6`) turns that list into the `Map<relPath, text>` the worker takes as input, while measuring bytes, wall time and peak concurrency. `PrefetchedFileSystemHost` then hands that same map to `ts-morph` so the checker never re-reads a file the indexer already read.
 
 `FileIdRegistry` and `PagedBitSet` (`file-index.mjs`) exist so the rest of the system can talk about files as small integers and hold dense sets of them cheaply; `FileIdRegistry.release` recycles ids through a free list (`file-index.mjs:33-41`).
 
@@ -54,29 +49,21 @@ source-policy.mjs      decides what is source (scan + watch filter)
         |
 source-reader.mjs      bounded-concurrency read -> Map<rel, text> + stats
         |
-        +--> semantic path (accurate, batch)
+        +--> semantic worker (accurate, batch)
         |      prefetched-file-system.mjs   PrefetchedFileSystemHost (ts-morph host)
         |      parser.mjs                   createSemanticProject
         |                                   prepareSemanticProject  (one walk/file)
         |                                   parsePartition          (per-file rows/edges)
         |      semantic-checker-worker.mjs  index / hydrate / validate / reference-overlay
-        |                                   one retained Project in persistent MCP runtimes
-        |
-        +--> syntax path (fast, incremental)
-               incremental-resolver.mjs     parseFile (facts) + FileLocalResolver (linking)
-               parser-apartment-pool.mjs    revision-ordered, file-affine worker pool
-               incremental-parser-worker.mjs  reads disk, ts.SourceFile.update, parseFile
+        |                                   one retained Project per engine
+        |      internal-graph.mjs            owners / CFG / relations / metrics
+
 
 file-index.mjs         FileIdRegistry (path <-> uint32) + PagedBitSet (dense id sets)
 ```
 
 Component relationships:
 
-- `FileLocalResolver` owns a `ParserApartmentPool` unless one is injected (`incremental-resolver.mjs:176`); `dispose()` only tears down a pool it owns (`:257`).
-- The pool degrades to synchronous in-process parsing when `workerCount === 0` (`parser-apartment-pool.mjs:52-62`), which is also its behavior on a single-core machine (`availableParallelism() - 1`, `:10`).
-- Workers are created lazily — the first apartment appears only on first parse (`parser-apartment-pool.mjs:31-33`) — and are `unref`'d when their queue drains (`:100`).
-- A crashed, exited, or timed-out worker is replaced, and after replacement the apartment sets `requiresRequestId` so pre-replacement messages cannot be mistaken for the current reply (`parser-apartment-pool.mjs:95, 105`).
-- `FileLocalResolver` keys its graph cache on a Merkle root over per-file digests (`#rebuildDigestTree`/`#updateDigest`/`#workspaceDigest`, `incremental-resolver.mjs:258-272`), with the last 64 leaf-to-root transitions memoized so a repeated A→B→A edit replays cached hashes instead of recomputing them.
 - Worker `index` and `hydrate` requests require exact, duplicate-free source membership and matching SHA-256 source hashes. Hydration additionally requires one partition per source whose `file` and `sourceHash` match. The cache is replaced only after validation succeeds.
 - `validateSnapshot` can take sources inline or hydrate a pinned generation from content-addressed blobs and partitions. Safe edits return `{ mode: 'delta' }` with exactly the changed file plus its reverse dependency closure; every unsafe or mismatched case returns `{ mode: 'full' }`.
 - `referenceOverlay` accepts only the current cached generation membership and an exact stale-file set, then returns non-call edges partitioned by owning file.
@@ -105,27 +92,14 @@ Component relationships:
 - `callExpressionForIdentifier(ident)` — true when the identifier is a call's callee directly, or is the name of a property access that is itself a callee (`:152-157`).
 - `semanticPath(node)`, `semanticSignature(node)`, `nodeName(node)` — the qualified-path, signature, and name components of symbol identity; `nodeName` falls back to `'constructor'` and `'default'`.
 
-**`incremental-resolver.mjs`**
-- `parseFile(file, source, sourceFile?, options?)` — four independent `forEachChild` walks: functions (declarations with a name and body), classes (plus their **static** methods only, `:140`), variable statements, then a top-level statement pass for named imports, namespace imports and named re-exports. A final `visitCalls` walk records call sites. Returns the parsed-file record; `options.includeSource === false` omits the source text.
-- `createParseDiagnosticsCollector(options)` — returns `null` unless `options.enabled`. `begin`/`end` sample `performance.now`, `process.cpuUsage`, `memoryUsage`, `resourceUsage`; `end` always updates the aggregate but only records an event when wall time exceeds `thresholdMs` (default 8). `recordGc` attributes GC entries to overlapping records; `snapshot()` returns a deep-ish copy. Events are capped at `capacity` (default 100), GC entries at `max(64, capacity*4)`.
-- `FileLocalResolver` — `loadSources`, `applyChanges` (source text supplied), `applyFileChanges` (disk-backed, source text forbidden, `:211`), `snapshot`, `sourceEntries`, `astCacheSnapshot`, `dispose`. `#parse` reuses a retained AST via `textChangeRange`-driven `sourceFile.update` and emits an `onParserEvent` of operation `update` or `create`.
-- `snapshot()` — returns cached result if the workspace digest is unchanged; otherwise links calls to targets (local function preference, then named import, then namespace import, then imported-class static method) and returns `{ revision, freshness, coverage, files, symbols, edges, unresolvedEdges }`.
-- `moduleCandidates(file, specifier)`, `textChangeRange(before, after)`, `normalizedLimit(value, fallback, name)` — module-private helpers.
-
-**`parser-apartment-pool.mjs`**
-- `ParserApartmentPool(root, options)` — options: `workerCount` (default `availableParallelism() - 1`), `timeoutMs`, `readFileSync`, `realpathSync`, `workerFactory`.
-- `parse(request)` — validates `{ path, fileId, revision }`, drops stale revisions, cancels superseded queued requests for the same file (`:71`), enqueues to the file's affine apartment.
-- `release(request | path, fileId, revision)` — posts a `release` to the apartment and forgets the file's revision and affinity.
-- `snapshot()` — `{ workerCount, queued, inFlight, latestRevisionByFile }`.
-- `dispose()` — rejects everything pending and terminates all workers.
-
-**`incremental-parser-worker.mjs`** — message loop handling `parse` and `release`; `resolveTarget` enforces root containment lexically and post-`realpath`; posts `{ type: 'result', ..., parsed }` or `{ type: 'error', ..., error }`.
-
 **`semantic-checker-worker.mjs`**
 - `ownedSnapshot(request, hydrate)` — validates exact source/hash membership, then either parses all partitions for `index` or adopts matching stored partitions for `hydrate`.
 - `validateSnapshot(snapshot)` — hydrates or reuses the pinned validated state, verifies changes, and returns `{ revision, mode, baseGeneration, sourceBlobs, partitions }`. Delta partitions are sparse; full partitions contain every source.
 - `referenceOverlay(request)` — reparses only requested stale files at complete coverage and returns their non-call edge fragments.
 - `SemanticCheckerWorker` — `index`, `hydrate`, `validate`, `referenceOverlay`, and `dispose`; unknown operations reject explicitly, while worker error or unexpected exit fails every pending request through `#fail`.
+
+**`internal-graph.mjs`**
+- Encodes and validates file-scoped executable owners, syntax nodes, control-flow edges, semantic relations, cyclomatic complexity, branch count, and nesting depth.
 
 **`file-index.mjs`**
 - `FileIdRegistry` — `intern`, `idOf`, `pathOf`, `entries`, `release`. Ids start at 1 and are recycled from `freeIds`.
@@ -160,23 +134,15 @@ Component relationships:
 - `source-hash` (`parser.mjs:232`): `{ file, sourceBytes }`.
 - Read stats (`source-reader.mjs:57`): `{ filesRead, bytesRead, readMs, readConcurrency, peakReads }`.
 
-**Parse diagnostics aggregate and event** (`incremental-resolver.mjs:32, 83-99`) — aggregate `{ parses, wallMs, parseCount, extractCount, nodeCount }`; event `{ file, ...attribution, wallMs, cpuUserMs, cpuSystemMs, unaccountedMs, heapDeltaBytes, rssDeltaBytes, voluntaryContextSwitches, involuntaryContextSwitches, minorPageFaults, majorPageFaults, ...counts, gc: [{ startTime, duration, kind, overlapMs }], severe }`, where `severe` is `wallMs > 50`.
-
-**Syntax-path symbol** (`incremental-resolver.mjs:128`) — `{ id, file, name, kind, line, qualifiedPath, signature: '', ordinal: 0, exported, start, end, parent }` plus `bodyStart` on functions/classes/methods. `start`, `end`, `bodyStart`, `parent` are internal and stripped before publication (`:251`). `kind` here is only `function`, `class`, `method` (static only), `variable`.
-
-**Syntax-path parsed file** (`incremental-resolver.mjs:172`) — `{ file, source?, digest, stateHash, sourceBytes, nodeCount, symbols, imports: Map<local,{specifier,remote}>, namespaces: Map<local,specifier>, reexports: Map<name,{specifier,remote}>, calls: [{ owner, base, property, line, expression }] }`. `digest` is SHA-256 of `file\0source`; `stateHash` is its first 8 hex chars as an int, XOR-folded across files.
-
-**Syntax-path graph snapshot** (`incremental-resolver.mjs:248-253`) — `{ revision, freshness: 'provisional', coverage: 'module-linked-syntax', files: string[], symbols[], edges: [{ from, to, fromFile, fromName, toFile, toName, toLine, line, call: true }], unresolvedEdges: [{ from, fromFile, fromName, expression, line, reason: 'ambiguous-property-call' }] }`.
-
 **Source policy shape** (`source-policy.mjs:110`) — `{ root, scan, acceptWatchPath, isSourceRelative, isControlRelative, isIgnoredRelative, normalize }`. Module constants: `MANDATORY_IGNORES`, `BUILD_IGNORES` (both exported), `SOURCE_EXTENSIONS`, `CONTROL_FILES` (both module-private).
-
-**Worker messages** — request `{ type: 'parse', requestId, path, fileId, revision }` or `{ type: 'release', path, fileId, revision? }`; reply `{ type: 'result' | 'error', path, requestId, fileId, revision, parsed | error }` (`parser-apartment-pool.mjs:80, 91`; `incremental-parser-worker.mjs:37-39`).
 
 **Semantic ownership requests** — `index` receives `{ root, sources: [[file, text]], sourceBlobs: {file: sha256}, edgeCoverage }`; `hydrate` adds `{ generation, partitions: {file: partition} }`. Both return `{ mode: 'full', sourceBlobs, partitions }` only after exact membership and hash validation.
 
 **Semantic checker snapshot input** — `{ root, revision, sourceDir?, partitionDir?, baseGeneration?, baseSourceBlobs?: {file: sha256}, basePartitionIds?: {file: sha256}, sources?: [[file, text]], changes?: [{ type, path, source?, expectedDigest? }] }`; output `{ revision, mode: 'full'|'delta', baseGeneration, sourceBlobs, partitions: {file: partition} }`. A persistent runtime omits `basePartitionIds` after successful ownership transfer.
 
 **Reference-overlay request** — `{ generation, sourceBlobs, staleFiles }`; output `{ generation, files: { [file]: { edges } } }`, containing only `call: false` edges for the requested stale files.
+
+**Internal partition** — a versioned binary file containing executable-owner, node, control-flow, semantic-relation, and metric records. Node and owner identifiers are local to one file and generation; source text stays in the existing source blob.
 
 **File index** (`file-index.mjs`) — `FileIdRegistry` holds `pathToId: Map<string, uint32>`, `idToPath: string[]`, `freeIds: number[]`, `nextFileId` (starts at 1). `PagedBitSet` holds `pages: Uint32Array[]` of 128 words (4096 bits) each, plus `allocatedPageCount`.
 
@@ -207,33 +173,6 @@ Component relationships:
   - A file was not prefetched or not prepared: `parsePartition` throws `source was not prefetched` / `source analysis was not prepared`.
   - The worker crashes or exits: `#fail` rejects every pending `validate()` with the underlying error and marks the instance closed.
 - **Postconditions** — one partition per source file, each with symbol rows of the seven kinds, `call`-attributed edge rows, sorted deduped dependencies, and an `unresolved` list; per-file analyses released from `context.perFile`.
-
-### 2. Refresh the graph after files change on disk (syntax path)
-
-- **Goal** — get an updated graph snapshot quickly after a small set of files changed, without rebuilding a type checker.
-- **Stakeholders** — an interactive caller waiting on a query; the watcher feeding change events.
-- **Actors** — the watcher/caller; `FileLocalResolver`; `ParserApartmentPool` and its worker threads.
-- **Preconditions** — a `FileLocalResolver` already holds parsed state for the workspace; the changed paths pass `policy.acceptWatchPath`; the caller knows the resolver's current `revision`.
-- **Basic Course of Events**
-  1. Caller invokes `applyFileChanges(changes, { baseRevision })`; the resolver checks `baseRevision` against its own `revision` and computes `targetRevision = revision + 1`.
-  2. For each non-unlink change, the resolver asks `parserPool.parse({ path, fileId, revision: targetRevision })`.
-  3. The pool records the file's latest revision, cancels any superseded queued request for that file, and dispatches to the file's affine apartment.
-  4. The worker resolves the path (lexically and after `realpath`), reads it, reuses the retained `SourceFile` via `update` when it has one, runs `parseFile` without source text, re-retains the AST under its 32-entry / 1 MiB bounds, and replies with the parsed record.
-  5. The resolver re-checks `baseRevision` and that no other commit intervened, then commits: XOR-folds `stateHash`, updates or deletes each file's entry, releases retained ASTs and pool affinity for unlinked files, and bumps `revision`.
-  6. `snapshot()` computes the Merkle workspace digest; on a miss it links every recorded call to a target and returns the graph, caching it under that digest.
-- **Alternate Flows**
-  - `workerCount === 0` (single core, or explicitly configured): the pool parses in-process, still enforcing the symlink-escape check.
-  - The workspace digest matches a cached graph: `snapshot()` returns the cached `files`/`symbols`/`edges`/`unresolvedEdges` with the current revision, doing no linking work.
-  - Source text is already in hand: the caller uses `applyChanges` instead, which parses in-process and never touches the pool.
-  - The same digest transition has been seen before: `#updateDigest` replays the memoized leaf-to-root hash writes.
-- **Exceptions**
-  - Stale `baseRevision`, or another commit landing mid-batch: the call throws `stale base revision …` / `stale parse batch revision …` and nothing is committed.
-  - A change carries inline `source` for `applyFileChanges`: `TypeError` (`disk-backed change must not include source text`).
-  - A path escapes the root through a symlink: the worker replies `error` and the promise rejects.
-  - A parse exceeds 30 s: the request rejects with `parser request timed out` and the apartment's worker is terminated and reinstalled.
-  - The request was superseded while queued or in flight: the promise resolves `null`, and `applyFileChanges` throws `stale or superseded parse result`.
-  - A call target cannot be resolved and the call was a property access: it is recorded in `unresolvedEdges` with `reason: 'ambiguous-property-call'` rather than dropped.
-- **Postconditions** — `revision` incremented by one, `stateHash` and the digest tree consistent with the new file set, all caches within their bounds, and a `freshness: 'provisional'`, `coverage: 'module-linked-syntax'` snapshot available.
 
 ### 3. Decide whether a changed path is worth reindexing
 

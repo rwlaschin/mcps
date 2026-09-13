@@ -522,3 +522,16 @@ test('equivalence partition and error guessing: every valid-JSON invalid request
     })
   })
 })
+
+test('transport contract: daemon streams generation-pinned internal summaries without changing their records', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-daemon-internal-summary-'))
+  temporaryRoots.add(root)
+  const daemon = new QueryDaemon(root, { engineFactory: () => ({ queryBatch: async (query) => [{ type: query.type, generation: query.generation, cyclomatic: 4 }], dispose: async () => {} }) })
+  openDaemons.add(daemon)
+  await daemon.start()
+  const client = new QueryDaemonClient(root)
+  openClients.add(client)
+  await client.connect()
+  const rows = await client.queryBatch({ type: 'internal-summaries', generation: 'generation-a' })
+  assert.deepEqual(rows, [{ type: 'internal-summaries', generation: 'generation-a', cyclomatic: 4 }])
+})

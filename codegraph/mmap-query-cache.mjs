@@ -229,6 +229,43 @@ export class MmapQueryCache {
       return true
     } catch { return false }
   }
+  cloneGeneration({ fromGeneration, generation, coverage }) {
+    if (!this.mapping || this.disposed || this.capacity < HEADER_BYTES + SCRATCH_BYTES + 2) return false
+    try {
+      const header = this.#readHeader()
+      if (!header) return false
+      const expectedCoverage = coverageName(requireCoverage(coverage))
+      for (const sourceIndex of [header.active, 1 - header.active]) {
+        const source = header.pages[sourceIndex]
+        if (!source.length || source.length > source.capacity || this.#pageChecksum(source) !== source.checksum) continue
+        const data = new DataView(this.mapping.buffer, this.mapping.byteOffset + source.offset, source.length)
+        if (data.getUint32(0, true) !== PAGE_MAGIC || data.getUint32(4, true) !== VERSION) continue
+        const string = (offset) => {
+          const start = source.offset + data.getUint32(8, true) + offset; let end = start
+          while (end < source.offset + data.getUint32(8, true) + data.getUint32(12, true) && this.mapping[end] !== 0) end += 1
+          return decoder.decode(this.mapping.subarray(start, end))
+        }
+        if (string(data.getUint32(56, true)) !== fromGeneration || string(data.getUint32(60, true)) !== expectedCoverage) continue
+        const replacement = encoder.encode(generation)
+        const old = encoder.encode(fromGeneration)
+        if (replacement.byteLength !== old.byteLength) return false
+        const targetIndex = 1 - sourceIndex
+        if (this.leases[targetIndex] > 0) return false
+        const target = header.pages[targetIndex]
+        if (source.length > target.capacity) return false
+        const priorHeader = this.mapping.slice(0, HEADER_BYTES)
+        this.mapping.copyWithin(target.offset, source.offset, source.offset + source.length)
+        const generationStart = target.offset + data.getUint32(8, true) + data.getUint32(56, true)
+        this.mapping.set(replacement, generationStart)
+        this.adapter.flush(this.mapping, target.offset, source.length)
+        target.length = source.length; target.checksum = this.#pageChecksum(target); target.serial = ++header.serial; header.active = targetIndex
+        this.#writeHeader(header)
+        try { this.adapter.flush(this.mapping, 0, HEADER_BYTES) } catch { this.mapping.set(priorHeader, 0); try { this.adapter.flush(this.mapping, 0, HEADER_BYTES) } catch {}; return false }
+        return true
+      }
+    } catch {}
+    return false
+  }
   acquire({ generation, coverage }) {
     if (!this.mapping || this.disposed) return null
     try {

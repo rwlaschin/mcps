@@ -4,6 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { EventEmitter } from 'node:events'
+import { spawnSync } from 'node:child_process'
 import { DebouncedBuildQueue, McpProjectRuntime } from '../mcp-runtime.mjs'
 import { DaemonQueryEngine } from '../daemon-query-engine.mjs'
 
@@ -36,27 +37,133 @@ test('MCP runtime reconciles on startup and shuts watcher down', async () => {
   assert.equal(runtime.queue.closed, true)
 })
 
-test('ownership boundary: the MCP runtime creates an engine that retains semantic state in its worker', () => {
+test('polling fallback reconciles a mutation absorbed before ready and reports reconciliation failure', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-mcp-fallback-reconcile-'))
+  fs.writeFileSync(path.join(root, 'tsconfig.json'), '{}')
+  const nativeWatcher = new EventEmitter()
+  nativeWatcher.close = () => {}
+  const fallbackWatcher = new EventEmitter()
+  fallbackWatcher.close = () => {}
+  const errors = []
+  const reconciledStates = []
+  let mutated = false
+  const runtime = new McpProjectRuntime(root, {
+    engine: {
+      policy: (await import('../source-policy.mjs')).createSourcePolicy(root),
+      reconcile: async () => { reconciledStates.push(mutated); if (reconciledStates.length === 2) throw new Error('fallback reconcile failed') },
+      incremental: async () => {},
+      registeredFiles: () => new Set(),
+      dispose: async () => {},
+    },
+    nativeWatch: () => nativeWatcher,
+    fallbackWatch: () => fallbackWatcher,
+    onError: (error) => errors.push(error.message),
+  })
+
+  await runtime.start()
+  mutated = true
+  nativeWatcher.emit('error', new Error('EMFILE: too many open files, watch'))
+  fallbackWatcher.emit('ready')
+  await new Promise((resolve) => setImmediate(resolve))
+
+  assert.deepEqual({ reconciledStates, errors }, { reconciledStates: [false, true], errors: ['EMFILE: too many open files, watch', 'fallback reconcile failed'] })
+  await runtime.close()
+})
+
+test('domain analysis: first and later explicit indexes each perform one semantic build and return that build receipt', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-mcp-explicit-index-'))
+  fs.writeFileSync(path.join(root, 'tsconfig.json'), '{}')
+  let builds = 0
+  let reconciles = 0
+  const runtime = new McpProjectRuntime(root, {
+    engine: {
+      policy: (await import('../source-policy.mjs')).createSourcePolicy(root),
+      reconcile: async () => { reconciles += 1; return { generation: 'unexpected-reconcile' } },
+      build: async () => { builds += 1; return builds === 1 ? { generation: 'generation-1', parsedFiles: ['one.ts'], validatedFiles: ['one.ts'] } : { generation: 'generation-2', parsedFiles: ['one.ts'], validatedFiles: ['one.ts'] } },
+      incremental: async () => {},
+      dispose: async () => {},
+    },
+  })
+
+  const first = await runtime.index()
+  const second = await runtime.index()
+  await runtime.close()
+
+  assert.deepEqual(
+    { builds, reconciles, first, second, queueClosed: runtime.queue.closed },
+    {
+      builds: 2,
+      reconciles: 0,
+      first: { generation: 'generation-1', parsedFiles: ['one.ts'], validatedFiles: ['one.ts'] },
+      second: { generation: 'generation-2', parsedFiles: ['one.ts'], validatedFiles: ['one.ts'] },
+      queueClosed: true,
+    },
+  )
+})
+
+test('domain analysis: an unindexed default root remains unbuilt until its first explicit index performs the only build', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-mcp-default-unindexed-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  fs.writeFileSync(path.join(root, 'tsconfig.json'), '{}')
+  const loader = path.join(root, 'runtime-loader.mjs')
+  const driver = path.join(root, 'driver.mjs')
+  fs.writeFileSync(loader, `
+export async function load(url, context, nextLoad) {
+  if (url.endsWith('/mcp-runtime.mjs')) return { format: 'module', shortCircuit: true, source: \`
+    let builds = 0
+    export class McpProjectRuntime {
+      async start() { builds += 1; process.stderr.write('semantic-build:' + builds + '\\\\n'); return this }
+      async index() { builds += 1; process.stderr.write('semantic-build:' + builds + '\\\\n'); return { generation: 'generation-' + builds, parsedFiles: ['one.ts'], validatedFiles: ['one.ts'] } }
+      async close() {}
+    }
+  \` }
+  return nextLoad(url, context)
+}
+`)
+  fs.writeFileSync(driver, `
+import { spawn } from 'node:child_process'
+import { once } from 'node:events'
+const child = spawn(process.execPath, ['--no-warnings', '--experimental-loader', ${JSON.stringify(loader)}, ${JSON.stringify(path.resolve(import.meta.dirname, '..', 'mcp-server.mjs'))}], { env: { ...process.env, CODEGRAPH_ROOT: ${JSON.stringify(root)} }, stdio: ['pipe', 'pipe', 'pipe'] })
+let stdout = ''; let stderr = ''
+child.stdout.on('data', (chunk) => { stdout += chunk })
+child.stderr.on('data', (chunk) => { stderr += chunk })
+await new Promise((resolve) => setTimeout(resolve, 100))
+child.stdin.end(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'codegraph_index', arguments: { root: ${JSON.stringify(root)} } } }) + '\\n')
+await once(child, 'exit')
+process.stdout.write(JSON.stringify({ stdout, stderr }))
+`)
+
+  const execution = spawnSync(process.execPath, [driver], { encoding: 'utf8', timeout: 5_000 })
+  const observed = JSON.parse(execution.stdout)
+  const response = JSON.parse(observed.stdout.trim())
+
+  assert.deepEqual(
+    { status: execution.status, builds: observed.stderr, receipt: JSON.parse(response.result.content[0].text) },
+    { status: 0, builds: 'semantic-build:1\n', receipt: { generation: 'generation-1', parsedFiles: ['one.ts'], validatedFiles: ['one.ts'] } },
+  )
+})
+
+test('ownership boundary: the MCP runtime creates the worker-owned engine path', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-mcp-worker-owner-'))
   fs.writeFileSync(path.join(root, 'tsconfig.json'), '{}')
 
   const runtime = new McpProjectRuntime(root)
 
-  assert.equal(runtime.engine.retainSemanticState, true)
+  assert.ok(runtime.engine.validationWorker)
   return runtime.engine.dispose()
 })
 
 test('ownership boundary: the MCP runtime preserves an injected engine without replacing its policy', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-mcp-injected-owner-'))
   fs.writeFileSync(path.join(root, 'tsconfig.json'), '{}')
-  const injected = { retainSemanticState: false, policy: (await import('../source-policy.mjs')).createSourcePolicy(root), reconcile: async () => {}, incremental: async () => {}, dispose: async () => {} }
+  const injected = { policy: (await import('../source-policy.mjs')).createSourcePolicy(root), reconcile: async () => {}, incremental: async () => {}, dispose: async () => {} }
 
   const runtime = new McpProjectRuntime(root, { engine: injected })
 
   assert.equal(runtime.engine, injected)
 })
 
-test('ownership boundary: mmap-only daemon queries do not opt the fallback engine into retained semantic state', async () => {
+test('ownership boundary: mmap-only daemon queries create the engine without mode options', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-mmap-owner-'))
   fs.mkdirSync(path.join(root, '.codegraph'))
   let requestedOptions
@@ -94,7 +201,7 @@ test('domain analysis: a watcher build advancing CURRENT cannot change an alread
   }
 })
 
-test('error guessing: runtime close disposes the warm engine workspace as well as watcher and queue', async () => {
+test('error guessing: runtime close disposes the warm engine as well as watcher and queue', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-mcp-dispose-'))
   fs.writeFileSync(path.join(root, 'tsconfig.json'), '{}')
   let disposed = 0

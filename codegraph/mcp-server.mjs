@@ -12,6 +12,9 @@ import { isFrameworkExport } from './framework-exports.mjs'
 import { qualifiedQuery } from './query-target.mjs'
 import { controlFileHashes, createSourcePolicy, fileContentHash } from './source-policy.mjs'
 import { GraphStore } from './store.mjs'
+import { MmapQueryCache } from './mmap-query-cache.mjs'
+import { prepareQueryViewCache } from './query-cache-schema.mjs'
+import { nativeMmapAdapter } from './native/mmap-adapter.mjs'
 
 const DEFAULT_ROOT = process.env.CODEGRAPH_ROOT ? path.resolve(process.env.CODEGRAPH_ROOT) : null
 
@@ -43,6 +46,7 @@ const TOOLS = [
       'Inverted call tree — walks upward from a symbol to the entry points that reach it (route handlers, page components). Answers "how does execution actually get here?". Use for tracing a request path or debugging unexpected invocation.',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
         symbol: { type: 'string' },
         depth: { type: 'integer', description: 'Levels to walk upward (default 3; 2-3 is usually right)' },
@@ -72,6 +76,31 @@ const TOOLS = [
         includeFramework: { type: 'boolean', description: 'List framework-convention exports too instead of withholding them. Default false.' },
         root: ROOT_PARAM,
       },
+    },
+  },
+  {
+    name: 'codegraph_internals',
+    description: 'Inspect validated executable internals, scoped structural matches, control-flow paths, and CFG-derived metrics without reparsing source.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        root: ROOT_PARAM,
+        operation: { type: 'string', enum: ['map', 'search', 'paths', 'metrics'] },
+        file: { type: 'string', minLength: 1 },
+        owner: { oneOf: [
+          { type: 'object', additionalProperties: false, properties: { id: { type: 'integer', minimum: 0, maximum: 4294967295 } }, required: ['id'] },
+          { type: 'object', additionalProperties: false, properties: { symbol: { type: 'string', minLength: 1 }, line: { type: 'integer', minimum: 1 } }, required: ['symbol'] },
+          { type: 'object', additionalProperties: false, properties: { line: { type: 'integer', minimum: 1 }, column: { type: 'integer', minimum: 1 }, kind: { type: 'string', enum: ['module', 'function', 'arrow', 'method', 'constructor', 'getter', 'setter', 'static-block', 'field-initializer'] } }, required: ['line', 'column', 'kind'] },
+        ] },
+        view: { type: 'string', enum: ['syntax', 'control-flow', 'combined'] },
+        match: { type: 'object', additionalProperties: false, minProperties: 1, properties: { nodeKind: { type: 'string', enum: ['entry', 'exit', 'statement', 'condition', 'loop', 'case', 'call', 'return', 'throw', 'break', 'continue', 'assignment', 'await', 'yield'] }, edgeKind: { type: 'string', enum: ['next', 'true', 'false', 'case', 'default', 'back', 'break', 'continue', 'return', 'throw', 'exception', 'finally'] }, relationKind: { type: 'string', enum: ['call', 'read', 'write'] }, role: { type: 'string', enum: ['body', 'condition', 'consequent', 'alternate', 'initializer', 'update', 'operand', 'callee', 'argument', 'handler', 'finalizer'] }, targetSymbolId: { type: 'string', minLength: 1 }, ancestorKind: { type: 'string' } } },
+        from: { $ref: '#/$defs/nodeSelector' }, to: { $ref: '#/$defs/nodeSelector' }, avoid: { $ref: '#/$defs/nodeSelector' },
+        metrics: { type: 'array', items: { type: 'string', enum: ['cyclomatic', 'branchCount', 'nestingDepth'] } },
+        generation: { type: 'string' }, limit: { type: 'integer', minimum: 1, maximum: 2000 },
+        maxDepth: { type: 'integer', minimum: 1, maximum: 100 }, maxPaths: { type: 'integer', minimum: 1, maximum: 20 },
+      },
+      required: ['operation', 'file'],
+      $defs: { nodeSelector: { type: 'object', additionalProperties: false, minProperties: 1, properties: { id: { type: 'integer', minimum: 0, maximum: 4294967295 }, nodeKind: { type: 'string', enum: ['entry', 'exit', 'statement', 'condition', 'loop', 'case', 'call', 'return', 'throw', 'break', 'continue', 'assignment', 'await', 'yield'] }, role: { type: 'string', enum: ['body', 'condition', 'consequent', 'alternate', 'initializer', 'update', 'operand', 'callee', 'argument', 'handler', 'finalizer'] }, symbolId: { type: 'string', minLength: 1 } } } },
     },
   },
   {
@@ -126,15 +155,33 @@ const resolveRoot = (a) => {
 const call = {}
 
 const runtimes = new Map()
-async function runtimeFor(root) {
+const queryCaches = new Map()
+const queryCacheFor = (root) => {
+  let cache = queryCaches.get(root)
+  if (!cache) {
+    cache = new MmapQueryCache({ filePath: prepareQueryViewCache(path.join(root, '.codegraph')), root, adapter: nativeMmapAdapter })
+    queryCaches.set(root, cache)
+  }
+  return cache
+}
+async function runtimeFor(root, initialize = (runtime) => runtime.start()) {
   let pending = runtimes.get(root)
   if (!pending) {
     stopLightWatcher(root)
-    pending = import('./mcp-runtime.mjs').then(({ McpProjectRuntime }) => new McpProjectRuntime(root).start())
+    pending = import('./mcp-runtime.mjs').then(({ McpProjectRuntime }) => initialize(new McpProjectRuntime(root, { queryCache: queryCacheFor(root) })))
     runtimes.set(root, pending)
     try { await pending } catch (error) { runtimes.delete(root); throw error }
   }
   return pending
+}
+async function indexRuntime(root) {
+  const active = runtimes.has(root)
+  let result
+  const runtime = await runtimeFor(root, async (created) => {
+    result = await created.index()
+    return created
+  })
+  return active ? runtime.index() : result
 }
 
 const queryEngines = new Map()
@@ -197,6 +244,7 @@ async function queryEngineFor(root) {
   let engine = queryEngines.get(root)
   if (!engine) {
     engine = new DaemonQueryEngine(root, {
+      cache: queryCacheFor(root),
       engineFactory: async () => (await runtimeFor(root)).engine,
       disposeFallback: false,
     })
@@ -272,11 +320,56 @@ call.codegraph_dead = async (a, { signal } = {}) => {
   notes.push('Do NOT delete anything from this list without explicit human approval.')
   return [...notes, ...rows.map((symbol) => `${symbol.file}:${symbol.line}  ${symbol.name}`)].join('\n')
 }
-call.codegraph_index = async (a) => JSON.stringify(await (await runtimeFor(resolveRoot(a))).engine.build())
+call.codegraph_index = async (a) => JSON.stringify(await indexRuntime(resolveRoot(a)))
 
 call.codegraph_refresh = async (a) => {
   const runtime = await runtimeFor(resolveRoot(a))
   return JSON.stringify(await runtime.engine.reconcile())
+}
+call.codegraph_internals = async (a, { signal } = {}) => {
+  const operations = new Set(['map', 'search', 'paths', 'metrics'])
+  if (!operations.has(a?.operation)) throw new Error('operation must be map, search, paths, or metrics')
+  const root = resolveRoot(a)
+  const file = required(a, 'file').split(path.sep).join('/')
+  const absolute = path.resolve(root, file)
+  const relative = path.relative(root, absolute)
+  if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw new Error('file path is outside repository root')
+  const integer = (key, min, max, fallback) => {
+    const value = Object.hasOwn(a, key) ? a[key] : fallback
+    if (!Number.isInteger(value) || value < min || value > max) throw new Error(`${key} must be an integer from ${min} through ${max}`)
+    return value
+  }
+  const limit = integer('limit', 1, 2000, 2000)
+  const exactObject = (value, label, allowed, required = []) => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`${label} must be an object`)
+    const unknownKey = Object.keys(value).find((key) => !allowed.has(key))
+    if (unknownKey) throw new Error(`field ${label}.${unknownKey} is not valid`)
+    for (const key of required) if (!Object.hasOwn(value, key)) throw new Error(`${label}.${key} is required`)
+  }
+  if (a.owner) {
+    exactObject(a.owner, 'owner', new Set(['id', 'symbol', 'line', 'column', 'kind']))
+    const shapes = Number(Object.hasOwn(a.owner, 'id')) + Number(Object.hasOwn(a.owner, 'symbol')) + Number(Object.hasOwn(a.owner, 'kind'))
+    if (shapes !== 1 || Object.hasOwn(a.owner, 'id') && Object.keys(a.owner).length !== 1 || Object.hasOwn(a.owner, 'kind') && (!Object.hasOwn(a.owner, 'line') || !Object.hasOwn(a.owner, 'column'))) throw new Error('owner must use exactly one supported selector shape')
+  }
+  if (a.match) exactObject(a.match, 'match', new Set(['nodeKind', 'edgeKind', 'relationKind', 'role', 'targetSymbolId', 'ancestorKind']))
+  for (const key of ['from', 'to', 'avoid']) if (a[key]) exactObject(a[key], key, new Set(['id', 'nodeKind', 'role', 'symbolId']))
+  if (['map', 'paths', 'metrics'].includes(a.operation) && !a.owner) throw new Error(`owner is required for ${a.operation}`)
+  if (a.operation === 'search' && (!a.match || !Object.keys(a.match).length)) throw new Error('match must be a non-empty object')
+  if (a.operation === 'paths' && (!a.from || !a.to)) throw new Error('from and to are required for paths')
+  const allowed = {
+    map: new Set(['root', 'operation', 'file', 'owner', 'view', 'generation', 'limit']),
+    search: new Set(['root', 'operation', 'file', 'owner', 'match', 'generation', 'limit']),
+    paths: new Set(['root', 'operation', 'file', 'owner', 'from', 'to', 'avoid', 'maxDepth', 'maxPaths', 'generation', 'limit']),
+    metrics: new Set(['root', 'operation', 'file', 'owner', 'metrics', 'generation', 'limit']),
+  }[a.operation]
+  const unknown = Object.keys(a).find((key) => !allowed.has(key))
+  if (unknown) throw new Error(`field ${unknown} is not valid for ${a.operation}`)
+  const request = { type: 'internals', ...a, root: undefined, file, limit }
+  if (a.operation === 'paths') { request.maxDepth = integer('maxDepth', 1, 100, 100); request.maxPaths = integer('maxPaths', 1, 20, 20) }
+  const pinned = await (await queryEngineFor(root)).pinQuery(request, { signal })
+  const rows = await cappedRows(pinned.rows, signal)
+  if (rows.length > limit) throw new Error(`result exceeds requested limit ${limit}; narrow the query`)
+  return [JSON.stringify(pinned.metadata), ...rows.map((row) => JSON.stringify(row))].join('\n')
 }
 call.codegraph_query = async (a, { signal } = {}) => {
   const started = a?.query?.diagnostics === true ? process.hrtime.bigint() : null
@@ -371,6 +464,8 @@ const releaseRoots = async () => {
   queryEngines.clear()
   freshnessChecks.clear()
   await Promise.allSettled([...closing, ...disposing])
+  for (const cache of queryCaches.values()) cache.dispose()
+  queryCaches.clear()
 }
 
 // Run as a worker when the shim hosts one, so a code reload can terminate this thread and free its
@@ -384,6 +479,7 @@ if (parentPort) {
     const confirm = () => parentPort.postMessage({ released: true })
     releaseRoots().then(confirm, confirm)
   })
+  parentPort.postMessage({ ready: true })
 } else {
   process.stdin.on('data', feed)
   process.stdin.on('end', () => releaseRoots())
@@ -405,7 +501,9 @@ let refreshing = null
 const warmDefaultRoot = (context) => {
   if (!DEFAULT_ROOT) return
   try {
-    queryEngineFor(resolveRoot({ root: DEFAULT_ROOT })).catch((error) => process.stderr.write(`codegraph-mcp ${context}: ${error.message}\n`))
+    const root = resolveRoot({ root: DEFAULT_ROOT })
+    if (!diskMatchesGeneration(root, createSourcePolicy(root))) return
+    queryEngineFor(root).catch((error) => process.stderr.write(`codegraph-mcp ${context}: ${error.message}\n`))
   } catch (error) {
     process.stderr.write(`codegraph-mcp ${context}: ${error.message}\n`)
   }

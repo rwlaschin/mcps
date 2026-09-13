@@ -22,3 +22,8 @@ test('visualizer aborts the child query on request or response disconnect', () =
   assert.match(source, /res\.once\('close', abort\)/)
   assert.match(source, /signal: controller\.signal/)
 })
+
+test('architecture contract: MCP exposes internals without replacing existing tool declarations', () => {
+  const source = fs.readFileSync(path.join(import.meta.dirname, '..', 'mcp-server.mjs'), 'utf8')
+  assert.deepEqual({ internals: /codegraph_internals/.test(source), refs: /codegraph_refs/.test(source), deps: /codegraph_deps/.test(source), callers: /codegraph_callers/.test(source), dead: /codegraph_dead/.test(source) }, { internals: true, refs: true, deps: true, callers: true, dead: true })
+})

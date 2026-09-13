@@ -29,9 +29,19 @@ export class DebouncedBuildQueue {
 }
 
 export class McpProjectRuntime {
-  constructor(root, options = {}) { this.root = path.resolve(root); this.engine = options.engine ?? new CodeGraphEngine(this.root, { retainSemanticState: true }); this.debounceMs = options.debounceMs ?? 150; this.onError = options.onError; this.nativeWatch = options.nativeWatch ?? fs.watch; this.fallbackWatch = options.fallbackWatch ?? chokidarWatch; this.watcher = null; this.queue = null; this.registered = new Set(); this.fallbackStarted = false }
+  constructor(root, options = {}) { this.root = path.resolve(root); this.engine = options.engine ?? new CodeGraphEngine(this.root, { ...(options.queryCache ? { queryCache: options.queryCache } : {}) }); this.debounceMs = options.debounceMs ?? 150; this.onError = options.onError; this.nativeWatch = options.nativeWatch ?? fs.watch; this.fallbackWatch = options.fallbackWatch ?? chokidarWatch; this.watcher = null; this.queue = null; this.registered = new Set(); this.fallbackStarted = false }
   async start() {
     await this.engine.reconcile()
+    this.#startWatcher()
+    return this
+  }
+  async index() {
+    const result = await this.engine.build()
+    if (this.queue) this.registered = new Set(this.engine.registeredFiles?.() ?? [])
+    else this.#startWatcher()
+    return result
+  }
+  #startWatcher() {
     this.registered = new Set(this.engine.registeredFiles?.() ?? [])
     this.queue = new DebouncedBuildQueue(async (events) => {
       await this.engine.incremental(events)
@@ -52,7 +62,6 @@ export class McpProjectRuntime {
       this.#report(error)
       this.#startFallback()
     }
-    return this
   }
   #report(error) { Promise.resolve(this.onError?.(error)).catch(() => {}) }
   #startFallback(nativeWatcher) {
@@ -82,6 +91,7 @@ export class McpProjectRuntime {
       watcher.on('add', (file) => this.enqueue('add', file))
       watcher.on('change', (file) => this.enqueue('change', file))
       watcher.on('unlink', (file) => this.enqueue('unlink', file))
+      watcher.once('ready', () => this.engine.reconcile().catch((error) => this.#report(error)))
       watcher.on('error', (error) => this.#report(error))
     } catch (error) { this.#report(error) }
   }
