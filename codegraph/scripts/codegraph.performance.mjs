@@ -315,7 +315,8 @@ export async function runSweep(mcp, root, workloads = WORKLOADS, symbol, warmRef
 const readUpdate = ({ text, ms }) => {
   let result
   try { result = JSON.parse(text) } catch { throw new Error(`update returned invalid JSON: ${text}`) }
-  return { ms, generation: result.generation, parsedFiles: result.parsedFiles?.length ?? 0, validatedFiles: result.validatedFiles?.length ?? 0 }
+  const parsedFiles = result.parsedFiles?.length ?? 0
+  return { ms, generation: result.generation, parsedFiles, validatedFiles: result.validatedFiles?.length ?? parsedFiles }
 }
 
 export const assertReceiptsMatch = (expected, actual) => {
@@ -494,8 +495,10 @@ export const gitValue = (root, args, fallback) => { const result = spawnSync('gi
 export function assertCompleteReport(report) {
   for (const { key } of WORKLOADS) for (const state of STATES) if (!report.benchmarks?.[key]?.[state]) throw new Error(`report is missing ${key} ${state}`)
   for (const update of ['initialIndex', 'leaf', 'cascade', 'fullReindex']) if (!report.updates?.[update]) throw new Error(`report is missing ${update}`)
-  if (!Number.isFinite(report.updates.cascade.parsedFiles)) throw new Error('cascade parsed-file count is missing')
-  if (!Number.isFinite(report.updates.cascade.validatedFiles)) throw new Error('cascade validated-file count is missing')
+  for (const update of ['initialIndex', 'cascade', 'fullReindex']) {
+    if (!Number.isFinite(report.updates[update].parsedFiles)) throw new Error(`${update} parsed-file count is missing`)
+    if (!Number.isFinite(report.updates[update].validatedFiles)) throw new Error(`${update} validated-file count is missing`)
+  }
   if (!report.correctness?.consistent) throw new Error('semantic output is not consistent; output drifted')
   if (!report.correctness?.originalRepositoryUnchanged) throw new Error('original repository is not unchanged; mutation detected')
   if (!report.correctness?.cleanShutdown) throw new Error('MCP shutdown was not clean')
@@ -525,7 +528,7 @@ export async function captureReport(options, { snapshot = resolvePerformanceSnap
       cascade: summarizeSamples(samples.map((sample) => sample.updates.cascade.ms)),
       fullReindex: summarizeSamples(samples.map((sample) => sample.updates.fullReindex.ms)),
     }
-    for (const key of ['leaf', 'cascade']) {
+    for (const key of ['initialIndex', 'leaf', 'cascade', 'fullReindex']) {
       updates[key].parsedFiles = Math.max(...samples.map((sample) => sample.updates[key].parsedFiles))
       updates[key].validatedFiles = Math.max(...samples.map((sample) => sample.updates[key].validatedFiles))
     }
@@ -542,10 +545,10 @@ export function renderMarkdown(report) {
     '', '## Metrics', '', '| Operation | Indexed | Leaf update | Cascade update |', '| :--- | ---: | ---: | ---: |',
     ...WORKLOADS.map(({ key, label }) => `| ${label} | ${formatPair(report.benchmarks[key].indexed)} | ${formatPair(report.benchmarks[key].leaf)} | ${formatPair(report.benchmarks[key].cascade)} |`),
     '', '| Update | p50 / p90 | Parsed files | Validated files |', '| :--- | ---: | ---: | ---: |',
-    `| CLI cold index | ${formatPair(report.updates.initialIndex)} | — | — |`,
+    `| CLI cold index | ${formatPair(report.updates.initialIndex)} | ${report.updates.initialIndex.parsedFiles} | ${report.updates.initialIndex.validatedFiles} |`,
     `| Leaf incremental update | ${formatPair(report.updates.leaf)} | ${report.updates.leaf.parsedFiles} | ${report.updates.leaf.validatedFiles} |`,
     `| Cascade incremental update | ${formatPair(report.updates.cascade)} | ${report.updates.cascade.parsedFiles} | ${report.updates.cascade.validatedFiles} |`,
-    `| Full reindex | ${formatPair(report.updates.fullReindex)} | — | — |`,
+    `| Full reindex | ${formatPair(report.updates.fullReindex)} | ${report.updates.fullReindex.parsedFiles} | ${report.updates.fullReindex.validatedFiles} |`,
   ]
   return `${rows.join('\n')}\n`
 }

@@ -23,10 +23,10 @@ const completeReport = {
     cyclo: { indexed: { n: 5, p50Ms: 22.11, p90Ms: 22.91 }, leaf: { n: 5, p50Ms: 23.12, p90Ms: 23.92 }, cascade: { n: 5, p50Ms: 24.13, p90Ms: 24.93 } },
   },
   updates: {
-    initialIndex: { n: 5, p50Ms: 101.1, p90Ms: 109.9 },
+    initialIndex: { n: 5, p50Ms: 101.1, p90Ms: 109.9, parsedFiles: 863, validatedFiles: 863 },
     leaf: { n: 5, p50Ms: 12.3, p90Ms: 18.7, parsedFiles: 1, validatedFiles: 1 },
     cascade: { n: 5, p50Ms: 52.4, p90Ms: 68.8, parsedFiles: 37, validatedFiles: 214 },
-    fullReindex: { n: 5, p50Ms: 111.1, p90Ms: 119.9 },
+    fullReindex: { n: 5, p50Ms: 111.1, p90Ms: 119.9, parsedFiles: 863, validatedFiles: 863 },
   },
   correctness: { consistent: true, originalRepositoryUnchanged: true, cleanShutdown: true },
 }
@@ -340,10 +340,10 @@ test('domain analysis: initial index timing performs exactly one cold tool build
   assert.deepEqual({ calls, result }, { calls: [['tool.mjs build', '/mirror']], result: { generation: 'indexed-generation', parsedFiles: 863, validatedFiles: 863, ms: 1250 } })
 })
 
-test('domain analysis: cold build invokes tool.mjs build once and parses its update receipt', async () => {
+test('domain analysis: cold build treats parsed full-build files as validated when the receipt omits validated files', async () => {
   const calls = []
   const result = await benchmark.buildOnce('/mirror', {
-    run: (command, args, options) => { calls.push({ command, args, cwd: options.cwd, timeout: options.timeout }); return { status: 0, stdout: '{"generation":"g1","parsedFiles":["a.ts"],"validatedFiles":["a.ts"]}\n', stderr: '' } },
+    run: (command, args, options) => { calls.push({ command, args, cwd: options.cwd, timeout: options.timeout }); return { status: 0, stdout: '{"generation":"g1","parsedFiles":["a.ts"]}\n', stderr: '' } },
     clock: (() => { const times = [100, 145]; return () => times.shift() })(),
     timeoutMs: 500,
   })
@@ -737,8 +737,8 @@ test('domain analysis: captureReport aggregates independent lifecycles from one 
     cyclo: { ms: 27, sha256: 'cyclo' },
   }
   const samples = [
-    { root: '/mirror/persistent', sourceFiles: 863, sweeps: { indexed: firstSweep, leaf: firstSweep, cascade: firstSweep }, updates: { initialIndex: { ms: 100 }, leaf: { ms: 30, parsedFiles: 1, validatedFiles: 1 }, cascade: { ms: 40, parsedFiles: 2, validatedFiles: 10 }, fullReindex: { ms: 110 } } },
-    { root: '/mirror/persistent', sourceFiles: 863, sweeps: { indexed: secondSweep, leaf: secondSweep, cascade: secondSweep }, updates: { initialIndex: { ms: 200 }, leaf: { ms: 35, parsedFiles: 2, validatedFiles: 2 }, cascade: { ms: 45, parsedFiles: 3, validatedFiles: 20 }, fullReindex: { ms: 210 } } },
+    { root: '/mirror/persistent', sourceFiles: 863, sweeps: { indexed: firstSweep, leaf: firstSweep, cascade: firstSweep }, updates: { initialIndex: { ms: 100, parsedFiles: 863, validatedFiles: 863 }, leaf: { ms: 30, parsedFiles: 1, validatedFiles: 1 }, cascade: { ms: 40, parsedFiles: 2, validatedFiles: 10 }, fullReindex: { ms: 110, parsedFiles: 863, validatedFiles: 863 } } },
+    { root: '/mirror/persistent', sourceFiles: 863, sweeps: { indexed: secondSweep, leaf: secondSweep, cascade: secondSweep }, updates: { initialIndex: { ms: 200, parsedFiles: 864, validatedFiles: 864 }, leaf: { ms: 35, parsedFiles: 2, validatedFiles: 2 }, cascade: { ms: 45, parsedFiles: 3, validatedFiles: 20 }, fullReindex: { ms: 210, parsedFiles: 864, validatedFiles: 864 } } },
   ]
 
   let captures = 0
@@ -749,7 +749,7 @@ test('domain analysis: captureReport aggregates independent lifecycles from one 
 
   assert.deepEqual(
     { captures, mirror: report.provenance.root, refs: report.benchmarks.refs.indexed, initialIndex: report.updates.initialIndex, leaf: report.updates.leaf, cascade: report.updates.cascade, fullReindex: report.updates.fullReindex },
-    { captures: 2, mirror: '/mirror/persistent', refs: { n: 2, p50Ms: 10, p90Ms: 20 }, initialIndex: { n: 2, p50Ms: 100, p90Ms: 200 }, leaf: { n: 2, p50Ms: 30, p90Ms: 35, parsedFiles: 2, validatedFiles: 2 }, cascade: { n: 2, p50Ms: 40, p90Ms: 45, parsedFiles: 3, validatedFiles: 20 }, fullReindex: { n: 2, p50Ms: 110, p90Ms: 210 } },
+    { captures: 2, mirror: '/mirror/persistent', refs: { n: 2, p50Ms: 10, p90Ms: 20 }, initialIndex: { n: 2, p50Ms: 100, p90Ms: 200, parsedFiles: 864, validatedFiles: 864 }, leaf: { n: 2, p50Ms: 30, p90Ms: 35, parsedFiles: 2, validatedFiles: 2 }, cascade: { n: 2, p50Ms: 40, p90Ms: 45, parsedFiles: 3, validatedFiles: 20 }, fullReindex: { n: 2, p50Ms: 110, p90Ms: 210, parsedFiles: 864, validatedFiles: 864 } },
   )
   fs.rmSync(root, { recursive: true, force: true })
 })
@@ -770,7 +770,7 @@ test('error guessing: source edits after the frozen snapshot do not invalidate i
     fs.writeFileSync(path.join(root, 'src', 'types', 'index.ts'), 'Shared')
   }
   const sweep = Object.fromEntries(benchmark.WORKLOADS.map(({ key }) => [key, { ms: 1, sha256: `${key}-stable` }]))
-  const sample = { root: snapshotRoot, sourceFiles: 5, sweeps: { indexed: sweep, leaf: sweep, cascade: sweep }, updates: { initialIndex: { ms: 10 }, leaf: { ms: 2, parsedFiles: 1, validatedFiles: 1 }, cascade: { ms: 3, parsedFiles: 1, validatedFiles: 2 }, fullReindex: { ms: 9 } } }
+  const sample = { root: snapshotRoot, sourceFiles: 5, sweeps: { indexed: sweep, leaf: sweep, cascade: sweep }, updates: { initialIndex: { ms: 10, parsedFiles: 5, validatedFiles: 5 }, leaf: { ms: 2, parsedFiles: 1, validatedFiles: 1 }, cascade: { ms: 3, parsedFiles: 1, validatedFiles: 2 }, fullReindex: { ms: 9, parsedFiles: 5, validatedFiles: 5 } } }
 
   const report = await benchmark.captureReport({ root: sourceRoot, samples: 1 }, {
     snapshot: async (_root, options) => { assert.equal(options.refresh, false); return snapshotRoot },
@@ -870,7 +870,7 @@ test('domain analysis: a successful report releases its repository snapshot lock
     queryNamed: { ms: 1, sha256: 'queryNamed' }, queryCapped: { ms: 1, sha256: 'queryCapped' }, querySingle: { ms: 1, sha256: 'querySingle' },
     cyclo: { ms: 1, sha256: 'cyclo' },
   }
-  const sample = { root, sourceFiles: 5, sweeps: { indexed: sweep, leaf: sweep, cascade: sweep }, updates: { initialIndex: { ms: 10 }, leaf: { ms: 2, parsedFiles: 1, validatedFiles: 1 }, cascade: { ms: 3, parsedFiles: 1, validatedFiles: 2 }, fullReindex: { ms: 9 } } }
+  const sample = { root, sourceFiles: 5, sweeps: { indexed: sweep, leaf: sweep, cascade: sweep }, updates: { initialIndex: { ms: 10, parsedFiles: 5, validatedFiles: 5 }, leaf: { ms: 2, parsedFiles: 1, validatedFiles: 1 }, cascade: { ms: 3, parsedFiles: 1, validatedFiles: 2 }, fullReindex: { ms: 9, parsedFiles: 5, validatedFiles: 5 } } }
   const first = await benchmark.captureReport({ root, samples: 1 }, { lock, snapshot: async () => root, capture: async () => [sample] })
   const secondMessage = await benchmark.captureReport({ root, samples: 1 }, { lock,
     snapshot: async () => { throw new Error('second acquired released lock') },
@@ -987,12 +987,12 @@ test('combinatorial analysis: renders every operation and state as p50 / p90 mil
   assert.match(markdown, /\| Cyclomatic complexity \| 22\.11 \/ 22\.91 ms \| 23\.12 \/ 23\.92 ms \| 24\.13 \/ 24\.93 ms \|/)
 })
 
-test('domain analysis: renders update latency separately and exposes cascade work counts', () => {
+test('domain analysis: renders update latency separately and exposes work counts', () => {
   const markdown = benchmark.renderMarkdown(completeReport)
-  assert.match(markdown, /\| CLI cold index \| 101\.10 \/ 109\.90 ms \|/)
+  assert.match(markdown, /\| CLI cold index \| 101\.10 \/ 109\.90 ms \| 863 \| 863 \|/)
   assert.match(markdown, /\| Leaf incremental update \| 12\.30 \/ 18\.70 ms \| 1 \| 1 \|/)
   assert.match(markdown, /\| Cascade incremental update \| 52\.40 \/ 68\.80 ms \| 37 \| 214 \|/)
-  assert.match(markdown, /\| Full reindex \| 111\.10 \/ 119\.90 ms \|/)
+  assert.match(markdown, /\| Full reindex \| 111\.10 \/ 119\.90 ms \| 863 \| 863 \|/)
 })
 
 test('domain analysis: Markdown does not mislabel the CLI build as a production-runtime initial index', () => {

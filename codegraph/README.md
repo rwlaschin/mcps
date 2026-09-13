@@ -255,10 +255,10 @@ CodeGraph was tested against the 877-source-file D&D Community and Marketplace p
 
 | Update | p50 / p90 | Parsed files | Validated files |
 | :--- | ---: | ---: | ---: |
-| CLI cold index | 20429.80 / 39933.92 ms | — | — |
+| CLI cold index | 20429.80 / 39933.92 ms | 877 | 877 |
 | Leaf incremental update | 1153.89 / 1476.76 ms | 1 | 1 |
 | Cascade incremental update | 10233.90 / 13029.95 ms | 1 | 395 |
-| Full reindex | 25927.54 / 43766.40 ms | — | — |
+| Full reindex | 25927.54 / 43766.40 ms | 877 | 877 |
 <!-- codegraph-performance:end -->
 
 ### Updating Performance Metrics
