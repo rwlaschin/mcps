@@ -13,6 +13,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { Worker } from 'node:worker_threads'
 import { ensureNativeMmap } from './native/build-optional.mjs'
+import { deriveWorkerProfile } from './worker-profile.mjs'
 
 const dir = process.env.NODE_COMPILE_CACHE || path.join(os.tmpdir(), 'codegraph-compile-cache')
 process.env.NODE_COMPILE_CACHE = dir
@@ -27,9 +28,11 @@ const body = new URL('./mcp-server.mjs', import.meta.url)
 let server = null
 let serverReady = Promise.resolve()
 let held = ''
+let serverProfileId = 0
 
 const spawn = () => {
-  server = new Worker(body)
+  const profileLabel = ++serverProfileId === 1 ? 'server' : `server-${serverProfileId}`
+  server = new Worker(body, { execArgv: deriveWorkerProfile(process.execArgv, profileLabel).execArgv })
   const worker = server
   serverReady = new Promise((resolve) => {
     const ready = (message) => { if (message?.ready) { worker.off('message', ready); resolve() } }

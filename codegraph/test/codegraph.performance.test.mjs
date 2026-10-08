@@ -7,26 +7,24 @@ import { EventEmitter } from 'node:events'
 import test from 'node:test'
 
 import * as benchmark from '../scripts/codegraph.performance.mjs'
-import { GraphStore } from '../store.mjs'
+import * as parserPoolModule from '../parser-apartment-pool.mjs'
 
 const completeReport = {
   schemaVersion: 2,
   provenance: { root: '/private/tmp/codegraph-performance/dnd-community-and-marketplace', sourceRoot: '/repos/dnd-community-and-marketplace', repository: 'dnd-community-and-marketplace', sourceFiles: 863, commit: '0123456789abcdef' },
   benchmarks: {
-    refs: { indexed: { n: 5, p50Ms: 1.11, p90Ms: 1.91 }, leaf: { n: 5, p50Ms: 2.12, p90Ms: 2.92 }, cascade: { n: 5, p50Ms: 3.13, p90Ms: 3.93 } },
-    deps: { indexed: { n: 5, p50Ms: 4.11, p90Ms: 4.91 }, leaf: { n: 5, p50Ms: 5.12, p90Ms: 5.92 }, cascade: { n: 5, p50Ms: 6.13, p90Ms: 6.93 } },
-    callers: { indexed: { n: 5, p50Ms: 7.11, p90Ms: 7.91 }, leaf: { n: 5, p50Ms: 8.12, p90Ms: 8.92 }, cascade: { n: 5, p50Ms: 9.13, p90Ms: 9.93 } },
-    dead: { indexed: { n: 5, p50Ms: 10.11, p90Ms: 10.91 }, leaf: { n: 5, p50Ms: 11.12, p90Ms: 11.92 }, cascade: { n: 5, p50Ms: 12.13, p90Ms: 12.93 } },
-    queryNamed: { indexed: { n: 5, p50Ms: 13.11, p90Ms: 13.91 }, leaf: { n: 5, p50Ms: 14.12, p90Ms: 14.92 }, cascade: { n: 5, p50Ms: 15.13, p90Ms: 15.93 } },
-    queryCapped: { indexed: { n: 5, p50Ms: 16.11, p90Ms: 16.91 }, leaf: { n: 5, p50Ms: 17.12, p90Ms: 17.92 }, cascade: { n: 5, p50Ms: 18.13, p90Ms: 18.93 } },
-    querySingle: { indexed: { n: 5, p50Ms: 19.11, p90Ms: 19.91 }, leaf: { n: 5, p50Ms: 20.12, p90Ms: 20.92 }, cascade: { n: 5, p50Ms: 21.13, p90Ms: 21.93 } },
-    cyclo: { indexed: { n: 5, p50Ms: 22.11, p90Ms: 22.91 }, leaf: { n: 5, p50Ms: 23.12, p90Ms: 23.92 }, cascade: { n: 5, p50Ms: 24.13, p90Ms: 24.93 } },
+    refs: { indexed: { n: 1, p50Ms: 1.11, p90Ms: 1.11 }, updated: { n: 5, p50Ms: 2.12, p90Ms: 2.92 } },
+    deps: { indexed: { n: 1, p50Ms: 4.11, p90Ms: 4.11 }, updated: { n: 5, p50Ms: 5.12, p90Ms: 5.92 } },
+    callers: { indexed: { n: 1, p50Ms: 7.11, p90Ms: 7.11 }, updated: { n: 5, p50Ms: 8.12, p90Ms: 8.92 } },
+    dead: { indexed: { n: 1, p50Ms: 10.11, p90Ms: 10.11 }, updated: { n: 5, p50Ms: 11.12, p90Ms: 11.92 } },
+    queryNamed: { indexed: { n: 1, p50Ms: 13.11, p90Ms: 13.11 }, updated: { n: 5, p50Ms: 14.12, p90Ms: 14.92 } },
+    queryCapped: { indexed: { n: 1, p50Ms: 16.11, p90Ms: 16.11 }, updated: { n: 5, p50Ms: 17.12, p90Ms: 17.92 } },
+    querySingle: { indexed: { n: 1, p50Ms: 19.11, p90Ms: 19.11 }, updated: { n: 5, p50Ms: 20.12, p90Ms: 20.92 } },
+    cyclo: { indexed: { n: 1, p50Ms: 22.11, p90Ms: 22.11 }, updated: { n: 5, p50Ms: 23.12, p90Ms: 23.92 } },
   },
   updates: {
-    initialIndex: { n: 5, p50Ms: 101.1, p90Ms: 109.9, parsedFiles: 863, validatedFiles: 863 },
-    leaf: { n: 5, p50Ms: 12.3, p90Ms: 18.7, parsedFiles: 1, validatedFiles: 1 },
-    cascade: { n: 5, p50Ms: 52.4, p90Ms: 68.8, parsedFiles: 37, validatedFiles: 214 },
-    fullReindex: { n: 5, p50Ms: 111.1, p90Ms: 119.9, parsedFiles: 863, validatedFiles: 863 },
+    initialIndex: { n: 1, p50Ms: 101.1, p90Ms: 101.1, parsedFiles: 863, validatedFiles: 863 },
+    update: { n: 5, p50Ms: 12.3, p90Ms: 18.7, parsedFiles: 1, validatedFiles: 1 },
   },
   correctness: { consistent: true, originalRepositoryUnchanged: true, cleanShutdown: true },
 }
@@ -62,43 +60,30 @@ const runSemanticQueries = (enabled) => {
   return spawnSync(process.execPath, ['-e', semanticQueryDriver], { cwd: path.resolve(import.meta.dirname, '..'), env, encoding: 'utf8', timeout: 20_000 })
 }
 
-test('domain analysis: cold complete-edge materialization and warm references lookup have separate timings without changing receipts', () => {
-  const disabled = runSemanticQueries(false)
-  const enabled = runSemanticQueries(true)
-  const records = enabled.stderr.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line)).filter(({ event, operation }) => event === 'Main Semantic Timing Summary' && operation === 'refs')
-
-  assert.deepEqual(
-    {
-      disabledStatus: disabled.status,
-      enabledStatus: enabled.status,
-      disabledReceipt: disabled.stdout,
-      enabledReceipt: enabled.stdout,
-      summaries: records.map((record) => ({
-        cache: record.cache,
-        completeEdgeMaterializationIsFinite: Number.isFinite(record.completeEdgeMaterializationMs) && record.completeEdgeMaterializationMs >= 0,
-        refsLookupIsFinite: Number.isFinite(record.refsLookupMs) && record.refsLookupMs >= 0,
-        distinctFields: Object.hasOwn(record, 'completeEdgeMaterializationMs') && Object.hasOwn(record, 'refsLookupMs'),
-      })),
-    },
-    {
-      disabledStatus: 0,
-      enabledStatus: 0,
-      disabledReceipt: '{"cold":[{"from":"b","to":"a","call":false,"line":2}],"warm":[{"from":"b","to":"a","call":false,"line":2}]}',
-      enabledReceipt: '{"cold":[{"from":"b","to":"a","call":false,"line":2}],"warm":[{"from":"b","to":"a","call":false,"line":2}]}',
-      summaries: [
-        { cache: 'cold', completeEdgeMaterializationIsFinite: true, refsLookupIsFinite: true, distinctFields: true },
-        { cache: 'warm', completeEdgeMaterializationIsFinite: true, refsLookupIsFinite: true, distinctFields: true },
-      ],
-    },
-  )
-})
-
 test('equivalence partition: rejects a missing repository root', () => {
   assert.throws(() => benchmark.parseArgs([]), /--root/)
 })
 
 test('equivalence partition: rejects an empty repository root', () => {
   assert.throws(() => benchmark.parseArgs(['--root', '']), /--root/)
+})
+
+test('domain analysis: omitting profiling selectors preserves the existing lifecycle options', () => {
+  assert.deepEqual(
+    benchmark.parseArgs(['--root', '/repos/dnd-community-and-marketplace']),
+    { root: '/repos/dnd-community-and-marketplace', samples: 5, json: undefined, markdown: undefined, readme: undefined },
+  )
+})
+
+test('domain analysis: watcher update preserves sorted exact parsed and validated file sets beside their counts', async () => {
+  const result = await benchmark.measureWatcherUpdate({
+    root: '/mirror', state: 'unchanged-surface', previousGeneration: 'g1', phase: 'unchanged-surface incremental update', timeoutMs: 100,
+    mutate: () => {},
+    readMetadata: async () => ({ generation: 'g2', status: 'validated', parsedFiles: ['src/z.ts', 'src/a.ts'], validatedFiles: ['src/z.ts', 'src/m.ts', 'src/a.ts'] }),
+    clock: (() => { const times = [10, 18]; return () => times.shift() })(),
+  })
+
+  assert.deepEqual(result, { ms: 8, generation: 'g2', parsedFiles: 2, validatedFiles: 3, parsedFileSet: ['src/a.ts', 'src/z.ts'], validatedFileSet: ['src/a.ts', 'src/m.ts', 'src/z.ts'] })
 })
 
 test('domain analysis: the documented symbol targets reference and named-symbol requests while location-only reference receipts remain valid', async () => {
@@ -244,10 +229,6 @@ test('domain analysis: declares the eight exact production workload requests', (
   ])
 })
 
-test('performance contract: workloads include cold and warm internal map, search, path, and metric queries', () => {
-  assert.deepEqual(benchmark.WORKLOADS.filter(({ key }) => key.startsWith('internal')).map(({ key }) => key), ['internalMapCold', 'internalMapWarm', 'internalSearchCold', 'internalSearchWarm', 'internalPathsCold', 'internalPathsWarm', 'internalMetricsCold', 'internalMetricsWarm'])
-})
-
 test('domain analysis: strips only the leading freshness metadata line from semantic receipts', () => {
   assert.equal(
     benchmark.normalizeSemanticReceipt('generation: first\nuseSessionEvent\ngeneration: semantic content'),
@@ -269,22 +250,6 @@ test('domain analysis: rejects an unchanged validated generation after refresh',
 
 test('equivalence partition: rejects a missing current validated generation', () => {
   assert.throws(() => benchmark.assertGenerationAdvanced('generation-a', ''), /generation.*advance|unchanged/i)
-})
-
-test('boundary analysis: rejects cascade validation of one file', () => {
-  assert.throws(() => benchmark.assertCascadeValidation(1), /cascade|two|2/i)
-})
-
-test('boundary analysis: accepts cascade validation of two files', () => {
-  assert.doesNotThrow(() => benchmark.assertCascadeValidation(2))
-})
-
-test('equivalence partition: accepts an array containing two cascade-validated files', () => {
-  assert.doesNotThrow(() => benchmark.assertCascadeValidation(['src/types/index.ts', 'src/query/event.ts']))
-})
-
-test('equivalence partition: rejects a non-integer cascade validation count', () => {
-  assert.throws(() => benchmark.assertCascadeValidation('2'), /cascade|two|2/i)
 })
 
 test('equivalence partition: rejects an empty endpoint-specific receipt', () => {
@@ -330,42 +295,6 @@ test('equivalence partition: clears the timeout after an operation resolves', as
   assert.equal(await benchmark.withTimeout(Promise.resolve('finished'), 100, 'operation'), 'finished')
 })
 
-test('domain analysis: initial index timing performs exactly one cold tool build before runtime queries', async () => {
-  const calls = []
-
-  const result = await benchmark.measureColdBuild('/mirror', {
-    build: async (root) => { calls.push(['tool.mjs build', root]); return { generation: 'indexed-generation', parsedFiles: 863, validatedFiles: 863, ms: 1250 } },
-  })
-
-  assert.deepEqual({ calls, result }, { calls: [['tool.mjs build', '/mirror']], result: { generation: 'indexed-generation', parsedFiles: 863, validatedFiles: 863, ms: 1250 } })
-})
-
-test('domain analysis: cold build treats parsed full-build files as validated when the receipt omits validated files', async () => {
-  const calls = []
-  const result = await benchmark.buildOnce('/mirror', {
-    run: (command, args, options) => { calls.push({ command, args, cwd: options.cwd, timeout: options.timeout }); return { status: 0, stdout: '{"generation":"g1","parsedFiles":["a.ts"]}\n', stderr: '' } },
-    clock: (() => { const times = [100, 145]; return () => times.shift() })(),
-    timeoutMs: 500,
-  })
-
-  assert.deepEqual(
-    { callCount: calls.length, args: calls[0].args.slice(-3), timeout: calls[0].timeout, result },
-    { callCount: 1, args: ['build', '--root', '/mirror'], timeout: 500, result: { ms: 45, generation: 'g1', parsedFiles: 1, validatedFiles: 1 } },
-  )
-})
-
-test('error guessing: cold build propagates a process launch error', async () => {
-  await assert.rejects(benchmark.buildOnce('/mirror', { run: () => ({ error: new Error('spawn denied') }), clock: () => 0 }), /spawn denied/)
-})
-
-test('error guessing: cold build reports a nonzero exit and stderr', async () => {
-  await assert.rejects(benchmark.buildOnce('/mirror', { run: () => ({ status: 2, signal: null, stdout: '', stderr: 'build broke' }), clock: () => 0 }), /cold build failed \(2\): build broke/)
-})
-
-test('error guessing: cold build reports a terminating signal when no status exists', async () => {
-  await assert.rejects(benchmark.buildOnce('/mirror', { run: () => ({ status: null, signal: 'SIGKILL', stdout: '', stderr: 'killed' }), clock: () => 0 }), /cold build failed \(SIGKILL\): killed/)
-})
-
 test('domain analysis: leaf update timing starts at mutation and ends when watcher metadata publishes a new validated generation', async () => {
   const events = []
   const metadata = [
@@ -384,7 +313,7 @@ test('domain analysis: leaf update timing starts at mutation and ends when watch
 
   assert.deepEqual(
     { events, result },
-    { events: ['mutate leaf', 'poll metadata', 'wait', 'poll metadata', 'wait', 'poll metadata'], result: { ms: 25, generation: 'generation-b', parsedFiles: 1, validatedFiles: 1 } },
+    { events: ['mutate leaf', 'poll metadata', 'wait', 'poll metadata', 'wait', 'poll metadata'], result: { ms: 25, generation: 'generation-b', parsedFiles: 1, validatedFiles: 1, parsedFileSet: ['leaf.ts'], validatedFileSet: ['leaf.ts'] } },
   )
 })
 
@@ -401,51 +330,22 @@ test('performance contract: leaf update timing includes the first complete-refer
 
   assert.deepEqual(
     { events, result },
-    { events: ['mutate leaf', 'validated publication', 'complete refs query'], result: { ms: 40, generation: 'generation-b', parsedFiles: 1, validatedFiles: 1 } },
+    { events: ['mutate leaf', 'validated publication', 'complete refs query'], result: { ms: 40, generation: 'generation-b', parsedFiles: 1, validatedFiles: 1, parsedFileSet: ['leaf.ts'], validatedFileSet: ['leaf.ts'] } },
   )
 })
 
-test('domain analysis: cascade watcher timing waits for validated publication without calling explicit refresh', async () => {
+test('domain analysis: changed-surface watcher timing waits for one-file validated publication without calling explicit refresh', async () => {
   const calls = []
 
   await benchmark.measureWatcherUpdate({
     root: '/mirror', state: 'cascade', previousGeneration: 'generation-leaf', phase: 'cascade incremental update', timeoutMs: 100,
     mutate: () => calls.push('mutate cascade'),
-    readMetadata: async () => { calls.push('poll metadata'); return { generation: 'generation-cascade', status: 'validated', parsedFiles: ['types.ts'], validatedFiles: ['types.ts', 'dependent.ts'] } },
+    readMetadata: async () => { calls.push('poll metadata'); return { generation: 'generation-cascade', status: 'validated', parsedFiles: ['types.ts'], validatedFiles: ['types.ts'] } },
     wait: async () => calls.push('wait'),
     clock: (() => { const times = [50, 90]; return () => times.shift() })(),
   })
 
   assert.deepEqual(calls, ['mutate cascade', 'poll metadata'])
-})
-
-test('error guessing: watcher publication timeout names the incremental phase', async () => {
-  let polls = 0
-  await assert.rejects(
-    benchmark.measureWatcherUpdate({
-      root: '/mirror', state: 'cascade', previousGeneration: 'generation-a', phase: 'cascade incremental update', timeoutMs: 1,
-      mutate: () => {},
-      readMetadata: async () => { polls += 1; return polls === 1 ? { generation: 'generation-a', status: 'validated' } : { generation: 'generation-b', status: 'validated' } },
-      wait: async () => new Promise((resolve) => setTimeout(resolve, 2)),
-      clock: () => 0,
-    }),
-    /cascade incremental update.*timed out/i,
-  )
-})
-
-test('equivalence partition: watcher update defaults mutate the leaf and poll until publication', async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-performance-watcher-defaults-'))
-  fs.mkdirSync(path.join(root, 'src', 'utils'), { recursive: true })
-  fs.writeFileSync(path.join(root, 'src', 'utils', 'plotSameSelectedItem.ts'), 'export const leaf = true\n')
-  let polls = 0
-
-  const result = await benchmark.measureWatcherUpdate({
-    root, state: 'leaf', previousGeneration: 'generation-a', phase: 'leaf incremental update', timeoutMs: 100,
-    readMetadata: async () => { polls += 1; return polls === 1 ? { generation: 'generation-a', status: 'validated' } : { validatedGeneration: 'generation-b', freshness: 'validated', parsedFiles: 1, validatedFiles: 1 } },
-  })
-
-  assert.deepEqual({ generation: result.generation, parsedFiles: result.parsedFiles, validatedFiles: result.validatedFiles, mutated: fs.readFileSync(path.join(root, 'src', 'utils', 'plotSameSelectedItem.ts'), 'utf8') }, { generation: 'generation-b', parsedFiles: 1, validatedFiles: 1, mutated: 'export const leaf = true\n// codegraph performance benchmark\n' })
-  fs.rmSync(root, { recursive: true, force: true })
 })
 
 test('equivalence partition: watcher metadata reports the unchanged generation without reading manifests', () => {
@@ -457,81 +357,72 @@ test('equivalence partition: watcher metadata reports the unchanged generation w
   fs.rmSync(root, { recursive: true, force: true })
 })
 
-test('domain analysis: watcher metadata computes cascade parsed files and reverse-dependent closure', () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-performance-watcher-cascade-'))
+test('domain analysis: watcher metadata returns the exact work sets persisted by the validated generation', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-performance-watcher-authoritative-'))
   const cache = path.join(root, '.codegraph')
   fs.mkdirSync(path.join(cache, 'generations'), { recursive: true })
-  fs.mkdirSync(path.join(cache, 'partitions'))
   fs.writeFileSync(path.join(cache, 'CURRENT'), 'generation-b\n')
-  fs.writeFileSync(path.join(cache, 'generations', 'generation-a.json'), '{"partitions":{"src/dependent.ts":"p1","src/transitive.ts":"p2"},"sources":{"src/types/index.ts":"old","src/dependent.ts":"same","src/transitive.ts":"same"}}')
-  fs.writeFileSync(path.join(cache, 'generations', 'generation-b.json'), '{"partitions":{},"sources":{"src/types/index.ts":"new","src/dependent.ts":"same","src/transitive.ts":"same"}}')
-  fs.writeFileSync(path.join(cache, 'partitions', 'p1.json'), '{"dependencies":["src/types/index.ts"]}')
-  fs.writeFileSync(path.join(cache, 'partitions', 'p2.json'), '{"dependencies":["src/dependent.ts"]}')
-
-  const metadata = benchmark.watcherMetadata(root, 'generation-a', 'cascade')
-
-  assert.deepEqual(metadata, { generation: 'generation-b', status: 'validated', parsedFiles: ['src/types/index.ts'], validatedFiles: ['src/types/index.ts', 'src/dependent.ts', 'src/transitive.ts'] })
-  fs.rmSync(root, { recursive: true, force: true })
-})
-
-test('storage compatibility: watcher metadata reads packed partitions through GraphStore and computes cascade importer closure', () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-performance-watcher-packed-'))
-  const cache = path.join(root, '.codegraph')
-  const store = new GraphStore(root)
-  store.initialize()
-  const dependent = store.writePartition({ file: 'src/dependent.ts', sourceHash: 'dependent-source', symbols: [], edges: [], dependencies: ['src/types/index.ts'], unresolved: [] })
-  const transitive = store.writePartition({ file: 'src/transitive.ts', sourceHash: 'transitive-source', symbols: [], edges: [], dependencies: ['src/dependent.ts'], unresolved: [] })
-  fs.writeFileSync(path.join(cache, 'CURRENT'), 'generation-b\n')
-  fs.writeFileSync(path.join(cache, 'generations', 'generation-a.json'), JSON.stringify({ partitions: { 'src/dependent.ts': dependent, 'src/transitive.ts': transitive }, sources: { 'src/types/index.ts': 'old', 'src/dependent.ts': 'same', 'src/transitive.ts': 'same' } }))
-  fs.writeFileSync(path.join(cache, 'generations', 'generation-b.json'), JSON.stringify({ partitions: {}, sources: { 'src/types/index.ts': 'new', 'src/dependent.ts': 'same', 'src/transitive.ts': 'same' } }))
-
-  const metadata = benchmark.watcherMetadata(root, 'generation-a', 'cascade')
-
-  assert.deepEqual(metadata, { generation: 'generation-b', status: 'validated', parsedFiles: ['src/types/index.ts'], validatedFiles: ['src/types/index.ts', 'src/dependent.ts', 'src/transitive.ts'] })
-  fs.rmSync(root, { recursive: true, force: true })
-})
-
-test('domain analysis: watcher metadata computes leaf work when partitions omit dependency arrays', () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-performance-watcher-leaf-'))
-  const cache = path.join(root, '.codegraph')
-  fs.mkdirSync(path.join(cache, 'generations'), { recursive: true })
-  fs.mkdirSync(path.join(cache, 'partitions'))
-  fs.writeFileSync(path.join(cache, 'CURRENT'), 'generation-b\n')
-  fs.writeFileSync(path.join(cache, 'generations', 'generation-a.json'), '{"partitions":{"src/unrelated.ts":"p1"},"sources":{"src/utils/plotSameSelectedItem.ts":"old","src/unrelated.ts":"same"}}')
-  fs.writeFileSync(path.join(cache, 'generations', 'generation-b.json'), '{"partitions":{},"sources":{"src/utils/plotSameSelectedItem.ts":"new","src/unrelated.ts":"same"}}')
-  fs.writeFileSync(path.join(cache, 'partitions', 'p1.json'), '{}')
-
-  const metadata = benchmark.watcherMetadata(root, 'generation-a', 'leaf')
-
-  assert.deepEqual(metadata, { generation: 'generation-b', status: 'validated', parsedFiles: ['src/utils/plotSameSelectedItem.ts'], validatedFiles: ['src/utils/plotSameSelectedItem.ts'] })
-  fs.rmSync(root, { recursive: true, force: true })
-})
-
-test('domain analysis: cascade mutation preserves the preceding leaf mutation', () => {
-  const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-performance-sequence-'))
-  fs.mkdirSync(path.join(temporaryRoot, 'src', 'utils'), { recursive: true })
-  fs.mkdirSync(path.join(temporaryRoot, 'src', 'types'), { recursive: true })
-  fs.writeFileSync(path.join(temporaryRoot, 'src', 'utils', 'plotSameSelectedItem.ts'), 'export const leaf = true\n')
-  fs.writeFileSync(path.join(temporaryRoot, 'src', 'types', 'index.ts'), 'export type Root = string\n')
-
-  benchmark.applyStateMutation(temporaryRoot, 'leaf')
-  benchmark.applyStateMutation(temporaryRoot, 'cascade')
+  fs.writeFileSync(path.join(cache, 'generations', 'generation-a.json'), '{"sources":{"src/types/index.ts":"old"}}')
+  fs.writeFileSync(path.join(cache, 'generations', 'generation-b.json'), '{"sources":{"src/types/index.ts":"new"},"parsedFiles":["src/types/index.ts"],"validatedFiles":["src/types/index.ts"]}')
 
   assert.deepEqual(
-    {
-      leaf: fs.readFileSync(path.join(temporaryRoot, 'src', 'utils', 'plotSameSelectedItem.ts'), 'utf8'),
-      cascade: fs.readFileSync(path.join(temporaryRoot, 'src', 'types', 'index.ts'), 'utf8'),
-    },
-    {
-      leaf: 'export const leaf = true\n// codegraph performance benchmark\n',
-      cascade: 'export type Root = string\n// codegraph performance benchmark\n',
-    },
+    benchmark.watcherMetadata(root, 'generation-a', 'changed-surface'),
+    { generation: 'generation-b', status: 'validated', parsedFiles: ['src/types/index.ts'], validatedFiles: ['src/types/index.ts'] },
   )
-  fs.rmSync(temporaryRoot, { recursive: true, force: true })
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('error guessing: watcher metadata rejects a validated generation that omitted authoritative work sets', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-performance-watcher-missing-work-'))
+  const cache = path.join(root, '.codegraph')
+  fs.mkdirSync(path.join(cache, 'generations'), { recursive: true })
+  fs.writeFileSync(path.join(cache, 'CURRENT'), 'generation-b\n')
+  fs.writeFileSync(path.join(cache, 'generations', 'generation-a.json'), '{"sources":{"src/types/index.ts":"old"}}')
+  fs.writeFileSync(path.join(cache, 'generations', 'generation-b.json'), '{"sources":{"src/types/index.ts":"new"}}')
+
+  assert.throws(() => benchmark.watcherMetadata(root, 'generation-a', 'changed-surface'), /parsedFiles.*validatedFiles|authoritative work sets/i)
+  fs.rmSync(root, { recursive: true, force: true })
 })
 
 test('equivalence partition: rejects an unknown mutation state', () => {
   assert.throws(() => benchmark.applyStateMutation('/tmp', 'indexed'), /unknown benchmark state/)
+})
+
+test('domain analysis: sequential update mutations append exactly one unique declaration while preserving every other file byte', (context) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-performance-mutation-'))
+  const source = path.join(root, 'src', 'types', 'index.ts')
+  const sibling = path.join(root, 'src', 'sibling.ts')
+  fs.mkdirSync(path.dirname(source), { recursive: true })
+  fs.writeFileSync(source, 'export type Id = string\n')
+  fs.writeFileSync(sibling, 'export const sibling = true\n')
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const originalSource = fs.readFileSync(source)
+  const originalSibling = fs.readFileSync(sibling)
+
+  benchmark.applyStateMutation(root, 'update', 1)
+  benchmark.applyStateMutation(root, 'update', 2)
+
+  const updatedSource = fs.readFileSync(source)
+  assert.deepEqual(
+    {
+      files: fs.readdirSync(path.join(root, 'src')).sort(),
+      targetBytesChanged: !updatedSource.equals(originalSource),
+      originalBytesRemainPrefix: updatedSource.subarray(0, originalSource.length).equals(originalSource),
+      siblingBytesUnchanged: fs.readFileSync(sibling).equals(originalSibling),
+      targetText: updatedSource.toString('utf8'),
+      surface1Count: updatedSource.toString('utf8').match(/CodeGraphPerformanceSurface1/g)?.length,
+      surface2Count: updatedSource.toString('utf8').match(/CodeGraphPerformanceSurface2/g)?.length,
+    },
+    {
+      files: ['sibling.ts', 'types'],
+      targetBytesChanged: true,
+      originalBytesRemainPrefix: true,
+      siblingBytesUnchanged: true,
+      targetText: 'export type Id = string\nexport type CodeGraphPerformanceSurface1 = Id\nexport type CodeGraphPerformanceSurface2 = Id\n',
+      surface1Count: 1,
+      surface2Count: 1,
+    },
+  )
 })
 
 test('error guessing: a disposable mirror isolates update mutations from the source repository', async (context) => {
@@ -710,50 +601,6 @@ test('error guessing: receipt comparison rejects one semantically drifting endpo
   assert.throws(() => benchmark.assertReceiptsMatch(expected, actual), /cyclo.*drifted/i)
 })
 
-test('domain analysis: validates all eight operations in all three repository states', () => {
-  assert.equal(benchmark.assertCompleteReport(completeReport), completeReport)
-})
-
-test('domain analysis: captureReport aggregates independent lifecycles from one frozen snapshot', async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-performance-report-'))
-  fs.mkdirSync(path.join(root, 'src', 'query'), { recursive: true })
-  fs.mkdirSync(path.join(root, 'src', 'pages', 'game'), { recursive: true })
-  fs.mkdirSync(path.join(root, 'src', 'services', 'data', 'session'), { recursive: true })
-  fs.mkdirSync(path.join(root, 'src', 'utils'), { recursive: true })
-  fs.mkdirSync(path.join(root, 'src', 'types'), { recursive: true })
-  fs.writeFileSync(path.join(root, 'src', 'query', 'event.ts'), 'useSessionEvent')
-  fs.writeFileSync(path.join(root, 'src', 'pages', 'game', 'GamePopoutShell.tsx'), 'GamePopoutShell')
-  fs.writeFileSync(path.join(root, 'src', 'services', 'data', 'session', 'storyArcState.ts'), 'fetchSessionStoryArcState')
-  fs.writeFileSync(path.join(root, 'src', 'utils', 'plotSameSelectedItem.ts'), 'plotSameSelectedItem')
-  fs.writeFileSync(path.join(root, 'src', 'types', 'index.ts'), 'Shared')
-  const firstSweep = {
-    refs: { ms: 10, sha256: 'refs' }, deps: { ms: 11, sha256: 'deps' }, callers: { ms: 12, sha256: 'callers' }, dead: { ms: 13, sha256: 'dead' },
-    queryNamed: { ms: 14, sha256: 'queryNamed' }, queryCapped: { ms: 15, sha256: 'queryCapped' }, querySingle: { ms: 16, sha256: 'querySingle' },
-    cyclo: { ms: 17, sha256: 'cyclo' },
-  }
-  const secondSweep = {
-    refs: { ms: 20, sha256: 'refs' }, deps: { ms: 21, sha256: 'deps' }, callers: { ms: 22, sha256: 'callers' }, dead: { ms: 23, sha256: 'dead' },
-    queryNamed: { ms: 24, sha256: 'queryNamed' }, queryCapped: { ms: 25, sha256: 'queryCapped' }, querySingle: { ms: 26, sha256: 'querySingle' },
-    cyclo: { ms: 27, sha256: 'cyclo' },
-  }
-  const samples = [
-    { root: '/mirror/persistent', sourceFiles: 863, sweeps: { indexed: firstSweep, leaf: firstSweep, cascade: firstSweep }, updates: { initialIndex: { ms: 100, parsedFiles: 863, validatedFiles: 863 }, leaf: { ms: 30, parsedFiles: 1, validatedFiles: 1 }, cascade: { ms: 40, parsedFiles: 2, validatedFiles: 10 }, fullReindex: { ms: 110, parsedFiles: 863, validatedFiles: 863 } } },
-    { root: '/mirror/persistent', sourceFiles: 863, sweeps: { indexed: secondSweep, leaf: secondSweep, cascade: secondSweep }, updates: { initialIndex: { ms: 200, parsedFiles: 864, validatedFiles: 864 }, leaf: { ms: 35, parsedFiles: 2, validatedFiles: 2 }, cascade: { ms: 45, parsedFiles: 3, validatedFiles: 20 }, fullReindex: { ms: 210, parsedFiles: 864, validatedFiles: 864 } } },
-  ]
-
-  let captures = 0
-  const report = await benchmark.captureReport({ root, samples: 2 }, {
-    snapshot: async () => root,
-    capture: async (_snapshotRoot, options) => { assert.equal(options.samples, 1); return [samples[captures++]] },
-  })
-
-  assert.deepEqual(
-    { captures, mirror: report.provenance.root, refs: report.benchmarks.refs.indexed, initialIndex: report.updates.initialIndex, leaf: report.updates.leaf, cascade: report.updates.cascade, fullReindex: report.updates.fullReindex },
-    { captures: 2, mirror: '/mirror/persistent', refs: { n: 2, p50Ms: 10, p90Ms: 20 }, initialIndex: { n: 2, p50Ms: 100, p90Ms: 200, parsedFiles: 864, validatedFiles: 864 }, leaf: { n: 2, p50Ms: 30, p90Ms: 35, parsedFiles: 2, validatedFiles: 2 }, cascade: { n: 2, p50Ms: 40, p90Ms: 45, parsedFiles: 3, validatedFiles: 20 }, fullReindex: { n: 2, p50Ms: 110, p90Ms: 210, parsedFiles: 864, validatedFiles: 864 } },
-  )
-  fs.rmSync(root, { recursive: true, force: true })
-})
-
 test('error guessing: source edits after the frozen snapshot do not invalidate its report', async () => {
   const sourceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-performance-live-source-'))
   const snapshotRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-performance-frozen-snapshot-'))
@@ -770,7 +617,7 @@ test('error guessing: source edits after the frozen snapshot do not invalidate i
     fs.writeFileSync(path.join(root, 'src', 'types', 'index.ts'), 'Shared')
   }
   const sweep = Object.fromEntries(benchmark.WORKLOADS.map(({ key }) => [key, { ms: 1, sha256: `${key}-stable` }]))
-  const sample = { root: snapshotRoot, sourceFiles: 5, sweeps: { indexed: sweep, leaf: sweep, cascade: sweep }, updates: { initialIndex: { ms: 10, parsedFiles: 5, validatedFiles: 5 }, leaf: { ms: 2, parsedFiles: 1, validatedFiles: 1 }, cascade: { ms: 3, parsedFiles: 1, validatedFiles: 2 }, fullReindex: { ms: 9, parsedFiles: 5, validatedFiles: 5 } } }
+  const sample = { root: snapshotRoot, sourceFiles: 5, sweeps: { indexed: sweep, updated: sweep }, updates: { initialIndex: { ms: 10, parsedFiles: 5, validatedFiles: 5 }, update: { ms: 2, parsedFiles: 1, validatedFiles: 1, parsedFileSet: ['src/types/index.ts'], validatedFileSet: ['src/types/index.ts'] } } }
 
   const report = await benchmark.captureReport({ root: sourceRoot, samples: 1 }, {
     snapshot: async (_root, options) => { assert.equal(options.refresh, false); return snapshotRoot },
@@ -870,7 +717,7 @@ test('domain analysis: a successful report releases its repository snapshot lock
     queryNamed: { ms: 1, sha256: 'queryNamed' }, queryCapped: { ms: 1, sha256: 'queryCapped' }, querySingle: { ms: 1, sha256: 'querySingle' },
     cyclo: { ms: 1, sha256: 'cyclo' },
   }
-  const sample = { root, sourceFiles: 5, sweeps: { indexed: sweep, leaf: sweep, cascade: sweep }, updates: { initialIndex: { ms: 10, parsedFiles: 5, validatedFiles: 5 }, leaf: { ms: 2, parsedFiles: 1, validatedFiles: 1 }, cascade: { ms: 3, parsedFiles: 1, validatedFiles: 2 }, fullReindex: { ms: 9, parsedFiles: 5, validatedFiles: 5 } } }
+  const sample = { root, sourceFiles: 5, sweeps: { indexed: sweep, updated: sweep }, updates: { initialIndex: { ms: 10, parsedFiles: 5, validatedFiles: 5 }, update: { ms: 2, parsedFiles: 1, validatedFiles: 1, parsedFileSet: ['src/types/index.ts'], validatedFileSet: ['src/types/index.ts'] } } }
   const first = await benchmark.captureReport({ root, samples: 1 }, { lock, snapshot: async () => root, capture: async () => [sample] })
   const secondMessage = await benchmark.captureReport({ root, samples: 1 }, { lock,
     snapshot: async () => { throw new Error('second acquired released lock') },
@@ -880,6 +727,11 @@ test('domain analysis: a successful report releases its repository snapshot lock
   assert.deepEqual({ firstConsistent: first.correctness.consistent, secondMessage }, { firstConsistent: true, secondMessage: 'second acquired released lock' })
   fs.rmSync(root, { recursive: true, force: true })
   fs.rmSync(lockDirectory, { recursive: true, force: true })
+})
+
+test('profiling boundary: parent artifact discovery uses the parser pool exact worker-profile derivation', () => {
+  assert.equal(typeof benchmark.deriveWorkerProfile, 'function')
+  assert.equal(benchmark.deriveWorkerProfile, parserPoolModule.deriveWorkerProfile)
 })
 
 test('error guessing: a dead snapshot owner restores its exact backup before entering an operation when canonical is missing', async () => {
@@ -933,26 +785,14 @@ test('error guessing: a dead owner keeps a completed canonical snapshot and remo
 
 test('combinatorial analysis: rejects a report missing one operation-state pair', () => {
   const report = structuredClone(completeReport)
-  delete report.benchmarks.callers.cascade
-  assert.throws(() => benchmark.assertCompleteReport(report), /callers.*cascade|cascade.*callers/i)
-})
-
-test('domain analysis: rejects a report without cascade parsed-file work', () => {
-  const report = structuredClone(completeReport)
-  delete report.updates.cascade.parsedFiles
-  assert.throws(() => benchmark.assertCompleteReport(report), /cascade.*parsed/i)
-})
-
-test('domain analysis: rejects a report without cascade validated-file work', () => {
-  const report = structuredClone(completeReport)
-  delete report.updates.cascade.validatedFiles
-  assert.throws(() => benchmark.assertCompleteReport(report), /cascade.*validated/i)
+  delete report.benchmarks.callers.updated
+  assert.throws(() => benchmark.assertCompleteReport(report), /callers.*updated|updated.*callers/i)
 })
 
 test('domain analysis: rejects a report without one update timing', () => {
   const report = structuredClone(completeReport)
-  delete report.updates.fullReindex
-  assert.throws(() => benchmark.assertCompleteReport(report), /missing fullReindex/i)
+  delete report.updates.update
+  assert.throws(() => benchmark.assertCompleteReport(report), /missing update/i)
 })
 
 test('error guessing: rejects output drift across update states', () => {
@@ -968,7 +808,7 @@ test('error guessing: rejects an unclean MCP shutdown', () => {
 })
 
 test('equivalence partition: renders one project-size and feature summary sentence first', () => {
-  assert.match(benchmark.renderMarkdown(completeReport), /^CodeGraph was tested against the 863-source-file D&D Community and Marketplace project, covering all query endpoints, initial indexing, leaf updates, cascade updates, and full reindexing\./)
+  assert.match(benchmark.renderMarkdown(completeReport), /^CodeGraph was tested against the 863-source-file D&D Community and Marketplace project in one production MCP lifecycle\./)
 })
 
 test('equivalence partition: serializes a complete schema-v2 report with a trailing newline', () => {
@@ -977,26 +817,25 @@ test('equivalence partition: serializes a complete schema-v2 report with a trail
 
 test('combinatorial analysis: renders every operation and state as p50 / p90 milliseconds', () => {
   const markdown = benchmark.renderMarkdown(completeReport)
-  assert.match(markdown, /\| References \| 1\.11 \/ 1\.91 ms \| 2\.12 \/ 2\.92 ms \| 3\.13 \/ 3\.93 ms \|/)
-  assert.match(markdown, /\| Dependencies \| 4\.11 \/ 4\.91 ms \| 5\.12 \/ 5\.92 ms \| 6\.13 \/ 6\.93 ms \|/)
-  assert.match(markdown, /\| Callers \| 7\.11 \/ 7\.91 ms \| 8\.12 \/ 8\.92 ms \| 9\.13 \/ 9\.93 ms \|/)
-  assert.match(markdown, /\| Dead exports \| 10\.11 \/ 10\.91 ms \| 11\.12 \/ 11\.92 ms \| 12\.13 \/ 12\.93 ms \|/)
-  assert.match(markdown, /\| Named-symbol query \| 13\.11 \/ 13\.91 ms \| 14\.12 \/ 14\.92 ms \| 15\.13 \/ 15\.93 ms \|/)
-  assert.match(markdown, /\| Symbol list \(2,000 max\) \| 16\.11 \/ 16\.91 ms \| 17\.12 \/ 17\.92 ms \| 18\.13 \/ 18\.93 ms \|/)
-  assert.match(markdown, /\| Single-symbol query \| 19\.11 \/ 19\.91 ms \| 20\.12 \/ 20\.92 ms \| 21\.13 \/ 21\.93 ms \|/)
-  assert.match(markdown, /\| Cyclomatic complexity \| 22\.11 \/ 22\.91 ms \| 23\.12 \/ 23\.92 ms \| 24\.13 \/ 24\.93 ms \|/)
+  assert.match(markdown, /\| Operation \| Indexed \| Post-update \|/)
+  assert.match(markdown, /\| References \| 1\.11 \/ 1\.11 ms \| 2\.12 \/ 2\.92 ms \|/)
+  assert.match(markdown, /\| Dependencies \| 4\.11 \/ 4\.11 ms \| 5\.12 \/ 5\.92 ms \|/)
+  assert.match(markdown, /\| Callers \| 7\.11 \/ 7\.11 ms \| 8\.12 \/ 8\.92 ms \|/)
+  assert.match(markdown, /\| Dead exports \| 10\.11 \/ 10\.11 ms \| 11\.12 \/ 11\.92 ms \|/)
+  assert.match(markdown, /\| Named-symbol query \| 13\.11 \/ 13\.11 ms \| 14\.12 \/ 14\.92 ms \|/)
+  assert.match(markdown, /\| Symbol list \(2,000 max\) \| 16\.11 \/ 16\.11 ms \| 17\.12 \/ 17\.92 ms \|/)
+  assert.match(markdown, /\| Single-symbol query \| 19\.11 \/ 19\.11 ms \| 20\.12 \/ 20\.92 ms \|/)
+  assert.match(markdown, /\| Cyclomatic complexity \| 22\.11 \/ 22\.11 ms \| 23\.12 \/ 23\.92 ms \|/)
 })
 
 test('domain analysis: renders update latency separately and exposes work counts', () => {
   const markdown = benchmark.renderMarkdown(completeReport)
-  assert.match(markdown, /\| CLI cold index \| 101\.10 \/ 109\.90 ms \| 863 \| 863 \|/)
-  assert.match(markdown, /\| Leaf incremental update \| 12\.30 \/ 18\.70 ms \| 1 \| 1 \|/)
-  assert.match(markdown, /\| Cascade incremental update \| 52\.40 \/ 68\.80 ms \| 37 \| 214 \|/)
-  assert.match(markdown, /\| Full reindex \| 111\.10 \/ 119\.90 ms \| 863 \| 863 \|/)
+  assert.match(markdown, /\| Initial index \| 101\.10 \/ 101\.10 ms \| 863 \| 863 \|/)
+  assert.match(markdown, /\| One-file update \| 12\.30 \/ 18\.70 ms \| 1 \| 1 \|/)
 })
 
-test('domain analysis: Markdown does not mislabel the CLI build as a production-runtime initial index', () => {
-  assert.doesNotMatch(benchmark.renderMarkdown(completeReport), /\| Initial index \|/)
+test('domain analysis: Markdown labels the production-runtime initial index', () => {
+  assert.match(benchmark.renderMarkdown(completeReport), /\| Initial index \|/)
 })
 
 test('error guessing: Markdown avoids instructional placeholder labels', () => {
@@ -1011,7 +850,26 @@ test('equivalence partition: CPU profile launch passes only CPU profiler flags',
 
   await benchmark.startMcp({ root: '/repo', profile: { cpu: '/private/tmp/profiles/update.cpuprofile' }, spawnChild: (_command, childArgs) => { args = childArgs; return child } }).stop()
 
-  assert.deepEqual(args, ['--cpu-prof', '--cpu-prof-dir=/private/tmp/profiles', path.resolve(import.meta.dirname, '..', 'mcp.mjs')])
+  assert.deepEqual(args, ['--cpu-prof', '--cpu-prof-dir=/private/tmp/profiles', '--cpu-prof-name=update.cpuprofile', path.resolve(import.meta.dirname, '..', 'mcp.mjs')])
+})
+
+test('error guessing: a synchronous MCP spawn failure closes the diagnostic file descriptor', (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-diagnostic-spawn-failure-'))
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const originalClose = fs.closeSync
+  let closed = 0
+  fs.closeSync = (descriptor) => { closed += 1; return originalClose(descriptor) }
+
+  try {
+    assert.throws(
+      () => benchmark.startMcp({ diagnosticLog: path.join(directory, 'profile.log'), spawnChild: () => { throw new Error('spawn failed') } }),
+      /spawn failed/,
+    )
+  } finally {
+    fs.closeSync = originalClose
+  }
+
+  assert.equal(closed, 1)
 })
 
 test('process lifecycle: controller termination stops the MCP group once and unregisters signal listeners', async () => {
@@ -1037,37 +895,37 @@ test('process lifecycle: controller termination stops the MCP group once and unr
   })
 })
 
-test('domain analysis: clean CPU shutdown retains every newly generated profile and ignores preexisting profiles', async (t) => {
+test('domain analysis: clean CPU shutdown reports deterministic main and semantic-worker profile paths', async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-cpu-artifacts-'))
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
   fs.writeFileSync(path.join(directory, 'CPU.before.cpuprofile'), 'preexisting')
   const child = new EventEmitter()
   child.pid = 42; child.exitCode = null; child.signalCode = null
   child.stdout = new EventEmitter(); child.stderr = new EventEmitter()
-  child.stdin = { write() {}, end() { fs.writeFileSync(path.join(directory, 'CPU.generated-b.cpuprofile'), 'worker'); fs.writeFileSync(path.join(directory, 'CPU.generated-a.cpuprofile'), 'main'); queueMicrotask(() => child.emit('exit', 0, null)) } }
+  child.stdin = { write() {}, end() { fs.writeFileSync(path.join(directory, 'update.cpuprofile'), 'main'); fs.writeFileSync(path.join(directory, 'update.worker-semantic.cpuprofile'), 'worker'); queueMicrotask(() => child.emit('exit', 0, null)) } }
   const mcp = benchmark.startMcp({ root: '/repo', profile: { cpu: path.join(directory, 'update.cpuprofile') }, spawnChild: () => child, platform: 'linux', killProcess() {} })
 
   const stopped = await mcp.stop()
 
   assert.deepEqual(
-    { stopped, files: fs.readdirSync(directory).sort(), contents: [fs.readFileSync(path.join(directory, 'update-1.cpuprofile'), 'utf8'), fs.readFileSync(path.join(directory, 'update-2.cpuprofile'), 'utf8')] },
-    { stopped: { cpu: [path.join(directory, 'update-1.cpuprofile'), path.join(directory, 'update-2.cpuprofile')] }, files: ['CPU.before.cpuprofile', 'update-1.cpuprofile', 'update-2.cpuprofile'], contents: ['main', 'worker'] },
+    { stopped, files: fs.readdirSync(directory).sort(), contents: [fs.readFileSync(path.join(directory, 'update.cpuprofile'), 'utf8'), fs.readFileSync(path.join(directory, 'update.worker-semantic.cpuprofile'), 'utf8')] },
+    { stopped: { main: { cpu: path.join(directory, 'update.cpuprofile') }, workers: [{ label: 'semantic', cpu: path.join(directory, 'update.worker-semantic.cpuprofile') }] }, files: ['CPU.before.cpuprofile', 'update.cpuprofile', 'update.worker-semantic.cpuprofile'], contents: ['main', 'worker'] },
   )
 })
 
-test('error guessing: timed-out CPU shutdown still retains every profile produced before forced termination', async (t) => {
+test('error guessing: timed-out CPU shutdown leaves deterministic profiles at their requested paths', async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-cpu-timeout-'))
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
   const child = new EventEmitter()
   child.pid = 42; child.exitCode = null; child.signalCode = null
   child.stdout = new EventEmitter(); child.stderr = new EventEmitter(); child.stdin = { write() {}, end() {} }
-  const mcp = benchmark.startMcp({ root: '/repo', profile: { cpu: path.join(directory, 'timeout.cpuprofile') }, spawnChild: () => child, platform: 'linux', shutdownTimeoutMs: 1, killProcess: () => { fs.writeFileSync(path.join(directory, 'CPU.generated-b.cpuprofile'), 'worker'); fs.writeFileSync(path.join(directory, 'CPU.generated-a.cpuprofile'), 'main') } })
+  const mcp = benchmark.startMcp({ root: '/repo', profile: { cpu: path.join(directory, 'timeout.cpuprofile') }, spawnChild: () => child, platform: 'linux', shutdownTimeoutMs: 1, killProcess: () => { fs.writeFileSync(path.join(directory, 'timeout.cpuprofile'), 'main'); fs.writeFileSync(path.join(directory, 'timeout.worker-semantic.cpuprofile'), 'worker') } })
 
   await assert.rejects(mcp.stop(), /shutdown timed out/)
 
   assert.deepEqual(
-    { files: fs.readdirSync(directory).sort(), contents: [fs.readFileSync(path.join(directory, 'timeout-1.cpuprofile'), 'utf8'), fs.readFileSync(path.join(directory, 'timeout-2.cpuprofile'), 'utf8')] },
-    { files: ['timeout-1.cpuprofile', 'timeout-2.cpuprofile'], contents: ['main', 'worker'] },
+    { files: fs.readdirSync(directory).sort(), contents: [fs.readFileSync(path.join(directory, 'timeout.cpuprofile'), 'utf8'), fs.readFileSync(path.join(directory, 'timeout.worker-semantic.cpuprofile'), 'utf8')] },
+    { files: ['timeout.cpuprofile', 'timeout.worker-semantic.cpuprofile'], contents: ['main', 'worker'] },
   )
 })
 
@@ -1314,73 +1172,212 @@ test('domain analysis: CPU profile capture starts the production MCP on the disp
     /stop after profile launch/,
   )
 
-  assert.deepEqual(starts, [{ root: '/private/tmp/codegraph-performance/project', profile: { cpu: '/profiles/update.cpuprofile' } }])
+  assert.deepEqual(starts, [{ root: '/private/tmp/codegraph-performance/project', profile: { cpu: '/profiles/update.cpuprofile' }, requestTimeoutMs: 0 }])
 })
 
-test('domain analysis: CLI cold build precedes one production MCP lifecycle and clean shutdown', async () => {
-  const events = []
-  const transitions = []
+test('equivalence partition: a CPU profile starts MCP before indexing and never invokes the external cold build', async () => {
+  const coldBuilds = []
+  const starts = []
+
+  await assert.rejects(
+    benchmark.captureSample('/source', {
+      withMirror: async (_root, operation) => operation('/private/tmp/codegraph-performance/project'),
+      profile: { cpu: '/profiles/update.cpuprofile' },
+      coldBuild: async (...args) => { coldBuilds.push(args); return { ms: 10, generation: 'generation-a', parsedFiles: 2, validatedFiles: 2 } },
+      start: (request) => { starts.push(request); throw new Error('stop after profile launch') },
+    }),
+    /stop after profile launch/,
+  )
+
+  assert.deepEqual(
+    { coldBuilds, requestTimeoutMs: starts[0].requestTimeoutMs },
+    { coldBuilds: [], requestTimeoutMs: 0 },
+  )
+})
+
+test('single production MCP lifecycle contract: one MCP identity performs initial index and every measured update', async () => {
+  const calls = { start: 0, initialize: 0, index: 0, refresh: 0, query: 0, stop: 0 }
+  const queryReceivers = []
+  const watcherCalls = []
   const mcp = {
-    timed: async (method, params) => {
-      if (method === 'initialize') { events.push('initialize'); return { message: { result: {} }, ms: 1 } }
-      events.push(params.name)
-      if (params.name === 'codegraph_refresh') return { message: { result: { content: [{ text: '{"generation":"g1"}' }] } }, ms: 1 }
-      if (params.name === 'codegraph_index') return { message: { result: { content: [{ text: '{"generation":"g6","parsedFiles":[],"validatedFiles":[]}' }] } }, ms: 1 }
-      const receipts = { codegraph_refs: 'src/query/event.ts: useSessionEvent', codegraph_deps: 'src/pages/game/GamePopoutShell.tsx', codegraph_callers: 'storyArcState.ts: fetchSessionStoryArcState', codegraph_dead: 'exports in src/query', codegraph_internals: 'validatedGeneration: g1\n{"record":"metrics","metrics":{"cyclomatic":3}}' }
+    async timed(method, params) {
+      if (method === 'initialize') {
+        calls.initialize += 1
+        return { message: { result: {} }, ms: 1 }
+      }
+      if (params.name === 'codegraph_index') {
+        calls.index += 1
+        return { message: { result: { content: [{ text: '{"generation":"g1","parsedFiles":["src/a.ts","src/b.ts"],"validatedFiles":["src/a.ts","src/b.ts"]}' }] } }, ms: 10 }
+      }
+      if (params.name === 'codegraph_refresh') {
+        calls.refresh += 1
+        return { message: { result: { content: [{ text: '{}' }] } }, ms: 1 }
+      }
+      calls.query += 1
+      queryReceivers.push(this)
+      const receipts = {
+        codegraph_refs: 'src/query/event.ts: useSessionEvent',
+        codegraph_deps: 'src/pages/game/GamePopoutShell.tsx',
+        codegraph_callers: 'storyArcState.ts: fetchSessionStoryArcState',
+        codegraph_dead: 'exports in src/query',
+        codegraph_internals: 'validatedGeneration: g1\n{"record":"metrics","metrics":{"cyclomatic":3}}',
+      }
       const text = params.name === 'codegraph_query'
-        ? (params.arguments.query.limit === 1 || params.arguments.query.name ? 'useSessionEvent' : '{"name":"symbol"}')
+        ? (params.arguments.query.name || params.arguments.query.file ? 'useSessionEvent' : '{"name":"useSessionEvent"}')
         : receipts[params.name]
       return { message: { result: { content: [{ text }] } }, ms: 1 }
     },
-    stop: async () => { events.push('stop MCP') },
-  }
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-performance-scripted-'))
-  fs.mkdirSync(path.join(root, 'src', 'utils'), { recursive: true })
-  fs.mkdirSync(path.join(root, 'src', 'types'), { recursive: true })
-  fs.writeFileSync(path.join(root, 'src', 'utils', 'plotSameSelectedItem.ts'), 'export const leaf = true\n')
-  fs.writeFileSync(path.join(root, 'src', 'types', 'index.ts'), 'export type Root = string\n')
-
-  const samples = await benchmark.captureLifecycle(root, {
-    samples: 2,
-    withMirror: async (_root, operation) => operation(root),
-    start: () => { events.push('start MCP'); return mcp },
-    progress: (phase) => events.push(`phase: ${phase}`),
-    coldBuild: async () => { events.push('CLI cold build'); return { ms: 10, generation: 'g1', parsedFiles: 2, validatedFiles: 2 } },
-    readMetadata: () => ({ status: 'validated' }),
-    watcherUpdate: async ({ root: target, state, previousGeneration, readMetadata }) => {
-      events.push(`${state} timed mutation`)
-      readMetadata(target, previousGeneration)
-      const generation = ({ 'leaf:g1': 'g2', 'cascade:g2': 'g3', 'leaf:g3': 'g4', 'cascade:g4': 'g5' })[`${state}:${previousGeneration}`]
-      transitions.push(`${state}:${previousGeneration}->${generation}`)
-      return state === 'leaf'
-        ? ({ ms: 2, generation, parsedFiles: 1, validatedFiles: 1 })
-        : ({ ms: 3, generation, parsedFiles: 1, validatedFiles: 2 })
+    async stop() {
+      calls.stop += 1
     },
+  }
+  const samples = await benchmark.captureLifecycle('/source', {
+    samples: 2,
+    withMirror: async (_root, operation) => operation('/mirror'),
+    start: () => {
+      calls.start += 1
+      return mcp
+    },
+    watcherUpdate: async ({ state, mutationIndex, previousGeneration }) => {
+      watcherCalls.push({ state, mutationIndex, previousGeneration })
+      return { ms: mutationIndex, generation: `g${mutationIndex + 1}`, parsedFiles: 1, validatedFiles: 1, parsedFileSet: ['src/types/index.ts'], validatedFileSet: ['src/types/index.ts'] }
+    },
+    progress: () => {},
   })
 
   assert.deepEqual(
     {
-      transitions,
-      samples: samples.length,
-      readinessCalls: events.filter((event) => event === 'codegraph_refresh').length,
-      coldBuilds: events.filter((event) => event === 'CLI cold build').length,
-      coldBuildBeforeMcp: events.indexOf('CLI cold build') < events.indexOf('start MCP'),
-      starts: events.filter((event) => event === 'start MCP').length,
-      cleanShutdown: events[events.length - 1],
-      cycloCalls: events.filter((event) => event === 'codegraph_internals').length,
+      calls,
+      everyQueryUsedStartedMcp: queryReceivers.every((receiver) => receiver === mcp),
+      watcherCalls,
+      sampleShapes: samples.map((sample) => ({
+        root: sample.root,
+        sourceFiles: sample.sourceFiles,
+        sweepKeys: Object.keys(sample.sweeps),
+        updateKeys: Object.keys(sample.updates),
+        update: sample.updates.update,
+      })),
     },
     {
-      transitions: ['leaf:g1->g2', 'cascade:g2->g3', 'leaf:g3->g4', 'cascade:g4->g5'],
-      samples: 2,
-      readinessCalls: 1,
-      coldBuilds: 1,
-      coldBuildBeforeMcp: true,
-      starts: 1,
-      cleanShutdown: 'stop MCP',
-      cycloCalls: 6,
+      calls: { start: 1, initialize: 1, index: 1, refresh: 1, query: 24, stop: 1 },
+      everyQueryUsedStartedMcp: true,
+      watcherCalls: [
+        { state: 'update', mutationIndex: 1, previousGeneration: 'g1' },
+        { state: 'update', mutationIndex: 2, previousGeneration: 'g2' },
+      ],
+      sampleShapes: [
+        { root: '/mirror', sourceFiles: 2, sweepKeys: ['indexed', 'updated'], updateKeys: ['update', 'initialIndex'], update: { ms: 1, generation: 'g2', parsedFiles: 1, validatedFiles: 1, parsedFileSet: ['src/types/index.ts'], validatedFileSet: ['src/types/index.ts'] } },
+        { root: '/mirror', sourceFiles: 2, sweepKeys: ['indexed', 'updated'], updateKeys: ['update'], update: { ms: 2, generation: 'g3', parsedFiles: 1, validatedFiles: 1, parsedFileSet: ['src/types/index.ts'], validatedFileSet: ['src/types/index.ts'] } },
+      ],
     },
   )
-  fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('domain analysis: lifecycle measures queryCapped after every exported-type update without requiring its growing receipt to equal the indexed baseline', async () => {
+  let queryCappedCalls = 0
+  const watcherCalls = []
+  const mcp = {
+    async timed(method, params) {
+      if (method === 'initialize') return { message: { result: {} }, ms: 1 }
+      if (params.name === 'codegraph_index') return { message: { result: { content: [{ text: '{"generation":"g1","parsedFiles":["src/types/index.ts"],"validatedFiles":["src/types/index.ts"]}' }] } }, ms: 1 }
+      if (params.name === 'codegraph_refresh') return { message: { result: { content: [{ text: '{}' }] } }, ms: 1 }
+      const receipts = {
+        codegraph_refs: 'src/query/event.ts: useSessionEvent',
+        codegraph_deps: 'src/pages/game/GamePopoutShell.tsx',
+        codegraph_callers: 'storyArcState.ts: fetchSessionStoryArcState',
+        codegraph_dead: 'exports in src/query',
+        codegraph_internals: 'validatedGeneration: g1\n{"record":"metrics","metrics":{"cyclomatic":3}}',
+      }
+      let text
+      if (params.name !== 'codegraph_query') text = receipts[params.name]
+      else if (params.arguments.query.name || params.arguments.query.file) text = 'useSessionEvent'
+      else {
+        queryCappedCalls += 1
+        text = `{"name":"symbol-${queryCappedCalls}"}`
+      }
+      return { message: { result: { content: [{ text }] } }, ms: 1 }
+    },
+    async stop() {},
+  }
+
+  const samples = await benchmark.captureLifecycle('/source', {
+    samples: 2,
+    withMirror: async (_root, operation) => operation('/mirror'),
+    start: () => mcp,
+    watcherUpdate: async ({ state, mutationIndex, previousGeneration }) => {
+      watcherCalls.push({ state, mutationIndex, previousGeneration })
+      return { ms: 1, generation: `g${mutationIndex + 1}`, parsedFiles: 1, validatedFiles: 1, parsedFileSet: ['src/types/index.ts'], validatedFileSet: ['src/types/index.ts'] }
+    },
+    progress: () => {},
+  })
+
+  assert.deepEqual(
+    { queryCappedCalls, watcherCalls, samples: samples.length, everySampleMeasuredQueryCapped: samples.every((sample) => sample.sweeps.updated.queryCapped.ms === 1) },
+    {
+      queryCappedCalls: 3,
+      watcherCalls: [
+        { state: 'update', mutationIndex: 1, previousGeneration: 'g1' },
+        { state: 'update', mutationIndex: 2, previousGeneration: 'g2' },
+      ],
+      samples: 2,
+      everySampleMeasuredQueryCapped: true,
+    },
+  )
+})
+
+test('domain analysis: report accepts dynamic queryCapped receipts but still rejects drift in a stable workload', async (context) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-performance-dynamic-query-report-'))
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const indexed = {
+    refs: { ms: 1, sha256: 'refs-stable' },
+    deps: { ms: 2, sha256: 'deps-stable' },
+    callers: { ms: 3, sha256: 'callers-stable' },
+    dead: { ms: 4, sha256: 'dead-stable' },
+    queryNamed: { ms: 5, sha256: 'queryNamed-stable' },
+    queryCapped: { ms: 6, sha256: 'queryCapped-before-update' },
+    querySingle: { ms: 7, sha256: 'querySingle-stable' },
+    cyclo: { ms: 8, sha256: 'cyclo-stable' },
+  }
+  const updated = {
+    refs: { ms: 11, sha256: 'refs-stable' },
+    deps: { ms: 12, sha256: 'deps-stable' },
+    callers: { ms: 13, sha256: 'callers-stable' },
+    dead: { ms: 14, sha256: 'dead-stable' },
+    queryNamed: { ms: 15, sha256: 'queryNamed-stable' },
+    queryCapped: { ms: 16, sha256: 'queryCapped-after-update' },
+    querySingle: { ms: 17, sha256: 'querySingle-stable' },
+    cyclo: { ms: 18, sha256: 'cyclo-stable' },
+  }
+  const sample = {
+    root,
+    sourceFiles: 2,
+    sweeps: { indexed, updated },
+    updates: {
+      initialIndex: { ms: 20, parsedFiles: 2, validatedFiles: 2 },
+      update: { ms: 3, parsedFiles: 1, validatedFiles: 1, parsedFileSet: ['src/types/index.ts'], validatedFileSet: ['src/types/index.ts'] },
+    },
+  }
+
+  const report = await benchmark.captureReport({ root, samples: 1 }, { snapshot: async () => root, capture: async () => [sample] })
+  const stableDrift = structuredClone(sample)
+  stableDrift.sweeps.updated.callers.sha256 = 'callers-drifted'
+  const stableDriftMessage = await benchmark.captureReport(
+    { root, samples: 1 },
+    { snapshot: async () => root, capture: async () => [stableDrift] },
+  ).then(() => 'stable drift unexpectedly accepted', (error) => error.message)
+
+  assert.deepEqual(
+    { queryCapped: report.benchmarks.queryCapped, stableDriftMessage },
+    {
+      queryCapped: { indexed: { n: 1, p50Ms: 6, p90Ms: 6 }, updated: { n: 1, p50Ms: 16, p90Ms: 16 } },
+      stableDriftMessage: 'callers semantic output drifted across update states',
+    },
+  )
+})
+
+test('single production MCP lifecycle contract: has no alternate selectors or execution routes', () => {
+  const source = fs.readFileSync(path.join(import.meta.dirname, '..', 'scripts', 'codegraph.performance.mjs'), 'utf8')
+  assert.doesNotMatch(source, /--(?:temperature|phase|direct-engine|provisional-child|external-build)|runProvisionalChild|measureColdBuild|\b(?:phase|temperature|provisional|leaf|cascade|fullReindex)\b/)
 })
 
 test('domain analysis: main writes the validated report and rendered Markdown once', async () => {

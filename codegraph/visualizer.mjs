@@ -2713,6 +2713,7 @@ export function createVisualizerServer(rootPath = root, options = {}) {
   })()
   const codegraphDir = path.join(resolvedRoot, '.codegraph')
   const debounceMs = options.debounceMs ?? 1500
+  const sourcePolicy = options.sourcePolicy ?? options.policy
   const ssePingMs = options.ssePingMs ?? 25000
   let debounceTimer = null
   let isDebouncing = false
@@ -2758,7 +2759,7 @@ export function createVisualizerServer(rootPath = root, options = {}) {
       const file = path.join(resolvedRoot, name)
       if (isIgnoredWatchPath(file)) return
       const isCurrent = path.basename(file) === 'CURRENT'
-      const isSource = ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.mts', '.cts'].includes(path.extname(file).toLowerCase())
+      const isSource = sourcePolicy?.acceptWatchPath(file) === true
       if (isCurrent || isSource) handleFileChange(evt, file)
     })
     // fs.watch has no 'ready' event of its own, but the watch is live once the call returns, and

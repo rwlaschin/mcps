@@ -2,129 +2,126 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 
-const fixtureRoot = path.resolve(import.meta.dirname, 'fixtures/go-project')
+const projectRoot = path.resolve(import.meta.dirname, '..')
+const failureFixtures = path.resolve(import.meta.dirname, 'fixtures/go-language-analyzer')
 const loadGoAnalyzer = () => import('../go-language-analyzer.mjs')
-const hash = (source) => crypto.createHash('sha256').update(source).digest('hex')
-const sources = () => new Map([
-  ['cmd/app/main.go', fs.readFileSync(path.join(fixtureRoot, 'cmd/app/main.go'), 'utf8')],
-  ['model/user.go', fs.readFileSync(path.join(fixtureRoot, 'model/user.go'), 'utf8')],
-  ['service/service.go', fs.readFileSync(path.join(fixtureRoot, 'service/service.go'), 'utf8')],
-])
+const oneSource = [['main.go', 'package main\nfunc main() {}\n']]
+const manySources = [['main.go', 'package main\nfunc main() { helper() }\n'], ['helper.go', 'package main\nfunc helper() {}\n'], ['value.go', 'package main\nconst value = 1\n']]
 
-async function indexFixture() {
+test('dependency contract: one zero-transitive runtime and one vendored Go grammar are pinned', () => {
+  const packageJson = JSON.parse(fs.readFileSync(path.join(projectRoot, 'package.json'), 'utf8'))
+  const packageLock = JSON.parse(fs.readFileSync(path.join(projectRoot, 'package-lock.json'), 'utf8'))
+  assert.deepEqual(
+    {
+      runtime: packageJson.dependencies?.['web-tree-sitter'],
+      runtimeTransitiveDependencies: packageLock.packages?.['node_modules/web-tree-sitter']?.dependencies ?? {},
+      allLanguagePackageInstalled: packageJson.dependencies?.['tree-sitter-wasm'] ?? null,
+      grammar: packageJson.codegraph?.goGrammar,
+    },
+    {
+      runtime: '0.27.0',
+      runtimeTransitiveDependencies: {},
+      allLanguagePackageInstalled: null,
+      grammar: { path: 'vendor/tree-sitter-go.wasm', provenance: 'tree-sitter-wasm', version: '1.1.8', sha256: packageJson.codegraph?.goGrammar?.sha256 },
+    },
+  )
+  assert.match(import.meta.resolve('web-tree-sitter'), /^file:/)
+  assert.match(packageJson.codegraph.goGrammar.sha256, /^[a-f0-9]{64}$/)
+  const grammar = fs.readFileSync(path.join(projectRoot, packageJson.codegraph.goGrammar.path))
+  assert.equal(crypto.createHash('sha256').update(grammar).digest('hex'), packageJson.codegraph.goGrammar.sha256)
+})
+
+test('boundary analysis: zero sources leave the packaged Go parser uninitialized', async () => {
   const { createGoLanguageAnalyzer } = await loadGoAnalyzer()
-  const analyzer = createGoLanguageAnalyzer(fixtureRoot)
-  const worker = analyzer.createSemanticWorker()
-  const input = sources()
-  const result = await worker.index({ root: fixtureRoot, sources: [...input], sourceBlobs: Object.fromEntries([...input].map(([file, source]) => [file, hash(source)])) })
+  const worker = createGoLanguageAnalyzer(projectRoot).createSemanticWorker()
+  assert.deepEqual(worker.runtimeState(), { initialized: false, parserCount: 0, disposed: false })
   await worker.dispose()
-  return result
+})
+
+test('boundary analysis: one Go source initializes one in-process WASM parser', async () => {
+  const { createGoLanguageAnalyzer } = await loadGoAnalyzer()
+  const worker = createGoLanguageAnalyzer(projectRoot).createSemanticWorker()
+  await worker.index({ root: projectRoot, sources: oneSource, sourceBlobs: {} })
+  assert.deepEqual(worker.runtimeState(), { initialized: true, parserCount: 1, disposed: false })
+  await worker.dispose()
+})
+
+test('boundary analysis: many Go sources reuse one in-process WASM parser', async () => {
+  const { createGoLanguageAnalyzer } = await loadGoAnalyzer()
+  const worker = createGoLanguageAnalyzer(projectRoot).createSemanticWorker()
+  await worker.index({ root: projectRoot, sources: manySources, sourceBlobs: {} })
+  assert.deepEqual(worker.runtimeState(), { initialized: true, parserCount: 1, disposed: false })
+  await worker.dispose()
+})
+
+test('domain analysis: repeated parsing reuses the same packaged WASM parser', async () => {
+  const { createGoLanguageAnalyzer } = await loadGoAnalyzer()
+  const worker = createGoLanguageAnalyzer(projectRoot).createSemanticWorker()
+  await worker.index({ root: projectRoot, sources: oneSource, sourceBlobs: {} })
+  await worker.index({ root: projectRoot, sources: manySources, sourceBlobs: {} })
+  assert.deepEqual(worker.runtimeState(), { initialized: true, parserCount: 1, disposed: false })
+  await worker.dispose()
+})
+
+test('domain analysis: dispose releases the initialized WASM parser exactly once', async () => {
+  const { createGoLanguageAnalyzer } = await loadGoAnalyzer()
+  const worker = createGoLanguageAnalyzer(projectRoot).createSemanticWorker()
+  await worker.index({ root: projectRoot, sources: oneSource, sourceBlobs: {} })
+  await worker.dispose()
+  await worker.dispose()
+  assert.deepEqual(worker.runtimeState(), { initialized: false, parserCount: 0, disposed: true })
+})
+
+test('error guessing: parsing after dispose rejects without recreating the parser', async () => {
+  const { createGoLanguageAnalyzer } = await loadGoAnalyzer()
+  const worker = createGoLanguageAnalyzer(projectRoot).createSemanticWorker()
+  await worker.dispose()
+  await assert.rejects(worker.index({ root: projectRoot, sources: oneSource, sourceBlobs: {} }), /disposed|closed/i)
+  assert.deepEqual(worker.runtimeState(), { initialized: false, parserCount: 0, disposed: true })
+})
+
+const failedPublication = async (option, asset, expected) => {
+  const { createGoLanguageAnalyzer } = await loadGoAnalyzer()
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-go-runtime-failure-'))
+  fs.mkdirSync(path.join(root, '.codegraph'))
+  fs.writeFileSync(path.join(root, '.codegraph', 'CURRENT'), 'generation-before\n')
+  let publications = 0
+  const worker = createGoLanguageAnalyzer(root, { [option]: asset, publish: () => { publications += 1 } }).createSemanticWorker()
+  await assert.rejects(worker.index({ root, sources: oneSource, sourceBlobs: {} }), expected)
+  assert.deepEqual({ publications, current: fs.readFileSync(path.join(root, '.codegraph', 'CURRENT'), 'utf8') }, { publications: 0, current: 'generation-before\n' })
 }
 
-test('equivalence partition: Go analyzer declares only Go source and Go workspace controls', async () => {
+test('error guessing: missing runtime WASM fails before publication and preserves CURRENT', async () => {
+  await failedPublication('runtimeAsset', path.join(failureFixtures, 'missing-runtime.wasm'), /runtime.*(?:missing|ENOENT)|ENOENT.*runtime/i)
+})
+
+test('error guessing: corrupt grammar WASM fails before publication and preserves CURRENT', async () => {
+  await failedPublication('grammarAsset', path.join(failureFixtures, 'corrupt-go.wasm'), /grammar.*(?:corrupt|invalid|WASM)|WASM.*grammar/i)
+})
+
+test('error guessing: mismatched grammar identity fails before publication and preserves CURRENT', async () => {
+  await failedPublication('grammarAsset', path.join(failureFixtures, 'mismatched-language.wasm'), /grammar.*(?:mismatch|language|version)|mismatch.*grammar/i)
+})
+
+test('architecture contract: Go runtime has no network process toolchain native helper download or compilation path', () => {
+  const source = fs.readFileSync(path.join(projectRoot, 'go-language-analyzer.mjs'), 'utf8')
+  assert.deepEqual({ network: /\bfetch\s*\(|https?\.|node:(?:http|https|net|tls|dgram)/.test(source), process: /node:child_process|\b(?:spawn|exec|fork)\s*\(/.test(source), toolchain: /\bgo\s+(?:run|build|install|env|list)\b/.test(source), native: /node-gyp|\.node['"]|native helper/i.test(source), download: /download|curl|wget|npm install/i.test(source), compile: /compileStreaming|WebAssembly\.compile|build.*wasm/i.test(source) }, { network: false, process: false, toolchain: false, native: false, download: false, compile: false })
+})
+
+test('error guessing: parsing performs zero network calls', async () => {
   const { createGoLanguageAnalyzer } = await loadGoAnalyzer()
-  const analyzer = createGoLanguageAnalyzer(fixtureRoot)
-
-  assert.deepEqual(
-    { id: analyzer.id, extensions: [...analyzer.extensions], controlFiles: [...analyzer.controlFiles] },
-    { id: 'go', extensions: ['.go'], controlFiles: ['go.mod', 'go.sum', 'go.work'] },
-  )
-})
-
-test('domain analysis: real Go semantic indexing emits types functions and methods with stable public kinds', async () => {
-  const result = await indexFixture()
-  const symbols = Object.values(result.partitions).flatMap((partition) => partition.symbols).map(({ file, name, kind }) => ({ file, name, kind })).sort((left, right) => `${left.file}:${left.name}`.localeCompare(`${right.file}:${right.name}`))
-
-  assert.deepEqual(symbols, [
-    { file: 'cmd/app/main.go', name: 'main', kind: 'function' },
-    { file: 'model/user.go', name: 'Greeting', kind: 'method' },
-    { file: 'model/user.go', name: 'NewUser', kind: 'function' },
-    { file: 'model/user.go', name: 'User', kind: 'type' },
-    { file: 'service/service.go', name: 'Welcome', kind: 'function' },
-    { file: 'service/service.go', name: 'helper', kind: 'function' },
-  ])
-})
-
-test('equivalence partition: Go export flags follow identifier visibility rather than file location', async () => {
-  const result = await indexFixture()
-  const exports = Object.values(result.partitions).flatMap((partition) => partition.symbols).map(({ name, exported }) => ({ name, exported })).sort((left, right) => left.name.localeCompare(right.name))
-
-  assert.deepEqual(exports, [
-    { name: 'Greeting', exported: true },
-    { name: 'main', exported: false },
-    { name: 'NewUser', exported: true },
-    { name: 'User', exported: true },
-    { name: 'Welcome', exported: true },
-    { name: 'helper', exported: false },
-  ])
-})
-
-test('domain analysis: Go package imports become normalized in-project file dependencies without standard-library noise', async () => {
-  const result = await indexFixture()
-  const dependencies = Object.fromEntries(Object.entries(result.partitions).map(([file, partition]) => [file, partition.dependencies]))
-
-  assert.deepEqual(dependencies, {
-    'cmd/app/main.go': ['service/service.go'],
-    'model/user.go': [],
-    'service/service.go': ['model/user.go'],
-  })
-})
-
-test('domain analysis: Go calls resolve across packages and receiver methods to existing symbol identifiers', async () => {
-  const result = await indexFixture()
-  const symbols = Object.values(result.partitions).flatMap((partition) => partition.symbols)
-  const names = new Map(symbols.map((symbol) => [symbol.id, symbol.name]))
-  const calls = Object.values(result.partitions).flatMap((partition) => partition.edges).filter((edge) => edge.call).map((edge) => `${names.get(edge.from)} -> ${names.get(edge.to)}`).sort()
-
-  assert.deepEqual(calls, ['Welcome -> Greeting', 'Welcome -> NewUser', 'main -> Welcome'])
-})
-
-test('error guessing: missing Go helper or toolchain fails explicitly instead of publishing empty partitions', async () => {
-  const { createGoLanguageAnalyzer } = await loadGoAnalyzer()
-  const analyzer = createGoLanguageAnalyzer(fixtureRoot, { command: path.join(fixtureRoot, 'missing-go-helper') })
-  const worker = analyzer.createSemanticWorker()
-
-  await assert.rejects(worker.index({ root: fixtureRoot, sources: [], sourceBlobs: {} }), /go.*(?:helper|toolchain|spawn|ENOENT)|ENOENT.*go/i)
-  await worker.dispose()
-})
-
-test('error guessing: malformed helper output rejects the operation rather than returning a partial generation', async () => {
-  const { validateGoAnalyzerResult } = await loadGoAnalyzer()
-
-  assert.throws(() => validateGoAnalyzerResult({ partitions: { 'model/user.go': { file: 'wrong.go', symbols: [], edges: [], dependencies: [] } } }, ['model/user.go']), /partition|membership|wrong\.go/i)
-})
-
-test('domain analysis: a leaf edit reparses its package without invalidating unrelated packages', async () => {
-  const { createGoLanguageAnalyzer } = await loadGoAnalyzer()
-  const analyzer = createGoLanguageAnalyzer(fixtureRoot)
-  const worker = analyzer.createSemanticWorker()
-  const input = sources()
-  await worker.index({ root: fixtureRoot, sources: [...input], sourceBlobs: Object.fromEntries([...input].map(([file, source]) => [file, hash(source)])) })
-  const changedSource = input.get('cmd/app/main.go').replace('"Ada"', '"Grace"')
-  const result = await worker.validate({ root: fixtureRoot, revision: 1, changes: [{ type: 'change', path: 'cmd/app/main.go', source: changedSource }] })
-  await worker.dispose()
-
-  assert.deepEqual(result.validatedFiles, ['cmd/app/main.go'])
-})
-
-test('domain analysis: an exported package edit validates its complete reverse-import cascade', async () => {
-  const { createGoLanguageAnalyzer } = await loadGoAnalyzer()
-  const analyzer = createGoLanguageAnalyzer(fixtureRoot)
-  const worker = analyzer.createSemanticWorker()
-  const input = sources()
-  await worker.index({ root: fixtureRoot, sources: [...input], sourceBlobs: Object.fromEntries([...input].map(([file, source]) => [file, hash(source)])) })
-  const changedSource = input.get('model/user.go').replace('Greeting() string', 'Greeting(prefix string) string').replace('return "hello " + user.Name', 'return prefix + user.Name')
-  const result = await worker.validate({ root: fixtureRoot, revision: 1, changes: [{ type: 'change', path: 'model/user.go', source: changedSource }] })
-  await worker.dispose()
-
-  assert.deepEqual(result.validatedFiles, ['cmd/app/main.go', 'model/user.go', 'service/service.go'])
-})
-
-test('error guessing: restoring an edited Go file produces the exact original partitions', async () => {
-  const original = await indexFixture()
-  const second = await indexFixture()
-
-  assert.deepEqual(second.partitions, original.partitions)
+  const originalFetch = globalThis.fetch
+  let calls = 0
+  globalThis.fetch = async () => { calls += 1; throw new Error('network access attempted') }
+  const worker = createGoLanguageAnalyzer(projectRoot).createSemanticWorker()
+  try {
+    await worker.index({ root: projectRoot, sources: oneSource, sourceBlobs: {} })
+    assert.equal(calls, 0)
+  } finally {
+    await worker.dispose()
+    globalThis.fetch = originalFetch
+  }
 })

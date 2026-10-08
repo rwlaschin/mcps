@@ -13,12 +13,18 @@ const PAGE_HEADER_BYTES = 64
 const STRING_PREFIX_BYTES = 64
 const SYMBOL_BYTES = 40
 const EDGE_BYTES = 16
+const UNRESOLVED_EDGE_BYTES = 16
 const INDEX_BYTES = 16
-const FOOTER_BYTES = 16
+const FOOTER_BYTES = 24
 const FOOTER_MAGIC = 0x58444951
 const HEADER_CHECKSUM_OFFSET = 252
 const encoder = new TextEncoder()
 const decoder = new TextDecoder('utf-8', { fatal: true })
+const compareBytes = (left, right) => {
+  const length = Math.min(left.byteLength, right.byteLength)
+  for (let index = 0; index < length; index += 1) if (left[index] !== right[index]) return left[index] - right[index]
+  return left.byteLength - right.byteLength
+}
 
 const checksum = (bytes) => {
   return crc32(bytes) >>> 0
@@ -29,6 +35,7 @@ const encodePage = ({ generation, coverage, view }) => {
   const graph = view.graph
   const strings = []
   const offsets = new Map()
+  const encoded = new Map()
   let stringBytes = STRING_PREFIX_BYTES
   const intern = (value) => {
     const text = String(value)
@@ -36,6 +43,7 @@ const encodePage = ({ generation, coverage, view }) => {
     const bytes = encoder.encode(text)
     const offset = stringBytes
     offsets.set(text, offset)
+    encoded.set(text, bytes)
     strings.push({ offset, bytes })
     stringBytes += bytes.byteLength + 1
     return offset
@@ -48,10 +56,12 @@ const encodePage = ({ generation, coverage, view }) => {
     intern(symbol.qualifiedPath ?? ''); intern(symbol.signature ?? '')
   }
   for (const edge of graph.edges) { intern(edge.from); intern(edge.to) }
+  for (const edge of graph.unresolvedEdges ?? []) { intern(edge.from); intern(edge.to); intern(edge.reason) }
 
   const symbolsOffset = PAGE_HEADER_BYTES + stringBytes
   const edgesOffset = symbolsOffset + graph.symbols.length * SYMBOL_BYTES
-  const nameIndexOffset = edgesOffset + graph.edges.length * EDGE_BYTES
+  const unresolvedEdgesOffset = edgesOffset + graph.edges.length * EDGE_BYTES
+  const nameIndexOffset = unresolvedEdgesOffset + (graph.unresolvedEdges?.length ?? 0) * UNRESOLVED_EDGE_BYTES
   const fileIndexOffset = nameIndexOffset + graph.symbols.length * INDEX_BYTES
   const incomingIndexOffset = fileIndexOffset + graph.symbols.length * INDEX_BYTES
   const outgoingIndexOffset = incomingIndexOffset + graph.edges.length * INDEX_BYTES
@@ -84,7 +94,12 @@ const encodePage = ({ generation, coverage, view }) => {
     data.setUint32(base, symbolIndex.get(edge.from) ?? 0xffffffff, true); data.setUint32(base + 4, symbolIndex.get(edge.to) ?? 0xffffffff, true)
     data.setInt32(base + 8, edge.line, true); data.setUint32(base + 12, edge.call ? 1 : 0, true)
   })
-  const sortedSymbols = (key) => graph.symbols.map((symbol, index) => ({ key: key(symbol), index })).sort((left, right) => left.key.localeCompare(right.key) || left.index - right.index)
+  ;(graph.unresolvedEdges ?? []).forEach((edge, index) => {
+    const base = unresolvedEdgesOffset + index * UNRESOLVED_EDGE_BYTES
+    data.setUint32(base, intern(edge.from), true); data.setUint32(base + 4, intern(edge.to), true)
+    data.setInt32(base + 8, edge.line, true); data.setUint32(base + 12, intern(edge.reason), true)
+  })
+  const sortedSymbols = (key) => graph.symbols.map((symbol, index) => ({ key: key(symbol), index })).sort((left, right) => compareBytes(encoded.get(left.key), encoded.get(right.key)) || left.index - right.index)
   sortedSymbols((symbol) => symbol.name).forEach((entry, index) => { data.setUint32(nameIndexOffset + index * INDEX_BYTES, intern(entry.key), true); data.setUint32(nameIndexOffset + index * INDEX_BYTES + 4, entry.index, true) })
   sortedSymbols((symbol) => symbol.file).forEach((entry, index) => { data.setUint32(fileIndexOffset + index * INDEX_BYTES, intern(entry.key), true); data.setUint32(fileIndexOffset + index * INDEX_BYTES + 4, entry.index, true) })
   const sortedEdges = (key) => graph.edges.map((edge, index) => ({ key: symbolIndex.get(key(edge)), index })).sort((left, right) => left.key - right.key || left.index - right.index)
@@ -92,6 +107,8 @@ const encodePage = ({ generation, coverage, view }) => {
   sortedEdges((edge) => edge.from).forEach((entry, index) => { data.setUint32(outgoingIndexOffset + index * INDEX_BYTES, entry.key, true); data.setUint32(outgoingIndexOffset + index * INDEX_BYTES + 4, entry.index, true) })
   sortedSymbols((symbol) => symbol.id).forEach((entry, index) => { data.setUint32(idIndexOffset + index * INDEX_BYTES, intern(entry.key), true); data.setUint32(idIndexOffset + index * INDEX_BYTES + 4, entry.index, true) })
   data.setUint32(footerOffset, FOOTER_MAGIC, true); data.setUint32(footerOffset + 4, idIndexOffset, true); data.setUint32(footerOffset + 8, graph.symbols.length, true)
+  data.setUint32(footerOffset + 12, unresolvedEdgesOffset, true); data.setUint32(footerOffset + 16, graph.unresolvedEdges?.length ?? 0, true)
+  data.setUint32(footerOffset + 20, Array.isArray(graph.unresolvedEdges) ? 1 : 0, true)
   return bytes
 }
 
@@ -110,7 +127,16 @@ class MappedQueryView {
   get symbols() { return this.matchingSymbols() }
   get files() { return [...new Set(this.symbols.map((symbol) => symbol.file))].sort() }
   get edges() { return Array.from({ length: this.data.getUint32(32, true) }, (_, index) => this.edge(index)) }
+  get unresolvedEdges() {
+    const footer = this.#footerOffset()
+    const offset = this.data.getUint32(footer + 12, true)
+    return Array.from({ length: this.data.getUint32(footer + 16, true) }, (_, index) => {
+      const base = offset + index * UNRESOLVED_EDGE_BYTES
+      return { from: this.string(this.data.getUint32(base, true)), to: this.string(this.data.getUint32(base + 4, true)), line: this.data.getInt32(base + 8, true), reason: this.string(this.data.getUint32(base + 12, true)) }
+    })
+  }
   string(offset) {
+    this.decodeObserver?.({ type: 'string' })
     const start = this.pageOffset + this.data.getUint32(8, true) + offset
     let end = start
     const limit = this.pageOffset + this.data.getUint32(8, true) + this.data.getUint32(12, true)
@@ -165,11 +191,24 @@ class MappedQueryView {
     return result
   }
   #stringIndex(start, end, key) {
-    const result = []
-    let low = 0; let high = Math.floor((end - start) / INDEX_BYTES)
-    while (low < high) { const middle = (low + high) >>> 1; if (this.string(this.data.getUint32(start + middle * INDEX_BYTES, true)).localeCompare(key) < 0) low = middle + 1; else high = middle }
-    for (let index = low; start + index * INDEX_BYTES < end && this.string(this.data.getUint32(start + index * INDEX_BYTES, true)) === key; index += 1) result.push(this.data.getUint32(start + index * INDEX_BYTES + 4, true))
+    const result = []; const needle = encoder.encode(key)
+    const count = Math.floor((end - start) / INDEX_BYTES)
+    const compare = (row) => this.#comparePageString(this.data.getUint32(start + row * INDEX_BYTES, true), needle)
+    let low = 0; let high = count
+    while (low < high) { const middle = (low + high) >>> 1; if (compare(middle) < 0) low = middle + 1; else high = middle }
+    for (let row = low; row < count && compare(row) === 0; row += 1) result.push(this.data.getUint32(start + row * INDEX_BYTES + 4, true))
     return result
+  }
+  #comparePageString(offset, needle) {
+    const start = this.pageOffset + this.data.getUint32(8, true) + offset
+    const limit = this.pageOffset + this.data.getUint32(8, true) + this.data.getUint32(12, true)
+    let index = 0
+    while (index < needle.byteLength && start + index < limit && this.bytes[start + index] !== 0) {
+      const difference = this.bytes[start + index] - needle[index]
+      if (difference) return difference
+      index += 1
+    }
+    return start + index >= limit || this.bytes[start + index] === 0 ? (index === needle.byteLength ? 0 : -1) : 1
   }
   #numericIndex(start, end, key) {
     const result = []; let low = 0; let high = Math.floor((end - start) / INDEX_BYTES)
@@ -187,7 +226,7 @@ class MappedQueryView {
     const symbols = this.symbols
     const files = [...new Set(symbols.map((symbol) => symbol.file))].sort()
     const edges = this.edges
-    return { generation, edgeCoverage, files, symbols, edges }
+    return { generation, edgeCoverage, files, symbols, edges, ...(this.data.getUint32(this.#footerOffset() + 20, true) ? { unresolvedEdges: this.unresolvedEdges } : {}) }
   }
 }
 

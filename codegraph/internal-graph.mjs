@@ -1,4 +1,6 @@
-import { Project, Node, SyntaxKind } from 'ts-morph'
+import { Node, SyntaxKind } from 'ts-morph'
+import path from 'node:path'
+import { createRawSemanticProject } from './one-file-semantic-library.mjs'
 export { encodeInternalPartition, decodeInternalPartition, INTERNAL_SCHEMA_VERSION } from './store.mjs'
 
 const assignments = new Set(Array.from({ length: SyntaxKind.LastAssignment - SyntaxKind.FirstAssignment + 1 }, (_, i) => SyntaxKind.FirstAssignment + i))
@@ -177,8 +179,10 @@ function attachRelations(sourceFile, graph, identifiers, resolveSymbol, instrume
   return graph
 }
 
-function graphFromSourceFile(sourceFile, file, syntax, resolveSymbol, packed = false, { instrumentRelationLookup = false } = {}) {
+function graphFromSourceFile(sourceFile, file, syntax, resolveSymbol, packed = false, { instrumentRelationLookup = false, structuralCache = null } = {}) {
   const owners = new Rows(); const nodes = new Rows(); const edges = new Rows(); const relations = new Rows(); const ownerStack = []; const built = new Set()
+  let activeFacts = null; let activeNodeStart = 0
+  if (structuralCache) { structuralCache.stats.rebuiltOwners = 0; structuralCache.stats.reusedOwners = 0 }
   const syntaxIndex = syntax.nodes ? new WeakMap(syntax.nodes.map((node, index) => [node, index])) : null
   const childrenOf = syntax.children
     ? (node) => syntax.children.get(node.compilerNode) ?? []
@@ -188,6 +192,7 @@ function graphFromSourceFile(sourceFile, file, syntax, resolveSymbol, packed = f
         return result
       }
   const addNode = (ownerId, ast, kind, role = 'body', parentId = null, unreachable = false, flags = 0) => {
+    if (activeFacts) activeFacts.nodes.push({ anchor: ast.compilerNode, row: { parentId: parentId === null ? null : parentId - activeNodeStart, kind, role, unreachable, ...(flags ? { flags } : {}) } })
     const node = { id: nodes.length, ownerId, parentId, kind, role, ...location(sourceFile, ast), symbolId: null, unreachable, ...(flags ? { flags } : {}) }; nodes.push(node); return node
   }
   const addEdge = (ownerId, from, to, kind) => { if (from !== null && to !== null) edges.push({ ownerId, from, to, kind }) }
@@ -197,6 +202,22 @@ function graphFromSourceFile(sourceFile, file, syntax, resolveSymbol, packed = f
     built.add(root.compilerNode)
     const id = owners.length
     const ownerNodeStart = nodes.length; const ownerEdgeStart = edges.length
+    const retained = structuralCache?.owners.get(root.compilerNode)
+    if (retained) {
+      const owner = { ...retained.owner, id, symbolId: null, parentOwnerId: explicitParent, name: ownerName(root), file, ...location(sourceFile, root), entryNodeId: ownerNodeStart + retained.owner.entryNodeId, exitNodeId: ownerNodeStart + retained.owner.exitNodeId, firstNode: ownerNodeStart }
+      owners.push(owner)
+      for (const fact of retained.nodes) {
+        const node = { ...fact.row, id: nodes.length, ownerId: id, parentId: fact.row.parentId === null ? null : ownerNodeStart + fact.row.parentId, ...location(sourceFile, { compilerNode: fact.anchor }), symbolId: null }
+        nodes.push(node)
+      }
+      for (const edge of retained.edges) edges.push({ ownerId: id, from: ownerNodeStart + edge.from, to: ownerNodeStart + edge.to, kind: edge.kind })
+      structuralCache.stats.reusedOwners += 1
+      for (const nested of retained.nestedOwners) buildOwner(root.session.wrap(nested), id)
+      return
+    }
+    if (structuralCache) structuralCache.stats.rebuiltOwners += 1
+    const facts = structuralCache ? { owner: null, nodes: [], edges: [], nestedOwners: [] } : null
+    activeFacts = facts; activeNodeStart = ownerNodeStart
     const owner = { id, symbolId: null, parentOwnerId: explicitParent, kind: executableKind(root), name: ownerName(root), file, ...location(sourceFile, root), entryNodeId: null, exitNodeId: null, cyclomatic: 1, branchCount: 0, nestingDepth: 0 }
     owners.push(owner); ownerStack.push(id)
     const entry = addNode(id, root, 'entry'); const exit = addNode(id, root, 'exit'); owner.entryNodeId = entry.id; owner.exitNodeId = exit.id
@@ -315,6 +336,13 @@ function graphFromSourceFile(sourceFile, file, syntax, resolveSymbol, packed = f
     const owned = nodes.rows.slice(ownerNodeStart); const ownedEdges = edges.rows.slice(ownerEdgeStart)
     owner.firstNode = owned[0].id; owner.nodeCount = owned.length
     Object.assign(owner, metricsForOwner(owner, owned, ownedEdges))
+    if (structuralCache) {
+      facts.owner = { kind: owner.kind, name: owner.name, entryNodeId: owner.entryNodeId - ownerNodeStart, exitNodeId: owner.exitNodeId - ownerNodeStart, nodeCount: owner.nodeCount, cyclomatic: owner.cyclomatic, branchCount: owner.branchCount, nestingDepth: owner.nestingDepth }
+      for (let index = ownerEdgeStart; index < edges.length; index += 1) { const edge = edges.get(index); facts.edges.push({ from: edge.from - ownerNodeStart, to: edge.to - ownerNodeStart, kind: edge.kind }) }
+      for (const nested of nestedOwners) facts.nestedOwners.push(nested.compilerNode)
+      structuralCache.owners.set(root.compilerNode, facts)
+    }
+    activeFacts = null
     ownerStack.pop()
     for (const nested of nestedOwners) buildOwner(nested, id)
   }
@@ -331,8 +359,9 @@ function graphFromSourceFile(sourceFile, file, syntax, resolveSymbol, packed = f
 }
 
 export function buildInternalGraph({ file, source, compilerOptions = {}, resolveSymbol, instrumentRelationLookup = false }) {
-  const project = new Project({ useInMemoryFileSystem: true, compilerOptions: { allowJs: true, ...compilerOptions } })
-  const sourceFile = project.createSourceFile(file, source)
+  const root = path.parse(path.resolve(file)).root
+  const project = createRawSemanticProject(root, new Map([[path.relative(root, path.resolve(file)), source]]), { allowJs: true, ...compilerOptions }, null, { loadLibFiles: true })
+  const sourceFile = project.getSourceFile(path.resolve(file))
   return graphFromSourceFile(sourceFile, file, collectSyntax(sourceFile), resolveSymbol, false, { instrumentRelationLookup })
 }
 export function buildInternalGraphFromCollectedSyntax(sourceFile, file, syntax, resolveSymbol, options) { return graphFromSourceFile(sourceFile, file, syntax, resolveSymbol, true, options) }

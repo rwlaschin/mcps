@@ -1,7 +1,16 @@
 import test from "node:test"
 import assert from "node:assert/strict"
+import fs from "node:fs"
 import * as visualizerGraph from "../visualizer-graph.mjs"
 import { colorFor, heatColorFor, getContrastText, hslToHex, filterSymbols, buildLayeredGraph, buildHeatmapData, buildSunburstData, buildChordData, buildCallTreeData, buildComplexityData, complexityColorFor, formatLocation, classifyArchitecturalTier } from "../visualizer-graph.mjs"
+
+test('architecture contract: visualizer watch delegates source routing to analyzer metadata', () => {
+  const source = fs.readFileSync(new URL('../visualizer.mjs', import.meta.url), 'utf8')
+  assert.deepEqual(
+    { acceptsInjectedPolicy: /options\.(?:sourcePolicy|policy)/.test(source), delegatesWatchPath: /acceptWatchPath\(file\)/.test(source), hardcodedSourceArray: /\[['"]\.ts['"][\s\S]{0,160}\.tsx/.test(source) },
+    { acceptsInjectedPolicy: true, delegatesWatchPath: true, hardcodedSourceArray: false },
+  )
+})
 
 test("colorFor: rotates colors using HSV + prime stride, avoids black and white", () => {
   const generated = new Set()

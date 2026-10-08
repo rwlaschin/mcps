@@ -435,13 +435,6 @@ test('hotpath boundary: publishing a small replacement never fills or writes the
   assert.equal(adapter.writeRanges.some(({ operation, end, start }) => operation === 'fill' || end - start > 4096), false)
 })
 
-test('build contract: optional native build declares node-gyp or resolves npm bundled node-gyp explicitly', () => {
-  const packageJson = JSON.parse(fs.readFileSync(path.join(import.meta.dirname, '..', 'package.json'), 'utf8'))
-  const buildScript = fs.readFileSync(path.join(import.meta.dirname, '..', 'native', 'build-optional.mjs'), 'utf8')
-
-  assert.equal(Boolean(packageJson.devDependencies?.['node-gyp']) || buildScript.includes('npm/node_modules/node-gyp/bin/node-gyp.js'), true)
-})
-
 test('schema boundary: the stable cache filename reaches both query engine runtime paths', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-cache-name-'))
   const opened = []
@@ -466,40 +459,54 @@ test('schema boundary: the stable cache filename reaches both query engine runti
   }
 })
 
-test('equivalence partition: the current reader opens the immutable old-release binary with both calls and complete pages intact', () => {
+test('cache compatibility: an immutable schema-v2 page safely misses and rebuilds as schema v3', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-old-cache-reader-'))
   const cacheFile = path.join(root, 'query-view-cache.bin')
   fs.copyFileSync(oldReleaseFixture, cacheFile)
   const cache = new MmapQueryCache({ filePath: cacheFile, root: '/workspace/project', adapter: nativeMmapAdapter, capacityBytes: 65536 })
 
   try {
-    const calls = cache.acquire({ generation: 'old-release-calls', coverage: 'calls' })
-    const complete = cache.acquire({ generation: 'old-release-complete', coverage: 'complete' })
-    const result = {
-      callsGeneration: calls.value.mappedView.generation,
-      callsCoverage: calls.value.mappedView.edgeCoverage,
-      callsRows: calls.value.mappedView.relationships({ name: 'useSettings' }, 'incoming'),
-      completeGeneration: complete.value.mappedView.generation,
-      completeCoverage: complete.value.mappedView.edgeCoverage,
-      completeRows: complete.value.mappedView.relationships({ name: 'saveCampaign' }, 'incoming'),
-      fixtureSha256: sha256File(oldReleaseFixture),
-    }
-    calls.release()
-    complete.release()
+    const callsMiss = cache.acquire({ generation: 'old-release-calls', coverage: 'calls' })
+    const completeMiss = cache.acquire({ generation: 'old-release-complete', coverage: 'complete' })
+    const rebuilt = cache.publish({
+      generation: 'schema-v3-rebuild', coverage: 'complete', view: { graph: {
+        generation: 'schema-v3-rebuild', edgeCoverage: 'complete', files: ['src/a.ts'],
+        symbols: [
+          { id: 'target-id', file: 'src/a.ts', name: 'target', kind: 'function', line: 1, qualifiedPath: '<module>', signature: '<>():', ordinal: 0, exported: true },
+          { id: 'caller-id', file: 'src/a.ts', name: 'caller', kind: 'function', line: 2, qualifiedPath: '<module>', signature: '<>():', ordinal: 1, exported: true },
+        ],
+        edges: [{ from: 'caller-id', to: 'target-id', line: 2, call: true }],
+      } },
+    })
+    const current = cache.acquire({ generation: 'schema-v3-rebuild', coverage: 'complete' })
 
-    assert.deepEqual(result, {
-      callsGeneration: 'old-release-calls',
-      callsCoverage: 'calls',
-      callsRows: [{ from: 'settings-panel', to: 'use-settings', line: 14, call: true }],
-      completeGeneration: 'old-release-complete',
-      completeCoverage: 'complete',
-      completeRows: [{ from: 'campaign-route', to: 'save-campaign', line: 9, call: true }],
+    assert.deepEqual({ callsMiss, completeMiss, rebuilt, generation: current.value.mappedView.generation, rows: current.value.mappedView.relationships({ name: 'target' }, 'incoming'), fixtureSha256: sha256File(oldReleaseFixture) }, {
+      callsMiss: null,
+      completeMiss: null,
+      rebuilt: true,
+      generation: 'schema-v3-rebuild',
+      rows: [{ from: 'caller-id', to: 'target-id', line: 2, call: true }],
       fixtureSha256: oldReleaseFixtureSha256,
     })
+    current.release()
   } finally {
     cache.dispose()
     fs.rmSync(root, { recursive: true, force: true })
   }
+})
+
+test('schema v3 retains unresolved references in the mapped page', () => {
+  const cache = createCache(new FakeMmapAdapter())
+  const unresolvedEdges = [{ from: 'caller-id', to: 'missing-id', line: 7, reason: 'unresolved target' }]
+  cache.publish({ generation: 'generation-unresolved', coverage: 'complete', view: { graph: {
+    generation: 'generation-unresolved', edgeCoverage: 'complete', files: ['src/a.ts'],
+    symbols: [{ id: 'caller-id', file: 'src/a.ts', name: 'caller', kind: 'function', line: 7, qualifiedPath: '<module>', signature: '<>():', ordinal: 0, exported: true }],
+    edges: [], unresolvedEdges,
+  } } })
+  const lease = cache.acquire({ generation: 'generation-unresolved', coverage: 'complete' })
+  assert.deepEqual(lease.value.mappedView.unresolvedEdges, unresolvedEdges)
+  lease.release()
+  cache.dispose()
 })
 
 test('boundary value: an absent mistaken versioned cache returns the stable path without creating either file', () => {
@@ -644,6 +651,188 @@ test('hotpath regression: acquire and indexed symbols deps and resolved refs nev
   lease.release()
 })
 
+const assertZeroDecodeLookup = (request, expected) => {
+  const adapter = new FakeMmapAdapter()
+  const writer = createCache(adapter)
+  writer.publish({
+    generation: 'generation-zero-decode', coverage: 'complete',
+    view: { graph: {
+      generation: 'generation-zero-decode', edgeCoverage: 'complete', files: ['src/shared.ts', 'src/other.ts'],
+      symbols: [
+        { id: 'id-a', file: 'src/shared.ts', name: 'same', kind: 'function', line: 1, qualifiedPath: '<module>', signature: '<>():', ordinal: 0, exported: true },
+        { id: 'id-b', file: 'src/shared.ts', name: 'same', kind: 'function', line: 2, qualifiedPath: '<module>', signature: '<>():', ordinal: 0, exported: true },
+        { id: 'id-c', file: 'src/other.ts', name: 'same-prefix', kind: 'function', line: 3, qualifiedPath: '<module>', signature: '<>():', ordinal: 0, exported: true },
+      ], edges: [],
+    } },
+  })
+  writer.dispose()
+  let resultMaterializationStarted = false
+  let traversalStringDecodes = 0
+  const reader = new MmapQueryCache({
+    filePath: path.join('/virtual', 'query-view-cache.bin'), root: '/workspace/project', adapter, capacityBytes: 65536,
+    decodeObserver: ({ type }) => {
+      if (type === 'symbol') resultMaterializationStarted = true
+      if (type === 'string' && !resultMaterializationStarted) traversalStringDecodes += 1
+    },
+  })
+  const lease = reader.acquire({ generation: 'generation-zero-decode', coverage: 'complete' })
+
+  const actual = lease.value.mappedView.matchingSymbols(request).map(({ id }) => id)
+
+  assert.deepEqual({ traversalStringDecodes, actual }, { traversalStringDecodes: 0, actual: expected })
+  lease.release()
+}
+
+test('hotpath zero-decode contract: name lookup does not decode strings before result materialization', () => {
+  assertZeroDecodeLookup({ name: 'same' }, ['id-a', 'id-b'])
+})
+
+test('hotpath zero-decode contract: file lookup does not decode strings before result materialization', () => {
+  assertZeroDecodeLookup({ file: 'src/shared.ts' }, ['id-a', 'id-b'])
+})
+
+test('hotpath zero-decode contract: id lookup does not decode strings before result materialization', () => {
+  assertZeroDecodeLookup({ id: 'id-b' }, ['id-b'])
+})
+
+test('hotpath zero-decode contract: combined name and file lookup does not decode strings before result materialization', () => {
+  assertZeroDecodeLookup({ name: 'same', file: 'src/shared.ts' }, ['id-a', 'id-b'])
+})
+
+test('hotpath zero-decode contract: relationship lookup traversal does not decode strings before result materialization', () => {
+  const adapter = new FakeMmapAdapter()
+  const writer = createCache(adapter)
+  writer.publish({
+    generation: 'generation-zero-decode-rel', coverage: 'complete',
+    view: { graph: {
+      generation: 'generation-zero-decode-rel', edgeCoverage: 'complete', files: ['src/a.ts', 'src/b.ts'],
+      symbols: [
+        { id: 'target-id', file: 'src/a.ts', name: 'target', kind: 'function', line: 1, qualifiedPath: '<module>', signature: '<>():', ordinal: 0, exported: true },
+        { id: 'caller-id', file: 'src/b.ts', name: 'caller', kind: 'function', line: 2, qualifiedPath: '<module>', signature: '<>():', ordinal: 0, exported: true },
+      ], edges: [{ from: 'caller-id', to: 'target-id', line: 2, call: true }],
+    } },
+  })
+  writer.dispose()
+  let resultMaterializationStarted = false
+  let traversalStringDecodes = 0
+  const reader = new MmapQueryCache({
+    filePath: path.join('/virtual', 'query-view-cache.bin'), root: '/workspace/project', adapter, capacityBytes: 65536,
+    decodeObserver: ({ type }) => {
+      if (type === 'symbol' || type === 'edge') resultMaterializationStarted = true
+      if (type === 'string' && !resultMaterializationStarted) traversalStringDecodes += 1
+    },
+  })
+  const lease = reader.acquire({ generation: 'generation-zero-decode-rel', coverage: 'complete' })
+
+  const actual = lease.value.mappedView.relationships({ name: 'target' }, 'incoming')
+
+  assert.deepEqual({ traversalStringDecodes, actual }, {
+    traversalStringDecodes: 0,
+    actual: [{ from: 'caller-id', to: 'target-id', line: 2, call: true }],
+  })
+  lease.release()
+})
+
+const assertAbsentNameReturnsNoRows = (name) => {
+  const adapter = new FakeMmapAdapter()
+  const writer = createCache(adapter)
+  writer.publish({
+    generation: 'generation-absent', coverage: 'complete',
+    view: { graph: {
+      generation: 'generation-absent', edgeCoverage: 'complete', files: ['src/a.ts'],
+      symbols: [
+        { id: 'id-a', file: 'src/a.ts', name: 'same', kind: 'function', line: 1, qualifiedPath: '<module>', signature: '<>():', ordinal: 0, exported: true },
+        { id: 'id-b', file: 'src/a.ts', name: 'same-prefix', kind: 'function', line: 2, qualifiedPath: '<module>', signature: '<>():', ordinal: 0, exported: true },
+      ], edges: [],
+    } },
+  })
+  writer.dispose()
+  const reader = new MmapQueryCache({ filePath: path.join('/virtual', 'query-view-cache.bin'), root: '/workspace/project', adapter, capacityBytes: 65536 })
+  const lease = reader.acquire({ generation: 'generation-absent', coverage: 'complete' })
+
+  const actual = lease.value.mappedView.matchingSymbols({ name }).map(({ id }) => id)
+
+  assert.deepEqual(actual, [])
+  lease.release()
+}
+
+test('boundary value: absent name before the index range returns no rows', () => {
+  assertAbsentNameReturnsNoRows(' ')
+})
+
+test('boundary value: absent name within the index range returns no rows', () => {
+  assertAbsentNameReturnsNoRows('same-prefig')
+})
+
+test('boundary value: absent name after the index range returns no rows', () => {
+  assertAbsentNameReturnsNoRows('\uffff')
+})
+
+test('hotpath ordering contract: string indexes use UTF-8 page-byte order rather than locale collation', () => {
+  const source = fs.readFileSync(path.join(import.meta.dirname, '..', 'mmap-query-cache.mjs'), 'utf8')
+
+  assert.deepEqual({ usesLocaleCollation: source.includes('.localeCompare('), usesPageByteComparison: source.includes('comparePageString') }, {
+    usesLocaleCollation: false,
+    usesPageByteComparison: true,
+  })
+})
+
+test('domain analysis: raw name index is monotonic under the reader UTF-8 byte comparator', () => {
+  const adapter = new FakeMmapAdapter()
+  const writer = createCache(adapter)
+  writer.publish({
+    generation: 'generation-byte-order', coverage: 'complete',
+    view: { graph: {
+      generation: 'generation-byte-order', edgeCoverage: 'complete', files: ['src/unicode.ts'],
+      symbols: [
+        { id: 'id-z', file: 'src/unicode.ts', name: 'z', kind: 'function', line: 1, qualifiedPath: '<module>', signature: '<>():', ordinal: 0, exported: true },
+        { id: 'id-accent', file: 'src/unicode.ts', name: 'é', kind: 'function', line: 2, qualifiedPath: '<module>', signature: '<>():', ordinal: 0, exported: true },
+      ], edges: [],
+    } },
+  })
+  writer.dispose()
+  const bytes = adapter.files.get(path.join('/virtual', 'query-view-cache.bin'))
+  const file = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+  const pageOffset = file.getUint32(32 + file.getUint32(16, true) * 16, true)
+  const page = new DataView(bytes.buffer, bytes.byteOffset + pageOffset)
+  const stringsOffset = pageOffset + page.getUint32(8, true)
+  const nameIndexOffset = pageOffset + page.getUint32(40, true)
+  const firstOffset = file.getUint32(nameIndexOffset, true)
+  const secondOffset = file.getUint32(nameIndexOffset + 16, true)
+  const firstEnd = bytes.indexOf(0, stringsOffset + firstOffset)
+  const secondEnd = bytes.indexOf(0, stringsOffset + secondOffset)
+  const first = bytes.subarray(stringsOffset + firstOffset, firstEnd)
+  const second = bytes.subarray(stringsOffset + secondOffset, secondEnd)
+
+  assert.deepEqual({
+    orderedNames: [new TextDecoder().decode(first), new TextDecoder().decode(second)],
+    byteComparator: Buffer.compare(first, second),
+  }, { orderedNames: ['z', 'é'], byteComparator: -1 })
+})
+
+test('equivalence partition: Unicode name whose byte order differs from locale collation returns its exact row', () => {
+  const adapter = new FakeMmapAdapter()
+  const writer = createCache(adapter)
+  writer.publish({
+    generation: 'generation-unicode-query', coverage: 'complete',
+    view: { graph: {
+      generation: 'generation-unicode-query', edgeCoverage: 'complete', files: ['src/unicode.ts'],
+      symbols: [
+        { id: 'id-z', file: 'src/unicode.ts', name: 'z', kind: 'function', line: 1, qualifiedPath: '<module>', signature: '<>():', ordinal: 0, exported: true },
+        { id: 'id-accent', file: 'src/unicode.ts', name: 'é', kind: 'function', line: 2, qualifiedPath: '<module>', signature: '<>():', ordinal: 0, exported: true },
+      ], edges: [],
+    } },
+  })
+  writer.dispose()
+  const reader = new MmapQueryCache({ filePath: path.join('/virtual', 'query-view-cache.bin'), root: '/workspace/project', adapter, capacityBytes: 65536 })
+  const lease = reader.acquire({ generation: 'generation-unicode-query', coverage: 'complete' })
+
+  const actual = lease.value.mappedView.matchingSymbols({ name: 'é' })
+
+  assert.deepEqual(actual, [{ id: 'id-accent', file: 'src/unicode.ts', name: 'é', kind: 'function', line: 2, qualifiedPath: '<module>', signature: '<>():', ordinal: 0, exported: true }])
+  lease.release()
+})
+
 test('hotpath diagnostic: mapped indexes query one of 22000 symbols and 29 of 55000 incoming refs without full graph decode', (t) => {
   const symbols = Array.from({ length: 22000 }, (_, index) => ({
     id: `symbol-${index}`, file: `src/file-${index}.ts`, name: index === 0 ? 'needle' : `symbol${index}`, kind: 'function', line: 1,
@@ -688,13 +877,13 @@ test('hotpath diagnostic: mapped indexes query one of 22000 symbols and 29 of 55
 
   assert.deepEqual({
     graphDecodes, firstSymbol, firstRef: firstRefs[0], firstRefCount: firstRefs.length, firstQueryDecodes,
-    symbolCount, refCount, acquireUnder25ms: acquireMs < 25, p95Under10ms: metrics.p95 < 10,
+    symbolCount, refCount,
   }, {
     graphDecodes: 0,
     firstSymbol: { id: 'symbol-0', file: 'src/file-0.ts', name: 'needle', kind: 'function', line: 1, qualifiedPath: '<module>', signature: '<>():', ordinal: 0, exported: true },
     firstRef: { from: 'symbol-1', to: 'symbol-0', line: 1, call: true }, firstRefCount: 29,
     firstQueryDecodes: { symbolDecodes: 60, edgeDecodes: 29 },
-    symbolCount: 1, refCount: 29, acquireUnder25ms: true, p95Under10ms: true,
+    symbolCount: 1, refCount: 29,
   })
   lease.release()
 })

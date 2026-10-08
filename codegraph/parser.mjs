@@ -1,11 +1,14 @@
 import path from 'node:path'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
-import { Project, Node, SyntaxKind, ts } from 'ts-morph'
+import { Node, SyntaxKind, ts, getCompilerOptionsFromTsConfig } from 'ts-morph'
 import { RealFileSystemHost } from '@ts-morph/common'
 import { PrefetchedFileSystemHost } from './prefetched-file-system.mjs'
+import { createRawSemanticProject } from './one-file-semantic-library.mjs'
 import { EDGE_COVERAGE, requireCoverage } from './edge-coverage.mjs'
 import { addInternalGraphRelations, buildInternalGraphFromCollectedSyntax, encodeInternalPartition } from './internal-graph.mjs'
+import { moduleCandidates } from './module-candidates.mjs'
+import { extractCachedBindings, resolveCachedImport, visitImportBindings } from './cached-binding-resolver.mjs'
 
 export const contentHash = (text) => crypto.createHash('sha256').update(text).digest('hex')
 const slash = (p) => p.split(path.sep).join('/')
@@ -62,13 +65,23 @@ export class LineCursor {
   }
 }
 
-export function createSemanticProject(root, sources) {
-  const config = ['tsconfig.json', 'jsconfig.json'].map((name) => path.join(root, name)).find((file) => fs.existsSync(file))
+export function createSemanticProject(root, sources, options = {}) {
   const fileSystem = new PrefetchedFileSystemHost(root, sources, new RealFileSystemHost())
-  const project = new Project({ fileSystem, ...(config ? { tsConfigFilePath: config } : {}), skipAddingFilesFromTsConfig: true, compilerOptions: { allowJs: true } })
-  for (const [rel, source] of sources) project.createSourceFile(path.join(root, rel), source, { overwrite: true })
-  project.__codegraphHost = fileSystem
-  return project
+  return createRawSemanticProject(root, sources, readOneFileCompilerOptions(root), fileSystem, options)
+}
+
+export function readOneFileCompilerOptions(root) {
+  const tsConfig = path.join(root, 'tsconfig.json')
+  const jsConfig = path.join(root, 'jsconfig.json')
+  const config = fs.existsSync(tsConfig) ? tsConfig : fs.existsSync(jsConfig) ? jsConfig : undefined
+  const fileSystem = new RealFileSystemHost()
+  fileSystem.readDirSync = () => []
+  const options = { ...(config ? getCompilerOptionsFromTsConfig(config, { fileSystem }).options : {}), allowJs: true }
+  return options
+}
+
+export function createOneFileSemanticProject(root, sources) {
+  return createRawSemanticProject(root, sources, readOneFileCompilerOptions(root))
 }
 
 function nodeName(node) {
@@ -95,42 +108,52 @@ function semanticSignature(node) {
   return `<${typeParameters}>(${parameters}):${returnType || declaredType}`
 }
 
-function collectFileSyntax(file, source, lineCursor, timing) {
+function collectFileSyntax(file, source, lineCursor, timing, preparedStructuralGraph, deferStructuralGraph = false) {
   const started = performance.now()
   const nodesByKind = new Map([...declarationKinds.keys()].map((syntaxKind) => [syntaxKind, []]))
   const identifiers = []
-  const internalNodes = [file]
-  const firstChild = [-1]
-  const nextSibling = [-1]
-  const lastChild = [-1]
-  const localOwner = [null]
-  const stack = [0]
+  const structuralCache = file.structuralCache
+  const syntaxFacts = structuralCache ? structuralCache.syntax ??= new WeakMap() : new WeakMap()
+  const nativeTraversal = Boolean((preparedStructuralGraph || deferStructuralGraph) && file.compilerNode && file.session?.wrap)
+  const children = nativeTraversal ? null : structuralCache ? structuralCache.children ??= new WeakMap() : new WeakMap()
   lineCursor.reset(source)
-  file.forEachDescendant((node) => {
-    const parent = node.getParent()
-    while (stack.length && internalNodes[stack.at(-1)] !== parent) stack.pop()
-    const parentIndex = stack.at(-1)
-    const internalIndex = internalNodes.length
-    internalNodes.push(node); firstChild.push(-1); nextSibling.push(-1); lastChild.push(-1)
-    if (lastChild[parentIndex] === -1) firstChild[parentIndex] = internalIndex
-    else nextSibling[lastChild[parentIndex]] = internalIndex
-    lastChild[parentIndex] = internalIndex
-    stack.push(internalIndex)
+  const record = (node, owner) => {
     const bucket = nodesByKind.get(node.getKind())
     const isIdentifier = Node.isIdentifier(node)
-    const name = bucket ? nodeName(node) : null
-    localOwner.push(name ? node.compilerNode : localOwner[parentIndex])
-    if (!bucket && !isIdentifier) return
-    const line = lineCursor.lineAt(node.getStart())
-    if (bucket) bucket.push({ node, line, name })
-    if (isIdentifier) identifiers.push({ node, line, owner: localOwner[parentIndex] })
-  })
+    let fact = bucket ? syntaxFacts.get(node.compilerNode) : null
+    if (bucket && !fact) { fact = { name: nodeName(node), signature: semanticSignature(node) }; syntaxFacts.set(node.compilerNode, fact) }
+    if (bucket || isIdentifier) {
+      const line = lineCursor.lineAt(node.getStart())
+      if (bucket) bucket.push({ node, line, name: fact.name, signature: fact.signature })
+      if (isIdentifier) identifiers.push({ node, line, owner })
+    }
+    return fact?.name ? node.compilerNode : owner
+  }
+  if (nativeTraversal) {
+    const visit = (node, owner) => {
+      const nextOwner = declarationKinds.has(node.kind) || node.kind === SyntaxKind.Identifier ? record(file.session.wrap(node), owner) : owner
+      ts.forEachChild(node, child => { visit(child, nextOwner) })
+    }
+    ts.forEachChild(file.compilerNode, child => { visit(child, null) })
+  } else {
+    const emptyChildren = []
+    const stack = [file]; const ownerStack = [null]; const building = [false]; let depth = 0
+    file.forEachDescendant((node) => {
+      const parent = node.getParent()
+      while (stack[depth] !== parent) { if (!children.has(stack[depth].compilerNode)) children.set(stack[depth].compilerNode, emptyChildren); depth -= 1 }
+      if (building[depth]) children.get(parent.compilerNode).push(node)
+      else if (!children.has(parent.compilerNode)) { children.set(parent.compilerNode, [node]); building[depth] = true }
+      const owner = record(node, ownerStack[depth])
+      depth += 1; stack[depth] = node; ownerStack[depth] = owner; building[depth] = false
+    })
+    while (depth >= 0) { if (!children.has(stack[depth].compilerNode)) children.set(stack[depth].compilerNode, emptyChildren); depth -= 1 }
+  }
 
   const groups = new Map(); const result = []
   for (const [syntaxKind, kind] of declarationKinds) {
-    for (const { node, line, name } of nodesByKind.get(syntaxKind)) {
+    for (const { node, line, name, signature } of nodesByKind.get(syntaxKind)) {
       if (!name) continue
-      const qualifiedPath = semanticPath(node); const signature = semanticSignature(node)
+      const qualifiedPath = semanticPath(node)
       const group = `${qualifiedPath}:${kind}:${name}:${signature}`; const ordinal = groups.get(group) ?? 0; groups.set(group, ordinal + 1)
       const rel = slash(path.relative(file.getProject().__codegraphRoot, file.getFilePath()))
       result.push({ node, identity: { id: contentHash(`${rel}\0${qualifiedPath}\0${kind}\0${name}\0${signature}\0${ordinal}`).slice(0, 24), file: rel, name, kind, line, qualifiedPath, signature, ordinal } })
@@ -138,7 +161,7 @@ function collectFileSyntax(file, source, lineCursor, timing) {
   }
   const rel = slash(path.relative(file.getProject().__codegraphRoot, file.getFilePath()))
   const structuralStarted = performance.now()
-  const internalSyntax = buildInternalGraphFromCollectedSyntax(file, rel, { nodes: internalNodes, firstChild: Int32Array.from(firstChild), nextSibling: Int32Array.from(nextSibling), identifiers })
+  const internalSyntax = preparedStructuralGraph ?? (deferStructuralGraph ? null : buildInternalGraphFromCollectedSyntax(file, rel, { children, identifiers }, undefined, { structuralCache }))
   const structuralMs = performance.now() - structuralStarted
   if (timing) { timing.structuralCfgMs += structuralMs; timing.syntaxCollectionMs += performance.now() - started - structuralMs }
   return { rows: result, identifiers, internalSyntax }
@@ -153,7 +176,9 @@ function ensureSemanticFile(context, file, profiler = context.profiler) {
     const profile = profiler?.begin('collect-file-syntax', args)
     try {
       for (const node of context.nodesByFile.get(filePath) ?? []) context.byDeclaration.delete(node)
-      const analysis = collectFileSyntax(file, file.getFullText(), context.lineCursor, context.semanticTiming)
+      const preparedStructuralGraph = context.preparedStructuralGraphs?.get(filePath)
+      const analysis = collectFileSyntax(file, file.getFullText(), context.lineCursor, context.semanticTiming, preparedStructuralGraph, context.deferStructuralGraph)
+      context.preparedStructuralGraphs?.delete(filePath)
       args.declarationCount = analysis.rows.length
       args.identifierCount = analysis.identifiers.length
       context.perFile.set(filePath, analysis)
@@ -228,23 +253,27 @@ function callExpressionForIdentifier(ident) {
   return Node.isPropertyAccessExpression(parent) && parent.getNameNode() === ident && Node.isCallExpression(grand) && grand.getExpression() === parent
 }
 
-function resolveIdentifierEdges(identifiers, localByNode, context, identifierArgs, coverage, targetByIdentifier) {
+function resolveIdentifierEdges(identifiers, localByNode, context, identifierArgs, coverage, targetByIdentifier, resolveMissing = null, references = null) {
   const edges = []
 
   for (const identifier of identifiers) {
     const { node: ident, line, owner } = identifier
     identifierArgs.total += 1
-    const call = callExpressionForIdentifier(ident)
+    let call = callExpressionForIdentifier(ident)
     if (coverage === EDGE_COVERAGE.CALLS && !call) continue
     const from = owner ? localByNode.get(owner) : null
     if (!from) { identifierArgs.noOwner += 1; continue }
     let symbol = ident.getSymbol?.()
     if (!symbol) { targetByIdentifier.set(ident.compilerNode, null); identifierArgs.symbolMissing += 1; continue }
-    try {
-      const alias = symbol.getAliasedSymbol()
-      if (alias) { symbol = alias; identifierArgs.aliases += 1 }
-    } catch {}
-    const target = identityForSymbol(symbol, context, identifierArgs)
+    const cached = resolveMissing ? resolveMissing(ident, symbol) : null
+    if (cached?.call) call = true
+    if (cached?.reference) { cached.reference.from = from.id; cached.reference.line = line; cached.reference.call = call; references.push(cached.reference) }
+    let target = cached?.target ?? null
+    if (!target) {
+      const alias = expandAliasSymbol(symbol)
+      if (alias !== symbol) { symbol = alias; identifierArgs.aliases += 1 }
+      target = identityForSymbol(symbol, context, identifierArgs)
+    }
     targetByIdentifier.set(ident.compilerNode, target?.id ?? null)
     if (!target) { identifierArgs.targetMissing += 1; continue }
     if (target.id === from.id) { identifierArgs.selfTarget += 1; continue }
@@ -256,11 +285,18 @@ function resolveIdentifierEdges(identifiers, localByNode, context, identifierArg
   return edges
 }
 
-export function parsePartition(rel, source, knownFiles, context, profiler = null, edgeCoverage = EDGE_COVERAGE.COMPLETE, includeInternals = true, retainAnalysis = false) {
+function expandAliasSymbol(symbol) {
+  if (!(symbol.getFlags() & ts.SymbolFlags.Alias)) return symbol
+  try { return symbol.getAliasedSymbol() ?? symbol } catch { return symbol }
+}
+
+export function parsePartition(rel, source, knownFiles, context, profiler = null, edgeCoverage = EDGE_COVERAGE.COMPLETE, includeInternals = true, retainAnalysis = false, cachedPartitions = null) {
   const absolute = path.join(context.root, rel)
   const file = context.project.getSourceFile(absolute)
   if (!file) throw new Error(`source was not prefetched: ${rel}`)
   const analysis = ensureSemanticFile(context, file, profiler)
+  const preparedStructuralGraph = context.preparedStructuralGraphs?.get(absolute)
+  if (preparedStructuralGraph) { analysis.internalSyntax = preparedStructuralGraph; context.preparedStructuralGraphs.delete(absolute) }
   const { rows } = analysis
 
   const exportArgs = { file: rel, exportsVisited: 0 }
@@ -268,21 +304,43 @@ export function parsePartition(rel, source, knownFiles, context, profiler = null
   let started = performance.now()
   let nestedStarted = context.semanticTiming && context.semanticTiming.syntaxCollectionMs + context.semanticTiming.structuralCfgMs
   const exportedIds = new Set()
-  for (const declarations of file.getExportedDeclarations().values()) for (const declaration of declarations) {
-    exportArgs.exportsVisited += 1
-    const identity = identityForDeclaration(declaration, context)
-    if (identity) exportedIds.add(identity.id)
-  }
+  const symbolRows = rows.map(({ identity }) => identity)
+  const bindings = extractCachedBindings(file.compilerNode, symbolRows, ts, exportedIds)
+  exportArgs.exportsVisited = bindings.length
   if (context.semanticTiming) context.semanticTiming.exportsMs += Math.max(0, performance.now() - started - (context.semanticTiming.syntaxCollectionMs + context.semanticTiming.structuralCfgMs - nestedStarted))
   if (exportProfile) profiler.end(exportProfile)
-  const symbols = rows.map(({ identity }) => ({ ...identity, exported: exportedIds.has(identity.id) }))
+  const symbols = symbolRows.map((identity) => ({ ...identity, exported: exportedIds.has(identity.id) }))
+  const imports = new Map()
+  const importFacts = file.structuralCache ? file.structuralCache.imports ??= new WeakMap() : null
+  if (importFacts) {
+    for (const statement of file.compilerNode.statements) {
+      if (!ts.isImportDeclaration(statement)) continue
+      let facts = importFacts.get(statement)
+      if (!facts) { facts = []; visitImportBindings({ statements: [statement] }, ts, (name, specifier, remote, namespace) => facts.push({ name, specifier, remote, namespace })); importFacts.set(statement, facts) }
+      for (const fact of facts) imports.set(fact.name, fact.namespace ? { specifier: fact.specifier, namespace: true, start: statement.pos, end: statement.end } : { specifier: fact.specifier, remote: fact.remote, start: statement.pos, end: statement.end })
+    }
+  } else visitImportBindings(file.compilerNode, ts, (name, specifier, remote, namespace, start, end) => imports.set(name, namespace ? { specifier, namespace: true, start, end } : { specifier, remote, start, end }))
+  const references = []
+  const resolveMissing = (ident, symbol) => {
+    const parent = ident.getParent()
+    if (Node.isPropertyAccessExpression(parent) && parent.getNameNode() === ident) return null
+    const imported = imports.get(ident.getText())
+    if (!imported) return null
+    const declaration = symbol.getDeclarations?.().find((node) => node.getStart() >= imported.start && node.getEnd() <= imported.end)
+    if (!declaration) return null
+    const propertyAccess = Node.isPropertyAccessExpression(parent) && parent.getExpression() === ident ? parent : null
+    const property = propertyAccess?.getName() ?? null
+    const reference = { specifier: imported.specifier, remote: imported.remote, namespace: Boolean(imported.namespace), property }
+    const target = cachedPartitions && resolveCachedImport(cachedPartitions, rel, reference, property)
+    return { target, call: propertyAccess ? Node.isCallExpression(propertyAccess.getParent()) : false, reference }
+  }
   const localByNode = new Map(rows.map(({ node, identity }) => [node.compilerNode, identity]))
   const targetByIdentifier = new Map()
   const identifierArgs = { file: rel, total: 0, noOwner: 0, symbolMissing: 0, aliases: 0, targetMissing: 0, selfTarget: 0, edges: 0, calls: 0, nonCalls: 0, declarationProbes: 0 }
   const identifierProfile = profiler?.begin('identifiers-symbol-resolution', identifierArgs)
   started = performance.now()
   nestedStarted = context.semanticTiming && context.semanticTiming.syntaxCollectionMs + context.semanticTiming.structuralCfgMs
-  const edges = resolveIdentifierEdges(analysis.identifiers, localByNode, context, identifierArgs, requireCoverage(edgeCoverage), targetByIdentifier)
+  const edges = resolveIdentifierEdges(analysis.identifiers, localByNode, context, identifierArgs, requireCoverage(edgeCoverage), targetByIdentifier, resolveMissing, references)
   if (context.semanticTiming) context.semanticTiming.identifierResolutionMs += Math.max(0, performance.now() - started - (context.semanticTiming.syntaxCollectionMs + context.semanticTiming.structuralCfgMs - nestedStarted))
   if (identifierProfile) profiler.end(identifierProfile)
   const dependencies = []; const unresolved = []
@@ -294,8 +352,9 @@ export function parsePartition(rel, source, knownFiles, context, profiler = null
     if (target) { dependencies.push(slash(path.relative(context.root, target.getFilePath()))); dependencyArgs.resolved += 1; continue }
     const specifier = decl.getModuleSpecifierValue?.()
     if (typeof specifier !== 'string' || !specifier.startsWith('.')) continue
-    const base = slash(path.posix.normalize(path.posix.join(path.posix.dirname(rel), specifier)))
-    const candidates = [base, ...['.ts', '.tsx', '.js', '.jsx', '.mts', '.cts', '.mjs', '.cjs'].map((ext) => base + ext), ...['/index.ts', '/index.tsx', '/index.js', '/index.jsx'].map((ext) => base + ext)]
+    const candidates = moduleCandidates(rel, specifier)
+    const known = candidates.find((candidate) => knownFiles.has(candidate))
+    if (known) { dependencies.push(known); dependencyArgs.resolved += 1; continue }
     dependencyArgs.unresolved += 1
     dependencyArgs.candidates += candidates.length
     unresolved.push({ specifier, candidates })
@@ -310,14 +369,15 @@ export function parsePartition(rel, source, knownFiles, context, profiler = null
     if (targetByIdentifier.has(identifier.compilerNode)) return targetByIdentifier.get(identifier.compilerNode)
     let symbol = identifier.getSymbol?.()
     if (!symbol) { targetByIdentifier.set(identifier.compilerNode, null); return null }
-    try { symbol = symbol.getAliasedSymbol() ?? symbol } catch {}
+    symbol = expandAliasSymbol(symbol)
     const target = identityForSymbol(symbol, context)?.id ?? null
     targetByIdentifier.set(identifier.compilerNode, target)
     return target
   }
   started = performance.now()
   nestedStarted = context.semanticTiming && context.semanticTiming.syntaxCollectionMs + context.semanticTiming.structuralCfgMs
-  const semanticTargets = analysis.identifiers.map(({ node }) => resolveInternalTarget(node)).filter(Boolean).sort()
+  const semanticTargets = [...targetByIdentifier.values()].filter(Boolean).sort()
+  if (retainAnalysis) analysis.semanticTargets = semanticTargets
   const orderedDependencies = [...new Set(dependencies)].sort()
   const internalFingerprint = contentHash(JSON.stringify({ schema: 1, typescript: ts.version, compilerOptions: context.project.getCompilerOptions(), sourceHash, dependencies: orderedDependencies, semanticTargets }))
   const internalGraph = includeInternals ? addInternalGraphRelations(file, analysis.internalSyntax, analysis.identifiers, resolveInternalTarget) : null
@@ -329,7 +389,7 @@ export function parsePartition(rel, source, knownFiles, context, profiler = null
     }
     for (const owner of internalGraph.owners) {
       const symbol = symbolByOwnerLocation.get(`${owner.name}\0${owner.line}`)
-      if (symbol) internalGraph.owners.set(owner.id, 'symbolId', symbol.id)
+      if (symbol) owner.symbolId = symbol.id
     }
   }
   if (context.semanticTiming) context.semanticTiming.internalRelationsMs += Math.max(0, performance.now() - started - (context.semanticTiming.syntaxCollectionMs + context.semanticTiming.structuralCfgMs - nestedStarted))
@@ -340,7 +400,7 @@ export function parsePartition(rel, source, knownFiles, context, profiler = null
     if (context.semanticTiming) context.semanticTiming.encodingMs += performance.now() - started
   }
   // The worker writes these required fields directly into the existing shared packed tables.
-  const partition = { file: rel, sourceHash, symbols, edges, dependencies: orderedDependencies, unresolved, internalFingerprint, ...(internalPartition ? { internalPartition } : {}) }
+  const partition = { file: rel, sourceHash, symbols, edges, dependencies: orderedDependencies, unresolved, bindings, references, internalFingerprint, ...(internalPartition ? { internalPartition } : {}) }
   if (!retainAnalysis) context.perFile.delete(file.getFilePath())
   return partition
 }

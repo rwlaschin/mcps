@@ -1,5 +1,5 @@
 ---
-modified: 2026-09-12
+modified: 2026-10-08
 dependencies: [storage-and-query.md, mcp-and-cli.md]
 ---
 
@@ -21,10 +21,10 @@ Read this if you are changing what gets indexed, what kinds of symbols exist, or
 ## Design Constraints
 
 - **Semantic parsing is worker-owned.** Every `CodeGraphEngine` sends initial `index`, persisted `hydrate`, delta `validate`, and warm `reference-overlay` work through one `SemanticCheckerWorker`.
-- **Sparse semantic validation is deliberately narrow.** A delta is allowed only for one edit to an existing module-scoped file when both the old and new source remain module-scoped and contain no global/ambient or triple-slash constructs. Adds, deletes, multi-file changes, scripts, unresolved dependencies, and cache/base mismatches use full validation.
+- **Single-file validation is changed-file-only.** A one-file change or add parses and validates exactly that file; an unlink emits exactly one tombstone and parses no source. Dependent source is never read, parsed, scanned, resolved, or validated. Retained complete partitions and indexes supply the facts needed to patch edges and report dangling references. Cold and multi-file builds remain full batches.
 - **Read concurrency is validated, not clamped.** `readSources` throws unless concurrency is an integer in 1..128 (`source-reader.mjs:8`), default 16.
 - **Worker requests time out at 30 s** and the worker is replaced (`parser-apartment-pool.mjs:7, 90`).
-- **`allowJs` is always on and `jsconfig.json` is accepted.** `parser.mjs:64-66` finds `tsconfig.json` or `jsconfig.json` and creates the `Project` with `compilerOptions: { allowJs: true }` and `skipAddingFilesFromTsConfig: true`.
+- **`allowJs` is always on and `jsconfig.json` is accepted.** The shared compiler-options reader selects `tsconfig.json` before `jsconfig.json`, disables source discovery, and overrides `allowJs` to true.
 - **`.gitignore`/`.codegraphignore` are honored; `node_modules`, `vendor`, `third_party`, `.git`, `.codegraph`, `.codegraph-v2` and the build directories in `BUILD_IGNORES` are unconditionally excluded** (`source-policy.mjs:6-7, 64`).
 - **File ids are uint32.** `PagedBitSet` asserts the range and pages at 4096 bits (`file-index.mjs:1-8`).
 
@@ -32,13 +32,15 @@ Read this if you are changing what gets indexed, what kinds of symbols exist, or
 
 Everything downstream — queries, dead-code detection, the visualizer — consumes symbol rows and edge rows. This subsystem is where those rows come from.
 
-The **semantic path** wants correctness: it needs the TypeScript checker to know that `helper` in this file is the `helper` exported from three modules over. That requires a real `Project` with a type checker over the whole workspace, which is expensive to build. `createSemanticProject` pays that cost against an in-memory source map, `prepareSemanticProject` does a single descendant walk per prepared file, and `parsePartition` resolves per-file without re-walking. In a persistent MCP runtime, the worker creates and retains that project during initial `index` or reconstructs it once during `hydrate`; the coordinator validates exact source and partition membership before adopting the result and retains no second semantic workspace. A safe one-file edit then refreshes only that file and its reverse transitive dependent closure. Unsafe edits rebuild the worker's full validated state.
+The **semantic path** uses the TypeScript compiler API directly through the shared raw-node library. Cold and multi-file batches own one lazy Program/checker over their prefetched sources, including the original bundled standard libraries and external package types. The existing parser pool supplies source-local structural graphs; its bounded source-order window overlaps that work with semantic resolution. Native semantic traversal wraps only declarations and identifiers when a structural graph is supplied. No production path constructs a Project or uses `createWrappedNode`.
 
-Complete-reference overlays use the semantic worker for only the stale files, hydrating the requested persisted generation when needed. The coordinator validates returned fragment membership, edge shape, endpoints, and owning file before atomically writing the overlay.
+Ordinary single-file mutations retain a semantic session per file. Unchanged compiler nodes reuse syntax, import, declaration, child and owner-local CFG facts; every edit still recomputes current identities, locations and semantic relations. Root or compiler-option changes replace the affected session. Hydration validates stored partitions and constructs reference/publication indexes without parsing every source AST. Legacy reference overlays construct their full semantic context when requested. Unlink records one tombstone without parsing; ordinary edits do not read dependent source or rebuild repository indexes.
+
+Current generations already contain complete-reference partitions and need no overlay build. Compatibility overlays are retained only for older calls-only generations; the coordinator validates their fragment membership, edge shape, endpoints, and owning file before publication.
 
 That semantic walk also produces a compact internal partition for each source file. It records executable owners, normalized syntax nodes, control-flow edges, semantic relations, and summary metrics without retaining a second repository-sized object graph. Cold builds move bounded partition payloads through one reusable shared-memory pool; oversized payloads are persisted by the worker directly.
 
-Reading and file selection are separated from semantic analysis so the policy is decided once. `createSourcePolicy` (`source-policy.mjs:19`) is the single answer to "is this a source file", used both for the initial `scan()` and for watch-event filtering (`acceptWatchPath`); `readSources` (`source-reader.mjs:6`) turns that list into the `Map<relPath, text>` the worker takes as input, while measuring bytes, wall time and peak concurrency. `PrefetchedFileSystemHost` then hands that same map to `ts-morph` so the checker never re-reads a file the indexer already read.
+Reading and file selection are separated from semantic analysis so the policy is decided once. `createSourcePolicy` is used for the initial scan and watch-event filtering; `readSources` produces the worker's source map and read statistics. `PrefetchedFileSystemHost` supplies those sources to the raw compiler host so the checker does not reread indexed source files.
 
 `FileIdRegistry` and `PagedBitSet` (`file-index.mjs`) exist so the rest of the system can talk about files as small integers and hold dense sets of them cheaply; `FileIdRegistry.release` recycles ids through a free list (`file-index.mjs:33-41`).
 
@@ -50,13 +52,16 @@ source-policy.mjs      decides what is source (scan + watch filter)
 source-reader.mjs      bounded-concurrency read -> Map<rel, text> + stats
         |
         +--> semantic worker (accurate, batch)
-        |      prefetched-file-system.mjs   PrefetchedFileSystemHost (ts-morph host)
+        |      prefetched-file-system.mjs   PrefetchedFileSystemHost (compiler host)
         |      parser.mjs                   createSemanticProject
+        |                                   createOneFileSemanticProject (restart one-file program)
         |                                   prepareSemanticProject  (one walk/file)
         |                                   parsePartition          (per-file rows/edges)
+        |      one-file-semantic-library.mjs shared raw runtime / retained per-file facts
         |      semantic-checker-worker.mjs  index / hydrate / validate / reference-overlay
-        |                                   one retained Project per engine
+        |                                   retained partitions / cached reference bindings
         |      internal-graph.mjs            owners / CFG / relations / metrics
+        +--> existing ParserApartmentPool   source-local CFG jobs, shared thread budget
 
 
 file-index.mjs         FileIdRegistry (path <-> uint32) + PagedBitSet (dense id sets)
@@ -65,7 +70,13 @@ file-index.mjs         FileIdRegistry (path <-> uint32) + PagedBitSet (dense id 
 Component relationships:
 
 - Worker `index` and `hydrate` requests require exact, duplicate-free source membership and matching SHA-256 source hashes. Hydration additionally requires one partition per source whose `file` and `sourceHash` match. The cache is replaced only after validation succeeds.
-- `validateSnapshot` can take sources inline or hydrate a pinned generation from content-addressed blobs and partitions. Safe edits return `{ mode: 'delta' }` with exactly the changed file plus its reverse dependency closure; every unsafe or mismatched case returns `{ mode: 'full' }`.
+- `validateSnapshot` returns `{ mode: 'delta' }` with exactly one changed/add partition or one unlink tombstone for a single-file mutation. Cold and multi-file requests return `{ mode: 'full' }`. Delta validation consults retained partition facts but never loads dependent source.
+- The worker retains a Map of per-file `createOneFileSemanticSession` instances. Alternating edits retain each file's facts; root/options changes replace its session and unlink removes its key. Index/hydrate/full and explicit-base replacement establish a new owned cache. The shared options reader disables source discovery and preserves configuration precedence and `allowJs`. A one-file compiler host supplies only changed source; imported identities come from retained partitions.
+- Lexical lookup memoization retains actual checker results, including missing symbols, for conservative TypeScript expression references in the same compiler-node scope. Contextual, property, type, shorthand, parameter and JavaScript references continue through the checker. A Program replacement clears lookup caches.
+- Main-side pool ownership keeps the existing thread budget shared across roots. Cold batches use CPU minus one, with one worker on a single-CPU host, or configured concurrency. Only that many structural jobs remain queued. One edit dispatches one semantic job. Profiled worker artifact names are unique and profiled jobs have no timeout.
+- The existing reference index also owns raw edge endpoint buckets and symbol membership. Single-file publication reclassifies incident facts and patches retained base partitions; it does not flatten or sort the repository graph. Full manifest serialization and ordered output materialization remain costs of the unchanged storage format. Pinned query views retain their original partitions.
+- Full rebuilds discard inherited delta patches; hydration preserves them. Full and delta publication acknowledge the worker's generation. The engine commits synchronous publication state before awaiting that acknowledgement, preserves newer queued entries by object identity, and resolves empty pending validations without a worker job or publication.
+- Completed-analysis reuse requires stable known-file and cached-partition context identities and unchanged relevant dependency partitions. The library compares only imported dependency partition identities and source hashes, excluding its own replaced partition; relevant other-file changes invalidate that result without discarding unrelated per-file sessions. Eligible changes preserve source length and edit only decimal digits in the return literal of a final, plain, parameterless function with one return statement, no modifiers, generator marker, type parameters, or return annotation. The library retains the parser's actual sorted `semanticTargets`, recomputes the source hash and fingerprint, and re-encodes the unchanged internal graph. Other edits use the ordinary retained syntax/CFG path. No dependent source is read.
 - `referenceOverlay` accepts only the current cached generation membership and an exact stale-file set, then returns non-call edges partitioned by owning file.
 
 ## Functions
@@ -85,17 +96,24 @@ Component relationships:
 **`parser.mjs`**
 - `contentHash(text)` — SHA-256 hex.
 - `LineCursor` — forward-only offset→line scanner with a backward-seek slow path (`:31-41`); `reset`/`lineAt`/`clear`.
-- `createSemanticProject(root, sources)` — builds the `Project` over a `PrefetchedFileSystemHost`, creates every source file with `overwrite: true`, stashes the host on `project.__codegraphHost`.
-- `prepareSemanticProject(project, root, profiler)` — one `forEachDescendant` per file collecting declaration nodes and identifiers; returns the resolution context `{ project, root, byDeclaration, perFile, lineCursor }`. Emits a `collect-file-syntax` profiler span per file.
-- `parsePartition(rel, source, knownFiles, context, profiler, edgeCoverage = 'complete')` — computes exported ids from `getExportedDeclarations()`, resolves identifier edges, collects import/export module dependencies, hashes the source, and returns the partition. Throws if the file was not prefetched or not prepared (`:196, 198`). Profiler spans: `exports`, `identifiers-symbol-resolution`, `dependencies`, `source-hash`.
+- `createSemanticProject(root, sources)` — creates the shared raw compiler adapter over a `PrefetchedFileSystemHost`, preserving prefetched sources, bundled libraries and external type lookup.
+- `readOneFileCompilerOptions(root)` — reads `tsconfig.json` or `jsconfig.json` compiler options without source discovery, always overriding `allowJs` to true. Shared by the retained library path and restart factory.
+- `createOneFileSemanticProject(root, sources)` — uses the same raw adapter with the shared options reader and no imported source or default library reads.
+- `prepareSemanticProject(project, root, profiler)` — one declaration/identifier traversal per prepared file, using native traversal when the pool supplies its CFG. Returns the resolution context `{ project, root, byDeclaration, perFile, lineCursor }` and emits a `collect-file-syntax` profiler span.
+- `parsePartition(rel, source, knownFiles, context, profiler, edgeCoverage = 'complete')` — extracts export bindings from owned syntax, resolves identifiers, collects module dependencies, hashes source and encodes the complete partition. Throws if source was not prefetched. Profiler spans include exports, identifier resolution, dependencies and source hashing.
+- When `parsePartition` retains per-file analysis, it stores the actual `semanticTargets` array used by the internal fingerprint for completed-analysis reuse.
 - `resolveIdentifierEdges(...)` (module-private) — the identifier loop at `parser.mjs:169-189`. With `edgeCoverage === 'complete'` it walks every collected identifier; with `'calls'` it skips non-callee identifiers (`:173`). Per identifier: find the enclosing declaration owner, get the symbol, follow one alias hop inside `try/catch`, map to a declaration identity, drop self-edges, emit `{ from, to, line, call }`.
 - `callExpressionForIdentifier(ident)` — true when the identifier is a call's callee directly, or is the name of a property access that is itself a callee (`:152-157`).
 - `semanticPath(node)`, `semanticSignature(node)`, `nodeName(node)` — the qualified-path, signature, and name components of symbol identity; `nodeName` falls back to `'constructor'` and `'default'`.
 
+**`one-file-semantic-library.mjs`**
+- `createRawSemanticProject(root, sources, options, fileSystem, libraryPolicy)` — owns raw source identity, node/symbol/declaration caches, compiler host and lazy shared Program/checker.
+- `createOneFileSemanticSession(root, rel, options)` — owns incremental raw TypeScript syntax, node and declaration lookups, the latest parser context, and eligible completed analysis. `parse(source, knownFiles, cachedPartitions, changeRange, timing)` returns the complete partition. `stats` records actual syntax, program/checker, lookup, and analysis-cache work.
+
 **`semantic-checker-worker.mjs`**
-- `ownedSnapshot(request, hydrate)` — validates exact source/hash membership, then either parses all partitions for `index` or adopts matching stored partitions for `hydrate`.
-- `validateSnapshot(snapshot)` — hydrates or reuses the pinned validated state, verifies changes, and returns `{ revision, mode, baseGeneration, sourceBlobs, partitions }`. Delta partitions are sparse; full partitions contain every source.
-- `referenceOverlay(request)` — reparses only requested stale files at complete coverage and returns their non-call edge fragments.
+- `ownedSnapshot(request, hydrate)` — validates exact source/hash membership, then adopts matching stored partitions for hydration without source AST construction. Cold indexing streams pooled structural/semantic partitions through `streamOwnedSnapshot`.
+- `validateSnapshot(snapshot)` — verifies the pinned base and returns `{ revision, mode, baseGeneration, sourceBlobs, partitions, tombstones? }`. A delta contains exactly the one changed/add partition or unlink tombstone; a full result contains every source partition. The retained change/add result includes `semanticSessionStats`; a completed-analysis hit reports zero new semantic traversals while keeping the latest parser context available for compatibility overlays.
+- `referenceOverlay(request)` — prepares the owned full semantic context when required, then analyzes requested stale files at complete coverage and returns non-call fragments. An empty request constructs no context.
 - `SemanticCheckerWorker` — `index`, `hydrate`, `validate`, `referenceOverlay`, and `dispose`; unknown operations reject explicitly, while worker error or unexpected exit fails every pending request through `#fail`.
 
 **`internal-graph.mjs`**
@@ -140,7 +158,7 @@ Component relationships:
 
 **Semantic checker snapshot input** — `{ root, revision, sourceDir?, partitionDir?, baseGeneration?, baseSourceBlobs?: {file: sha256}, basePartitionIds?: {file: sha256}, sources?: [[file, text]], changes?: [{ type, path, source?, expectedDigest? }] }`; output `{ revision, mode: 'full'|'delta', baseGeneration, sourceBlobs, partitions: {file: partition} }`. A persistent runtime omits `basePartitionIds` after successful ownership transfer.
 
-**Reference-overlay request** — `{ generation, sourceBlobs, staleFiles }`; output `{ generation, files: { [file]: { edges } } }`, containing only `call: false` edges for the requested stale files.
+**Legacy reference-overlay request** — for a persisted calls-only generation, `{ generation, sourceBlobs, staleFiles }`; output `{ generation, files: { [file]: { edges } }`, containing only `call: false` edges for the requested stale files. Current complete generations do not use this path.
 
 **Internal partition** — a versioned binary file containing executable-owner, node, control-flow, semantic-relation, and metric records. Node and owner identifiers are local to one file and generation; source text stays in the existing source blob.
 
@@ -159,14 +177,14 @@ Component relationships:
   2. Caller calls `readSources(root, policy)`; `policy.scan()` returns the sorted candidate list and up to 16 concurrent reads fill a `Map<rel, text>` alongside read stats.
   3. Caller passes root and sources into `SemanticCheckerWorker.validate(snapshot)`, which posts them to the worker thread.
   4. `validateSnapshot` materializes the source map and applies `snapshot.changes`, verifying each change's `expectedDigest` when present.
-  5. `createSemanticProject` wraps the map in a `PrefetchedFileSystemHost`, creates the `Project` with `{ allowJs: true }`, and creates every source file in it.
+  5. `createSemanticProject` wraps the map in a `PrefetchedFileSystemHost` and creates raw source files with shared compiler options; one lazy Program/checker resolves the batch.
   6. `prepareSemanticProject` walks each file once, recording declaration nodes of the seven `declarationKinds` into `byDeclaration` and every identifier into `perFile`.
   7. For each file, `parsePartition` marks exported ids, resolves identifiers to edges, collects module dependencies, hashes the source, and deletes that file's cached analysis.
   8. The worker replies `{ revision, sourceBlobs, partitions }`; the caller hands the partitions to storage.
 - **Alternate Flows**
-  - No `tsconfig.json`/`jsconfig.json`: the `Project` is created without `tsConfigFilePath` and `configured()` accepts every non-ignored path with a source extension.
+  - No `tsconfig.json`/`jsconfig.json`: the raw runtime uses default compiler options with `allowJs`, and source policy accepts otherwise eligible non-ignored files.
   - `snapshot.sources` omitted: sources are loaded from content-addressed blobs under `sourceDir`, each verified against its SHA-256 filename.
-  - `edgeCoverage: 'calls'` (what `validateSnapshot` passes): non-callee identifiers are skipped, so the partition holds call edges only.
+  - `edgeCoverage: 'calls'` is accepted for legacy compatibility: non-callee identifiers are skipped. Current indexing and validation request `complete` coverage.
 - **Exceptions**
   - A read fails mid-scan: `readSources` stops dispatching and rethrows the first error; no partial source map is returned.
   - A blob's digest does not match its filename, or a blob/change path escapes `sourceDir`/root (lexically or via symlink): `validateSnapshot` throws and the rejection surfaces through `validate()`.
@@ -211,8 +229,13 @@ Tests live in `codegraph/test/` and run with `npm test`. Covering this subsystem
 - `test/file-index.test.mjs` — id interning/release and `PagedBitSet` behavior.
 - `test/trace-profile.test.mjs` — the profiler spans emitted by `parser.mjs`.
 - `test/engine.test.mjs`, `test/boundaries.test.mjs` — end-to-end indexing over the semantic path.
+- `test/one-file-semantic-parity.test.mjs` — complete raw-program partition parity against the Project oracle.
+- `test/one-file-semantic-library.test.mjs` — complete partition, fingerprint, and binary parity after position shifts, binding edits, repeated edits, and numeric-return cache reuse/invalidation.
+- `test/one-file-library-integration.test.mjs` — cached imported targets and bounded dependency invalidation, numeric token boundaries, and actual worker transport parity across warm, dependency, unlink/re-add, configuration, and root transitions.
 
-`parser.mjs` and `semantic-checker-worker.mjs` have no dedicated test file of their own; they are exercised through `test/engine.test.mjs` and `test/boundaries.test.mjs`.
+`parser.mjs` and `semantic-checker-worker.mjs` are exercised through the focused one-file parity/integration tests and `test/engine.test.mjs` / `test/boundaries.test.mjs`.
+
+The October 8 whole-runtime verification also compared complete symbols, internal bytes and fingerprints against a preserved pre-change runtime for 931 D&D files and 1,907 larger-corpus files. External receipts cover ordinary edits, legacy overlays, generation transitions, failed publication, pinned queries, shared pool budgets and queued changes during acknowledgement. The [whole-runtime plan](../plans/whole-semantic-runtime/plan.md) records measured performance and the remaining gap to the 40-fold cold-load target.
 
 ## UI/UX
 
@@ -223,7 +246,7 @@ No UI/UX. This subsystem has no user-facing surface — it is a library consumed
 - [storage-and-query.md](storage-and-query.md) — consumes the symbol rows, edge rows and partitions defined in Models.
 - [mcp-and-cli.md](mcp-and-cli.md) — the callers that build a policy, read sources, and drive both parse paths.
 - [visualizer.md](visualizer.md) — renders the resulting graph; inherits the property-edge and single-`call`-attribute limits from Sensitive Areas.
-- External: `ts-morph` and `@ts-morph/common` (`Project`, `Node`, `SyntaxKind`, `ts`, `RealFileSystemHost`), `minimatch`, and Node's `worker_threads`, `fs`, `path`, `crypto`, `os`.
+- External: `ts-morph` and `@ts-morph/common` (`Node`, `SyntaxKind`, `ts`, `RealFileSystemHost`, bundled library text), `minimatch`, and Node's `worker_threads`, `fs`, `path`, `crypto`, `os`. Dependency versions are unchanged.
 
 ## Diagrams
 
@@ -232,6 +255,6 @@ The component/data-flow diagram is the ASCII block in Architecture above. No add
 ## References
 
 - TypeScript compiler API `ts.createSourceFile` / `SourceFile.update` — the incremental reparse mechanism used in `incremental-resolver.mjs` and `incremental-parser-worker.mjs`.
-- `ts-morph` `Project` and `FileSystemHost` — the interface `PrefetchedFileSystemHost` implements.
+- `FileSystemHost` — the interface `PrefetchedFileSystemHost` implements.
 - `minimatch` glob semantics — how `include`/`exclude`/ignore patterns are matched in `source-policy.mjs`.
 - Node `worker_threads` `ref`/`unref` — why idle parser and checker workers do not keep the process alive.

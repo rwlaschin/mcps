@@ -217,16 +217,51 @@ test('equivalence partition: explicit in-memory source changes remain synchronou
 })
 
 test('domain analysis: disk-backed multi-file changes admit each parsed digest and publish one graph-equivalent revision without retaining source text', async () => {
+  const dispatches = []
   const parsedByFile = {
-    'file-a': { file: 'src/a.ts', digest: 'a2', stateHash: 11, sourceBytes: 40, nodeCount: 8, symbols: [{ id: 'a', file: 'src/a.ts', name: 'target', kind: 'function', line: 1, qualifiedPath: '<module>', signature: '', ordinal: 0, exported: true }], imports: new Map(), namespaces: new Map(), reexports: new Map(), calls: [] },
-    'file-b': { file: 'src/b.ts', digest: 'b2', stateHash: 12, sourceBytes: 82, nodeCount: 14, symbols: [{ id: 'b', file: 'src/b.ts', name: 'caller', kind: 'function', line: 2, qualifiedPath: '<module>', signature: '', ordinal: 0, exported: true }], imports: new Map([['target', { specifier: './a', remote: 'target' }]]), namespaces: new Map(), reexports: new Map(), calls: [{ owner: { id: 'b', file: 'src/b.ts', name: 'caller', kind: 'function', line: 2, qualifiedPath: '<module>', signature: '', ordinal: 0, exported: true }, base: 'target', property: null, line: 2, expression: 'target' }] },
+    'file-a': { file: 'src/a.ts', digest: 'a2', stateHash: 11, sourceBytes: 40, nodeCount: 8, symbols: [{ id: 'a', file: 'src/a.ts', name: 'target', kind: 'function', line: 1, qualifiedPath: '<module>', signature: '', ordinal: 0, exported: true }], imports: new Map(), namespaces: new Map(), reexports: new Map(), bindings: [{ kind: 'symbol', name: 'target', target: 'a' }], calls: [] },
+    'file-b': { file: 'src/b.ts', digest: 'b2', stateHash: 12, sourceBytes: 82, nodeCount: 14, symbols: [{ id: 'b', file: 'src/b.ts', name: 'caller', kind: 'function', line: 2, qualifiedPath: '<module>', signature: '', ordinal: 0, exported: true }], imports: new Map([['target', { specifier: './a', remote: 'target' }]]), namespaces: new Map(), reexports: new Map(), bindings: [{ kind: 'symbol', name: 'caller', target: 'b' }], calls: [{ owner: { id: 'b', file: 'src/b.ts', name: 'caller', kind: 'function', line: 2, qualifiedPath: '<module>', signature: '', ordinal: 0, exported: true }, base: 'target', property: null, line: 2, expression: 'target' }] },
   }
-  const pool = { parse: async ({ fileId }) => parsedByFile[fileId], dispose: async () => {}, snapshot: () => ({ workerCount: 2, queued: 0, inFlight: 0, latestRevisionByFile: {} }) }
+  const pool = { parse: async (request) => { dispatches.push(request); return parsedByFile[request.fileId] }, dispose: async () => {}, snapshot: () => ({ workerCount: 3, queued: 0, inFlight: 0, latestRevisionByFile: {} }) }
   const resolver = new FileLocalResolver('/repo', null, { parserPool: pool })
 
   const snapshot = await resolver.applyFileChanges([{ type: 'add', path: 'src/a.ts', fileId: 'file-a' }, { type: 'add', path: 'src/b.ts', fileId: 'file-b' }], { baseRevision: 0 })
 
-  assert.deepEqual({ revision: snapshot.revision, files: snapshot.files, admittedDigests: [...resolver.files.values()].map(({ digest }) => digest), symbols: snapshot.symbols.map(({ name }) => name), edges: snapshot.edges.map(({ fromName, toName }) => ({ fromName, toName })), sources: resolver.sourceEntries() }, { revision: 1, files: ['src/a.ts', 'src/b.ts'], admittedDigests: ['a2', 'b2'], symbols: ['target', 'caller'], edges: [{ fromName: 'caller', toName: 'target' }], sources: [['src/a.ts', undefined], ['src/b.ts', undefined]] })
+  assert.deepEqual(
+    { revision: snapshot.revision, files: snapshot.files, admittedDigests: [...resolver.files.values()].map(({ digest }) => digest), symbols: snapshot.symbols.map(({ name }) => name), edges: snapshot.edges.map(({ fromName, toName }) => ({ fromName, toName })), sources: resolver.sourceEntries(), dispatches, pool: resolver.parserPool.snapshot() },
+    { revision: 1, files: ['src/a.ts', 'src/b.ts'], admittedDigests: ['a2', 'b2'], symbols: ['target', 'caller'], edges: [{ fromName: 'caller', toName: 'target' }], sources: [['src/a.ts', undefined], ['src/b.ts', undefined]], dispatches: [{ path: 'src/a.ts', fileId: 'file-a', revision: 1 }, { path: 'src/b.ts', fileId: 'file-b', revision: 1 }], pool: { workerCount: 3, queued: 0, inFlight: 0, latestRevisionByFile: {} } },
+  )
+})
+
+test('combinatorial worker boundary: one disk-backed edit dispatches only that file through the existing three-worker parser pool', async () => {
+  const dispatches = []
+  const events = []
+  const pool = {
+    parse: async (request) => {
+      dispatches.push(request)
+      return { file: 'src/changed.ts', digest: 'changed-2', stateHash: 12, sourceBytes: 32, nodeCount: 4, symbols: [{ id: 'changed', file: 'src/changed.ts', name: 'changed', kind: 'function', line: 1, qualifiedPath: '<module>', signature: '', ordinal: 0, exported: true }], imports: new Map(), namespaces: new Map(), reexports: new Map(), bindings: [{ kind: 'symbol', name: 'changed', target: 'changed' }], calls: [] }
+    },
+    dispose: async () => {},
+    snapshot: () => ({ workerCount: 3, queued: 0, inFlight: 0, latestRevisionByFile: {} }),
+  }
+  const resolver = new FileLocalResolver('/repo', new Map([
+    ['src/changed.ts', 'export function changed(){ return 1 }\n'],
+    ['src/dependent.ts', "import { changed } from './changed'\nexport function dependent(){ return changed() }\n"],
+    ['src/unrelated.ts', 'export const unrelated = 1\n'],
+  ]), { parserPool: pool, onWork: (event) => events.push(event) })
+  resolver.snapshot()
+  events.length = 0
+
+  await resolver.applyFileChanges([{ type: 'change', path: 'src/changed.ts', fileId: 'changed-file' }], { baseRevision: 0 })
+
+  assert.deepEqual(
+    { dispatches, pool: resolver.parserPool.snapshot(), work: events },
+    {
+      dispatches: [{ path: 'src/changed.ts', fileId: 'changed-file', revision: 1 }],
+      pool: { workerCount: 3, queued: 0, inFlight: 0, latestRevisionByFile: {} },
+      work: [{ type: 'work', mutationFile: 'src/changed.ts', parsedFiles: ['src/changed.ts'], resolvedFiles: ['src/changed.ts'], reusedFiles: ['src/dependent.ts', 'src/unrelated.ts'], fullRebuild: false }],
+    },
+  )
 })
 
 test('error guessing: a stale disk parse result aborts the whole multi-file batch without a partial commit', async () => {
@@ -375,48 +410,49 @@ test('hotpath architecture: AST node count is emitted from existing fact extract
   assert.deepEqual(events, [{ file: 'src/traversal.ts', operation: 'create', nodeCountSource: 'fact-extraction' }])
 })
 
-test('error guessing: two former XOR-colliding workspaces receive distinct graph-cache digests and preserve distinct graphs', () => {
-  const resolver = new FileLocalResolver('/repo')
-  resolver.files = new Map([
-    ['src/a.ts', { file: 'src/a.ts', source: 'a', stateHash: 1, symbols: [{ id: 'a', file: 'src/a.ts', name: 'a', kind: 'variable', line: 1, qualifiedPath: '<module>', signature: '', ordinal: 0, exported: true }], imports: new Map(), namespaces: new Map(), reexports: new Map(), calls: [] }],
-    ['src/b.ts', { file: 'src/b.ts', source: 'b', stateHash: 2, symbols: [], imports: new Map(), namespaces: new Map(), reexports: new Map(), calls: [] }],
-  ])
-  resolver.stateHash = 3
+test('retained index reuse: repeated snapshots perform no parse or resolution work', () => {
+  const events = []
+  const resolver = new FileLocalResolver('/repo', new Map([
+    ['src/target.ts', 'export function target(){ return 1 }\n'],
+    ['src/importer.ts', "import { target } from './target'\nexport function caller(){ return target() }\n"],
+  ]), { onWork: (event) => events.push(event) })
+  resolver.snapshot()
+  events.length = 0
+
   const first = resolver.snapshot()
-  resolver.files = new Map([
-    ['src/c.ts', { file: 'src/c.ts', source: 'c', stateHash: 4, symbols: [{ id: 'c', file: 'src/c.ts', name: 'c', kind: 'variable', line: 1, qualifiedPath: '<module>', signature: '', ordinal: 0, exported: true }], imports: new Map(), namespaces: new Map(), reexports: new Map(), calls: [] }],
-    ['src/d.ts', { file: 'src/d.ts', source: 'd', stateHash: 7, symbols: [], imports: new Map(), namespaces: new Map(), reexports: new Map(), calls: [] }],
-  ])
-  resolver.stateHash = 3
-  resolver.cached = null
   const second = resolver.snapshot()
 
-  assert.deepEqual({ firstFiles: first.files, secondFiles: second.files }, { firstFiles: ['src/a.ts', 'src/b.ts'], secondFiles: ['src/c.ts', 'src/d.ts'] })
-  assert.equal(resolver.graphCache.size, 2)
-  assert.notEqual([...resolver.graphCache.keys()][0], [...resolver.graphCache.keys()][1])
+  assert.deepEqual({ sameSnapshot: first === second, work: events }, { sameSnapshot: true, work: [] })
 })
 
-test('boundary values: graph cache remains within 32 entries and a 2048-byte key budget after forty distinct revisions', () => {
-  const resolver = new FileLocalResolver('/repo')
-  resolver.applyChanges([{ type: 'add', path: 'src/value.ts', source: 'export const value = 0\n' }])
-  for (let revision = 1; revision <= 40; revision += 1) resolver.applyChanges([{ type: 'change', path: 'src/value.ts', source: `export const value = ${revision}\n` }])
+test('retained index reuse: a target edit patches one cached reference without rebuilding its importer facts', () => {
+  const resolver = new FileLocalResolver('/repo', new Map([
+    ['src/target.ts', 'export function target(){ return 1 }\n'],
+    ['src/importer.ts', "import { target } from './target'\nexport function caller(){ return target() }\n"],
+  ]))
+  const beforeImporter = resolver.graphFiles.get('src/importer.ts')
 
-  const keyBytes = [...resolver.graphCache.keys()].reduce((total, key) => total + Buffer.byteLength(key), 0)
+  const snapshot = resolver.applyChanges([{ type: 'change', path: 'src/target.ts', source: 'export function target(){ return 2 }\n' }])
 
-  assert.deepEqual({ entries: resolver.graphCache.size, withinByteBudget: keyBytes <= 2048 }, { entries: 32, withinByteBudget: true })
+  assert.deepEqual(
+    { importerFactsReused: resolver.graphFiles.get('src/importer.ts') === beforeImporter, edges: snapshot.edges.map(({ fromFile, toFile, toName }) => ({ fromFile, toFile, toName })) },
+    { importerFactsReused: true, edges: [{ fromFile: 'src/importer.ts', toFile: 'src/target.ts', toName: 'target' }] },
+  )
 })
 
-test('hotpath architecture: graph cache keys are bounded digests and retain no concatenated source text', () => {
-  const resolver = new FileLocalResolver('/repo')
-  resolver.applyChanges([
-    { type: 'add', path: 'src/a.ts', source: 'export function uniquelyNamedSourceA(){ return 1 }\n' },
-    { type: 'add', path: 'src/b.ts', source: 'export function uniquelyNamedSourceB(){ return uniquelyNamedSourceA() }\n' },
-  ])
+test('retained index reuse: removing and restoring a target reuses one importer reference record', () => {
+  const resolver = new FileLocalResolver('/repo', new Map([
+    ['src/target.ts', 'export function target(){ return 1 }\n'],
+    ['src/importer.ts', "import { target } from './target'\nexport function caller(){ return target() }\n"],
+  ]))
+  resolver.applyChanges([{ type: 'unlink', path: 'src/target.ts' }])
 
-  resolver.snapshot()
-  const keys = [...resolver.graphCache.keys()]
+  const restored = resolver.applyChanges([{ type: 'add', path: 'src/target.ts', source: 'export function target(){ return 2 }\n' }])
 
-  assert.deepEqual({ count: keys.length, bounded: keys.every((key) => key.length <= 64), containsSource: keys.some((key) => key.includes('uniquelyNamedSourceA') || key.includes('uniquelyNamedSourceB')) }, { count: 1, bounded: true, containsSource: false })
+  assert.deepEqual(
+    { referenceIds: resolver.graphFiles.get('src/importer.ts').referenceIds, edgeCount: restored.edges.length, unresolvedEdges: restored.unresolvedEdges },
+    { referenceIds: ['src/importer.ts\u00000'], edgeCount: 1, unresolvedEdges: [] },
+  )
 })
 
 const PERFORMANCE_SOURCE_A = `export function fn01(){ return fn02() }
@@ -1464,23 +1500,19 @@ test('error guessing: repeated A and B edits of a slow 500-line file emit no AST
   )
 })
 
-test('performance gate: exactly 500 lines and 20 functions refresh from source text to an observable revision within 5ms maximum after warmup', (t) => {
-  const resolver = new FileLocalResolver('/repo')
+test('deterministic performance gate: a 500-line 20-function edit parses and resolves only its file', () => {
+  const events = []
+  const resolver = new FileLocalResolver('/repo', null, { onWork: (event) => events.push(event) })
   assert.deepEqual({ lines: PERFORMANCE_SOURCE_A.split('\n').length, functions: PERFORMANCE_SOURCE_A.match(/^export function /gm).length }, { lines: 500, functions: 20 })
-  for (let iteration = 0; iteration < 20; iteration += 1) resolver.applyChanges([{ type: iteration ? 'change' : 'add', path: 'src/performance.ts', source: iteration % 2 ? PERFORMANCE_SOURCE_A : PERFORMANCE_SOURCE_B }])
-  const durations = []
+  resolver.applyChanges([{ type: 'add', path: 'src/performance.ts', source: PERFORMANCE_SOURCE_A }])
+  events.length = 0
 
-  for (let iteration = 0; iteration < 120; iteration += 1) {
-    const started = performance.now()
-    const result = resolver.applyChanges([{ type: 'change', path: 'src/performance.ts', source: iteration % 2 ? PERFORMANCE_SOURCE_A : PERFORMANCE_SOURCE_B }])
-    assert.equal(resolver.snapshot().revision, result.revision)
-    durations.push(performance.now() - started)
-  }
-  const ordered = durations.toSorted((left, right) => left - right)
-  const metrics = { p50: ordered[59], p95: ordered[113], p99: ordered[118], max: ordered[119] }
+  const result = resolver.applyChanges([{ type: 'change', path: 'src/performance.ts', source: PERFORMANCE_SOURCE_B }])
 
-  t.diagnostic(`source-text applyChanges+snapshot milliseconds ${JSON.stringify(metrics)}`)
-  assert.ok(metrics.max <= 5, `source-text performance regression: ${JSON.stringify(metrics)}`)
+  assert.deepEqual(
+    { revision: result.revision, work: events },
+    { revision: 2, work: [{ type: 'work', mutationFile: 'src/performance.ts', parsedFiles: ['src/performance.ts'], resolvedFiles: ['src/performance.ts'], reusedFiles: [], fullRebuild: false }] },
+  )
 })
 
 test('performance stretch: actual SSD read through observable revision reports p50 p95 p99 and max with p99 at most 5ms', (t) => {
@@ -1510,5 +1542,341 @@ test('performance stretch: actual SSD read through observable revision reports p
     Object.values(metrics).every((value) => Number.isFinite(value) && value >= 0) && metrics.p50 <= metrics.p95 && metrics.p95 <= metrics.p99 && metrics.p99 <= metrics.max,
     true,
     `SSD stretch produced invalid metrics: ${JSON.stringify(metrics)}`,
+  )
+})
+
+test('domain analysis: a body-only edit parses and resolves only the changed file while reusing every other file', () => {
+  const events = []
+  const resolver = new FileLocalResolver('/repo', new Map([
+    ['src/unrelated.ts', 'export const unrelated = 1\n'],
+    ['src/utils/eventAccess.ts', 'export const accepts = (userId) => !!userId && true\n'],
+    ['src/useEvent.ts', "import { accepts } from './utils/eventAccess'\nexport const used = accepts('user-1')\n"],
+  ]), { onWork: (event) => events.push(event) })
+  resolver.snapshot()
+  events.length = 0
+
+  resolver.applyChanges([{ type: 'change', path: 'src/utils/eventAccess.ts', source: 'export const accepts = (userId) => Boolean(userId) && true\n' }])
+
+  assert.deepEqual(events, [{
+    type: 'work',
+    mutationFile: 'src/utils/eventAccess.ts',
+    parsedFiles: ['src/utils/eventAccess.ts'],
+    resolvedFiles: ['src/utils/eventAccess.ts'],
+    reusedFiles: ['src/unrelated.ts', 'src/useEvent.ts'],
+    fullRebuild: false,
+  }])
+})
+
+test('domain analysis: removing an exported symbol patches its cached importer to one visible dangling reference without resolving the importer', () => {
+  const events = []
+  const resolver = new FileLocalResolver('/repo', new Map([
+    ['src/exported.ts', 'export function target(){ return 1 }\n'],
+    ['src/importer.ts', "import { target } from './exported'\nexport function caller(){ return target() }\n"],
+    ['src/unrelated.ts', 'export const unrelated = 1\n'],
+  ]), { onWork: (event) => events.push(event) })
+  resolver.snapshot()
+  events.length = 0
+
+  const snapshot = resolver.applyChanges([{ type: 'change', path: 'src/exported.ts', source: 'export function replacement(){ return 2 }\n' }])
+
+  assert.deepEqual(
+    {
+      work: events,
+      edges: snapshot.edges,
+      unresolvedEdges: snapshot.unresolvedEdges.map(({ fromFile, fromName, expression, line, reason }) => ({ fromFile, fromName, expression, line, reason })),
+    },
+    {
+      work: [{ type: 'work', mutationFile: 'src/exported.ts', parsedFiles: ['src/exported.ts'], resolvedFiles: ['src/exported.ts'], reusedFiles: ['src/importer.ts', 'src/unrelated.ts'], fullRebuild: false }],
+      edges: [],
+      unresolvedEdges: [{ fromFile: 'src/importer.ts', fromName: 'caller', expression: 'target', line: 2, reason: 'missing-import-target' }],
+    },
+  )
+})
+
+test('boundary and error guessing: deleting an exported file preserves its importer as one dangling reference without parsing or resolving another file', () => {
+  const events = []
+  const resolver = new FileLocalResolver('/repo', new Map([
+    ['src/exported.ts', 'export function target(){ return 1 }\n'],
+    ['src/importer.ts', "import { target } from './exported'\nexport function caller(){ return target() }\n"],
+    ['src/unrelated.ts', 'export const unrelated = 1\n'],
+  ]), { onWork: (event) => events.push(event) })
+  resolver.snapshot()
+  events.length = 0
+
+  const snapshot = resolver.applyChanges([{ type: 'unlink', path: 'src/exported.ts' }])
+
+  assert.deepEqual(
+    {
+      work: events,
+      files: snapshot.files,
+      unresolvedEdges: snapshot.unresolvedEdges.map(({ fromFile, fromName, expression, line, reason }) => ({ fromFile, fromName, expression, line, reason })),
+    },
+    {
+      work: [{ type: 'work', mutationFile: 'src/exported.ts', parsedFiles: [], resolvedFiles: [], reusedFiles: ['src/importer.ts', 'src/unrelated.ts'], fullRebuild: false }],
+      files: ['src/importer.ts', 'src/unrelated.ts'],
+      unresolvedEdges: [{ fromFile: 'src/importer.ts', fromName: 'caller', expression: 'target', line: 2, reason: 'missing-import-target' }],
+    },
+  )
+})
+
+test('domain analysis: a later one-file importer edit repairs its dangling reference without parsing or resolving any peer file', () => {
+  const events = []
+  const resolver = new FileLocalResolver('/repo', new Map([
+    ['src/exported.ts', 'export function target(){ return 1 }\n'],
+    ['src/importer.ts', "import { target } from './exported'\nexport function caller(){ return target() }\n"],
+    ['src/unrelated.ts', 'export const unrelated = 1\n'],
+  ]), { onWork: (event) => events.push(event) })
+  resolver.snapshot()
+  resolver.applyChanges([{ type: 'unlink', path: 'src/exported.ts' }])
+  events.length = 0
+
+  const snapshot = resolver.applyChanges([{ type: 'change', path: 'src/importer.ts', source: 'export function caller(){ return 0 }\n' }])
+
+  assert.deepEqual(
+    { work: events, edges: snapshot.edges, unresolvedEdges: snapshot.unresolvedEdges },
+    {
+      work: [{ type: 'work', mutationFile: 'src/importer.ts', parsedFiles: ['src/importer.ts'], resolvedFiles: ['src/importer.ts'], reusedFiles: ['src/unrelated.ts'], fullRebuild: false }],
+      edges: [],
+      unresolvedEdges: [],
+    },
+  )
+})
+
+test('domain analysis: an incremental change retains the same files symbols and resolved edges as a fresh resolver', () => {
+  const incremental = new FileLocalResolver('/repo', new Map([
+    ['src/exported.ts', 'export function target(){ return 1 }\n'],
+    ['src/importer.ts', "import { target } from './exported'\nexport function caller(){ return target() }\n"],
+  ]))
+  const changed = incremental.applyChanges([{ type: 'change', path: 'src/exported.ts', source: 'export function replacement(){ return 2 }\n' }])
+  const changedFresh = new FileLocalResolver('/repo', new Map([
+    ['src/exported.ts', 'export function replacement(){ return 2 }\n'],
+    ['src/importer.ts', "import { target } from './exported'\nexport function caller(){ return target() }\n"],
+  ])).snapshot()
+
+  assert.deepEqual(
+    {
+      changed: { files: changed.files, symbols: changed.symbols.map(({ file, name }) => ({ file, name })), edges: changed.edges, unresolvedEdges: changed.unresolvedEdges.map(({ fromFile, expression, reason }) => ({ fromFile, expression, reason })) },
+      changedFresh: { files: changedFresh.files, symbols: changedFresh.symbols.map(({ file, name }) => ({ file, name })), edges: changedFresh.edges, unresolvedEdges: changedFresh.unresolvedEdges.map(({ fromFile, expression, reason }) => ({ fromFile, expression, reason })) },
+    },
+    {
+      changed: { files: ['src/exported.ts', 'src/importer.ts'], symbols: [{ file: 'src/exported.ts', name: 'replacement' }, { file: 'src/importer.ts', name: 'caller' }], edges: [], unresolvedEdges: [{ fromFile: 'src/importer.ts', expression: 'target', reason: 'missing-import-target' }] },
+      changedFresh: { files: ['src/exported.ts', 'src/importer.ts'], symbols: [{ file: 'src/exported.ts', name: 'replacement' }, { file: 'src/importer.ts', name: 'caller' }], edges: [], unresolvedEdges: [{ fromFile: 'src/importer.ts', expression: 'target', reason: 'missing-import-target' }] },
+    },
+  )
+})
+
+test('domain analysis: an incremental unlink retains the same files symbols and resolved edges as a fresh resolver', () => {
+  const incremental = new FileLocalResolver('/repo', new Map([
+    ['src/exported.ts', 'export function target(){ return 1 }\n'],
+    ['src/importer.ts', "import { target } from './exported'\nexport function caller(){ return target() }\n"],
+  ]))
+  const unlinked = incremental.applyChanges([{ type: 'unlink', path: 'src/exported.ts' }])
+  const unlinkedFresh = new FileLocalResolver('/repo', new Map([
+    ['src/importer.ts', "import { target } from './exported'\nexport function caller(){ return target() }\n"],
+  ])).snapshot()
+
+  assert.deepEqual(
+    {
+      unlinked: { files: unlinked.files, symbols: unlinked.symbols.map(({ file, name }) => ({ file, name })), edges: unlinked.edges, unresolvedEdges: unlinked.unresolvedEdges.map(({ fromFile, expression, reason }) => ({ fromFile, expression, reason })) },
+      unlinkedFresh: { files: unlinkedFresh.files, symbols: unlinkedFresh.symbols.map(({ file, name }) => ({ file, name })), edges: unlinkedFresh.edges, unresolvedEdges: unlinkedFresh.unresolvedEdges.map(({ fromFile, expression, reason }) => ({ fromFile, expression, reason })) },
+    },
+    {
+      unlinked: { files: ['src/importer.ts'], symbols: [{ file: 'src/importer.ts', name: 'caller' }], edges: [], unresolvedEdges: [{ fromFile: 'src/importer.ts', expression: 'target', reason: 'missing-import-target' }] },
+      unlinkedFresh: { files: ['src/importer.ts'], symbols: [{ file: 'src/importer.ts', name: 'caller' }], edges: [], unresolvedEdges: [{ fromFile: 'src/importer.ts', expression: 'target', reason: 'missing-import-target' }] },
+    },
+  )
+})
+
+test('combinatorial retained indexes: alias namespace static and re-export references all become dangling when their target is deleted', () => {
+  const resolver = new FileLocalResolver('/repo', new Map([
+    ['src/target.ts', 'export function target(){ return 1 }\nexport class Worker { static run(){ return 1 } }\n'],
+    ['src/barrel.ts', "export { target as relayed } from './target'\n"],
+    ['src/importer.ts', "import { target as alias, Worker } from './target'\nimport * as ns from './target'\nimport { relayed } from './barrel'\nexport function caller(){ alias(); ns.target(); Worker.run(); relayed() }\n"],
+  ]))
+
+  const snapshot = resolver.applyChanges([{ type: 'unlink', path: 'src/target.ts' }])
+
+  assert.deepEqual(
+    snapshot.unresolvedEdges.map(({ fromFile, expression, line, reason }) => ({ fromFile, expression, line, reason })),
+    [
+      { fromFile: 'src/importer.ts', expression: 'alias', line: 4, reason: 'missing-import-target' },
+      { fromFile: 'src/importer.ts', expression: 'ns.target', line: 4, reason: 'missing-import-target' },
+      { fromFile: 'src/importer.ts', expression: 'Worker.run', line: 4, reason: 'missing-import-target' },
+      { fromFile: 'src/importer.ts', expression: 'relayed', line: 4, reason: 'missing-import-target' },
+    ],
+  )
+})
+
+test('combinatorial retained indexes: re-adding one target repairs alias namespace static and re-export references without processing their importer', () => {
+  const events = []
+  const resolver = new FileLocalResolver('/repo', new Map([
+    ['src/target.ts', 'export function target(){ return 1 }\nexport class Worker { static run(){ return 1 } }\n'],
+    ['src/barrel.ts', "export { target as relayed } from './target'\n"],
+    ['src/importer.ts', "import { target as alias, Worker } from './target'\nimport * as ns from './target'\nimport { relayed } from './barrel'\nexport function caller(){ alias(); ns.target(); Worker.run(); relayed() }\n"],
+  ]), { onWork: (event) => events.push(event) })
+  resolver.snapshot()
+  resolver.applyChanges([{ type: 'unlink', path: 'src/target.ts' }])
+  events.length = 0
+
+  const snapshot = resolver.applyChanges([{ type: 'add', path: 'src/target.ts', source: 'export function target(){ return 2 }\nexport class Worker { static run(){ return 2 } }\n' }])
+
+  assert.deepEqual(
+    {
+      work: events,
+      edges: snapshot.edges.map(({ fromFile, toFile, toName }) => ({ fromFile, toFile, toName })),
+      unresolvedEdges: snapshot.unresolvedEdges,
+    },
+    {
+      work: [{ type: 'work', mutationFile: 'src/target.ts', parsedFiles: ['src/target.ts'], resolvedFiles: ['src/target.ts'], reusedFiles: ['src/barrel.ts', 'src/importer.ts'], fullRebuild: false }],
+      edges: [
+        { fromFile: 'src/importer.ts', toFile: 'src/target.ts', toName: 'target' },
+        { fromFile: 'src/importer.ts', toFile: 'src/target.ts', toName: 'target' },
+        { fromFile: 'src/importer.ts', toFile: 'src/target.ts', toName: 'Worker.run' },
+        { fromFile: 'src/importer.ts', toFile: 'src/target.ts', toName: 'target' },
+      ],
+      unresolvedEdges: [],
+    },
+  )
+})
+
+test('domain analysis: adding a higher-precedence module candidate retargets one cached import without processing its importer', () => {
+  const events = []
+  const resolver = new FileLocalResolver('/repo', new Map([
+    ['src/foo/index.ts', 'export function target(){ return 1 }\n'],
+    ['src/importer.ts', "import { target } from './foo'\nexport function caller(){ return target() }\n"],
+  ]), { onWork: (event) => events.push(event) })
+  resolver.snapshot()
+  events.length = 0
+
+  const snapshot = resolver.applyChanges([{ type: 'add', path: 'src/foo.ts', source: 'export function target(){ return 2 }\n' }])
+
+  assert.deepEqual(
+    { work: events, edges: snapshot.edges.map(({ fromFile, toFile, toName }) => ({ fromFile, toFile, toName })) },
+    {
+      work: [{ type: 'work', mutationFile: 'src/foo.ts', parsedFiles: ['src/foo.ts'], resolvedFiles: ['src/foo.ts'], reusedFiles: ['src/foo/index.ts', 'src/importer.ts'], fullRebuild: false }],
+      edges: [{ fromFile: 'src/importer.ts', toFile: 'src/foo.ts', toName: 'target' }],
+    },
+  )
+})
+
+test('combinatorial order boundary: unlink then add and add then unlink publish the same single retained reference', () => {
+  const unlinkThenAdd = new FileLocalResolver('/repo', new Map([
+    ['src/foo/index.ts', 'export function target(){ return 1 }\n'],
+    ['src/importer.ts', "import { target } from './foo'\nexport function caller(){ return target() }\n"],
+  ]))
+  const addThenUnlink = new FileLocalResolver('/repo', new Map([
+    ['src/foo/index.ts', 'export function target(){ return 1 }\n'],
+    ['src/importer.ts', "import { target } from './foo'\nexport function caller(){ return target() }\n"],
+  ]))
+
+  const first = unlinkThenAdd.applyChanges([{ type: 'unlink', path: 'src/foo/index.ts' }, { type: 'add', path: 'src/foo.ts', source: 'export function target(){ return 2 }\n' }])
+  const second = addThenUnlink.applyChanges([{ type: 'add', path: 'src/foo.ts', source: 'export function target(){ return 2 }\n' }, { type: 'unlink', path: 'src/foo/index.ts' }])
+
+  assert.deepEqual(
+    {
+      first: { edges: first.edges.map(({ fromFile, toFile, toName }) => ({ fromFile, toFile, toName })), unresolvedEdges: first.unresolvedEdges },
+      second: { edges: second.edges.map(({ fromFile, toFile, toName }) => ({ fromFile, toFile, toName })), unresolvedEdges: second.unresolvedEdges },
+    },
+    {
+      first: { edges: [{ fromFile: 'src/importer.ts', toFile: 'src/foo.ts', toName: 'target' }], unresolvedEdges: [] },
+      second: { edges: [{ fromFile: 'src/importer.ts', toFile: 'src/foo.ts', toName: 'target' }], unresolvedEdges: [] },
+    },
+  )
+})
+
+test('allocation boundary: root indexing many references mutates one dependency bucket in place with zero bucket clones', () => {
+  const resolver = new FileLocalResolver('/repo', new Map([
+    ['src/target.ts', 'export function target(){ return 1 }\n'],
+    ['src/importer.ts', "import { target } from './target'\nexport function one(){ return target() }\nexport function two(){ return target() }\nexport function three(){ return target() }\nexport function four(){ return target() }\n"],
+  ]))
+  const before = resolver.dependencyRefs.get('src/target.ts')
+
+  const snapshot = resolver.applyChanges([{ type: 'change', path: 'src/target.ts', source: 'export function target(){ return 2 }\n' }])
+
+  assert.deepEqual(
+    {
+      sameBucket: resolver.dependencyRefs.get('src/target.ts') === before,
+      bucketClones: resolver.dependencyBucketCloneCount,
+      referenceCount: resolver.dependencyRefs.get('src/target.ts').size,
+      edges: snapshot.edges.map(({ fromName, toName }) => ({ fromName, toName })),
+    },
+    {
+      sameBucket: true,
+      bucketClones: 0,
+      referenceCount: 4,
+      edges: [{ fromName: 'one', toName: 'target' }, { fromName: 'two', toName: 'target' }, { fromName: 'three', toName: 'target' }, { fromName: 'four', toName: 'target' }],
+    },
+  )
+})
+
+test('copy-on-write boundary: a fork target-only edit clones zero unchanged dependency buckets and leaves its base unchanged', () => {
+  const base = new FileLocalResolver('/repo', new Map([
+    ['src/target.ts', 'export function target(){ return 1 }\n'],
+    ['src/importer.ts', "import { target } from './target'\nexport function one(){ return target() }\nexport function two(){ return target() }\n"],
+  ]))
+  const baseCandidateBucket = base.dependencyRefs.get('src/target')
+  const baseResolvedBucket = base.dependencyRefs.get('src/target.ts')
+  const fork = base.fork()
+
+  fork.applyChanges([{ type: 'change', path: 'src/target.ts', source: 'export function target(){ return 2 }\n' }])
+  const snapshot = fork.applyChanges([{ type: 'change', path: 'src/target.ts', source: 'export function target(){ return 3 }\n' }])
+
+  assert.deepEqual(
+    {
+      forkReusedCandidateBucket: fork.dependencyRefs.get('src/target') === baseCandidateBucket,
+      forkReusedResolvedBucket: fork.dependencyRefs.get('src/target.ts') === baseResolvedBucket,
+      forkBucketClones: fork.dependencyBucketCloneCount,
+      baseBucketsUnchanged: base.dependencyRefs.get('src/target') === baseCandidateBucket && baseCandidateBucket.size === 2 && base.dependencyRefs.get('src/target.ts') === baseResolvedBucket && baseResolvedBucket.size === 2,
+      baseTargetLine: base.snapshot().edges.map(({ toLine }) => toLine),
+      forkEdges: snapshot.edges.map(({ fromName, toName, toLine }) => ({ fromName, toName, toLine })),
+    },
+    {
+      forkReusedCandidateBucket: true,
+      forkReusedResolvedBucket: true,
+      forkBucketClones: 0,
+      baseBucketsUnchanged: true,
+      baseTargetLine: [1, 1],
+      forkEdges: [{ fromName: 'one', toName: 'target', toLine: 1 }, { fromName: 'two', toName: 'target', toLine: 1 }],
+    },
+  )
+})
+
+test('copy-on-write boundary: a fork membership change clones each inherited dependency bucket once and reuses both for later writes', () => {
+  const base = new FileLocalResolver('/repo', new Map([
+    ['src/target.ts', 'export function target(){ return 1 }\n'],
+    ['src/importer.ts', "import { target } from './target'\nexport function one(){ return target() }\n"],
+  ]))
+  const baseCandidateBucket = base.dependencyRefs.get('src/target')
+  const baseResolvedBucket = base.dependencyRefs.get('src/target.ts')
+  const fork = base.fork()
+
+  fork.applyChanges([{ type: 'change', path: 'src/importer.ts', source: "import { target } from './target'\nexport function one(){ return target() }\nexport function two(){ return target() }\n" }])
+  const ownedCandidateBucket = fork.dependencyRefs.get('src/target')
+  const ownedResolvedBucket = fork.dependencyRefs.get('src/target.ts')
+  const snapshot = fork.applyChanges([{ type: 'change', path: 'src/importer.ts', source: "import { target } from './target'\nexport function two(){ return target() }\n" }])
+
+  assert.deepEqual(
+    {
+      forkClonedCandidateBucket: ownedCandidateBucket !== baseCandidateBucket,
+      forkClonedResolvedBucket: ownedResolvedBucket !== baseResolvedBucket,
+      forkReusedCandidateBucket: fork.dependencyRefs.get('src/target') === ownedCandidateBucket,
+      forkReusedResolvedBucket: fork.dependencyRefs.get('src/target.ts') === ownedResolvedBucket,
+      forkBucketClones: fork.dependencyBucketCloneCount,
+      forkReferenceCount: fork.dependencyRefs.get('src/target.ts').size,
+      baseBucketsUnchanged: base.dependencyRefs.get('src/target') === baseCandidateBucket && baseCandidateBucket.size === 1 && base.dependencyRefs.get('src/target.ts') === baseResolvedBucket && baseResolvedBucket.size === 1,
+      baseEdges: base.snapshot().edges.map(({ fromName, toName }) => ({ fromName, toName })),
+      forkEdges: snapshot.edges.map(({ fromName, toName }) => ({ fromName, toName })),
+    },
+    {
+      forkClonedCandidateBucket: true,
+      forkClonedResolvedBucket: true,
+      forkReusedCandidateBucket: true,
+      forkReusedResolvedBucket: true,
+      forkBucketClones: 2,
+      forkReferenceCount: 1,
+      baseBucketsUnchanged: true,
+      baseEdges: [{ fromName: 'one', toName: 'target' }],
+      forkEdges: [{ fromName: 'two', toName: 'target' }],
+    },
   )
 })

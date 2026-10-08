@@ -15,13 +15,16 @@ const NODE_KINDS = ['entry', 'exit', 'statement', 'condition', 'loop', 'case', '
 const ROLES = ['body', 'condition', 'consequent', 'alternate', 'initializer', 'update', 'operand', 'callee', 'argument', 'handler', 'finalizer']
 const EDGE_KINDS = ['next', 'true', 'false', 'case', 'default', 'back', 'break', 'continue', 'return', 'throw', 'exception', 'finally']
 const RELATION_KINDS = ['call', 'read', 'write']
+const BINDING_KINDS = ['symbol', 'reexport', 'namespace', 'star']
 const MAX_INTERNAL_RECORDS = 10_000_000
 const SYMBOL_MAGIC = 0x50534743
-const SYMBOL_SCHEMA_VERSION = 1
-const SYMBOL_HEADER_BYTES = 48
+const SYMBOL_SCHEMA_VERSION = 3
+const SYMBOL_HEADER_BYTES = 52
 const SYMBOL_RECORD_BYTES = 36
 const SYMBOL_EDGE_BYTES = 16
 const SYMBOL_UNRESOLVED_BYTES = 12
+const SYMBOL_BINDING_BYTES = 16
+const SYMBOL_REFERENCE_BYTES = 24
 const UTF8_ENCODER = new TextEncoder()
 const UTF8_DECODER = new TextDecoder()
 const code = (list, value, label) => { const result = list.indexOf(value); if (result < 0) throw new Error(`unknown internal ${label}: ${value}`); return result }
@@ -33,7 +36,7 @@ const uint32 = (value, label, nullable = false) => {
 }
 
 const symbolStrings = (partition) => {
-  const symbols = partition.symbols ?? []; const edges = partition.edges ?? []; const dependencies = partition.dependencies ?? []; const unresolved = partition.unresolved ?? []
+  const symbols = partition.symbols ?? []; const edges = partition.edges ?? []; const dependencies = partition.dependencies ?? []; const unresolved = partition.unresolved ?? []; const bindings = partition.bindings ?? []; const references = partition.references ?? []
   const indexes = new Map(); const values = []
   const intern = (value) => { value = String(value ?? ''); if (indexes.has(value)) return indexes.get(value); const index = values.length; indexes.set(value, index); values.push(value); return index }
   const file = intern(partition.file); const sourceHash = intern(partition.sourceHash)
@@ -42,12 +45,14 @@ const symbolStrings = (partition) => {
   for (const value of dependencies) intern(value)
   let candidateCount = 0
   for (const row of unresolved) { intern(row.specifier); for (const value of row.candidates) intern(value); candidateCount += row.candidates.length }
-  return { symbols, edges, dependencies, unresolved, values, indexes, file, sourceHash, candidateCount }
+  for (const row of bindings) for (const value of [row.name, row.target, row.specifier, row.remote]) if (value !== undefined) intern(value)
+  for (const row of references) for (const value of [row.from, row.specifier, row.remote, row.property]) if (value !== undefined && value !== null) intern(value)
+  return { symbols, edges, dependencies, unresolved, bindings, references, values, indexes, file, sourceHash, candidateCount }
 }
 
 export function symbolPartitionLayout(partition) {
   const strings = symbolStrings(partition)
-  const recordsEnd = SYMBOL_HEADER_BYTES + strings.symbols.length * SYMBOL_RECORD_BYTES + strings.edges.length * SYMBOL_EDGE_BYTES + strings.dependencies.length * 4 + strings.unresolved.length * SYMBOL_UNRESOLVED_BYTES + strings.candidateCount * 4
+  const recordsEnd = SYMBOL_HEADER_BYTES + strings.symbols.length * SYMBOL_RECORD_BYTES + strings.edges.length * SYMBOL_EDGE_BYTES + strings.dependencies.length * 4 + strings.unresolved.length * SYMBOL_UNRESOLVED_BYTES + strings.candidateCount * 4 + strings.bindings.length * SYMBOL_BINDING_BYTES + strings.references.length * SYMBOL_REFERENCE_BYTES
   let stringBytes = 0
   for (const value of strings.values) stringBytes += 4 + UTF8_ENCODER.encode(value).byteLength
   return { ...strings, recordsEnd, byteLength: recordsEnd + stringBytes }
@@ -59,7 +64,7 @@ export function writeSymbolPartition(partition, layout, target) {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength); const u = (offset, value) => view.setUint32(offset, value >>> 0, true)
   const stringOffsets = new Uint32Array(layout.values.length); let cursor = layout.recordsEnd
   layout.values.forEach((value, index) => { const encoded = UTF8_ENCODER.encode(value); stringOffsets[index] = cursor; u(cursor, encoded.byteLength); bytes.set(encoded, cursor + 4); cursor += 4 + encoded.byteLength })
-  ;[SYMBOL_MAGIC, SYMBOL_SCHEMA_VERSION, layout.byteLength, layout.symbols.length, layout.edges.length, layout.dependencies.length, layout.unresolved.length, layout.candidateCount, layout.recordsEnd, stringOffsets[layout.file], stringOffsets[layout.sourceHash], 0].forEach((value, index) => u(index * 4, value))
+  ;[SYMBOL_MAGIC, SYMBOL_SCHEMA_VERSION, layout.byteLength, layout.symbols.length, layout.edges.length, layout.dependencies.length, layout.unresolved.length, layout.candidateCount, layout.recordsEnd, stringOffsets[layout.file], stringOffsets[layout.sourceHash], layout.bindings.length, layout.references.length].forEach((value, index) => u(index * 4, value))
   let offset = SYMBOL_HEADER_BYTES
   for (const row of layout.symbols) { [layout.indexes.get(row.id), layout.indexes.get(row.file), layout.indexes.get(row.name), layout.indexes.get(row.kind), row.line, layout.indexes.get(row.qualifiedPath), layout.indexes.get(row.signature), row.ordinal, row.exported ? 1 : 0].forEach((value, index) => u(offset + index * 4, value)); offset += SYMBOL_RECORD_BYTES }
   for (const row of layout.edges) { [layout.indexes.get(row.from), layout.indexes.get(row.to), row.line, row.call ? 1 : 0].forEach((value, index) => u(offset + index * 4, value)); offset += SYMBOL_EDGE_BYTES }
@@ -67,6 +72,16 @@ export function writeSymbolPartition(partition, layout, target) {
   let candidate = 0
   for (const row of layout.unresolved) { u(offset, layout.indexes.get(row.specifier)); u(offset + 4, candidate); u(offset + 8, row.candidates.length); offset += SYMBOL_UNRESOLVED_BYTES; candidate += row.candidates.length }
   for (const row of layout.unresolved) for (const value of row.candidates) { u(offset, layout.indexes.get(value)); offset += 4 }
+  for (const row of layout.bindings) {
+    u(offset, code(BINDING_KINDS, row.kind, 'binding kind'))
+    u(offset + 4, row.name === undefined ? NONE : layout.indexes.get(row.name))
+    u(offset + 8, row.kind === 'symbol' ? layout.indexes.get(row.target) : layout.indexes.get(row.specifier))
+    u(offset + 12, row.remote === undefined ? NONE : layout.indexes.get(row.remote))
+    offset += SYMBOL_BINDING_BYTES
+  }
+  for (const row of layout.references) {
+    u(offset, layout.indexes.get(row.from)); u(offset + 4, layout.indexes.get(row.specifier)); u(offset + 8, row.remote == null ? NONE : layout.indexes.get(row.remote)); u(offset + 12, row.property == null ? NONE : layout.indexes.get(row.property)); u(offset + 16, row.line); u(offset + 20, (row.call ? 1 : 0) | (row.namespace ? 2 : 0)); offset += SYMBOL_REFERENCE_BYTES
+  }
   for (let index = 0; index < stringOffsets.length; index += 1) stringOffsets[index] = stringOffsets[index]
   // Records store string-table indexes; rewrite them to byte offsets once, in place.
   const convert = (at) => u(at, stringOffsets[view.getUint32(at, true)])
@@ -76,6 +91,8 @@ export function writeSymbolPartition(partition, layout, target) {
   for (let index = 0; index < layout.dependencies.length; index += 1, offset += 4) convert(offset)
   for (let index = 0; index < layout.unresolved.length; index += 1, offset += SYMBOL_UNRESOLVED_BYTES) convert(offset)
   for (let index = 0; index < layout.candidateCount; index += 1, offset += 4) convert(offset)
+  for (const row of layout.bindings) { if (row.name !== undefined) convert(offset + 4); convert(offset + 8); if (row.remote !== undefined) convert(offset + 12); offset += SYMBOL_BINDING_BYTES }
+  for (const row of layout.references) { convert(offset); convert(offset + 4); if (row.remote != null) convert(offset + 8); if (row.property != null) convert(offset + 12); offset += SYMBOL_REFERENCE_BYTES }
   return bytes
 }
 
@@ -84,7 +101,7 @@ const openSymbolPartition = (input, offset = 0, length = input.byteLength - offs
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength); const u = (at) => view.getUint32(at, true)
   if (length < SYMBOL_HEADER_BYTES || u(0) !== SYMBOL_MAGIC || u(4) !== SYMBOL_SCHEMA_VERSION || u(8) !== length) throw new Error('invalid packed symbol partition')
   const stringAt = (at) => { const size = u(at); if (at < u(32) || at + 4 + size > length) throw new Error('invalid packed symbol string'); return UTF8_DECODER.decode(bytes.subarray(at + 4, at + 4 + size)) }
-  return { bytes, view, u, stringAt, counts: { symbols: u(12), edges: u(16), dependencies: u(20), unresolved: u(24), candidates: u(28) }, file: stringAt(u(36)), sourceHash: stringAt(u(40)) }
+  return { bytes, view, u, stringAt, counts: { symbols: u(12), edges: u(16), dependencies: u(20), unresolved: u(24), candidates: u(28), bindings: u(44), references: u(48) }, file: stringAt(u(36)), sourceHash: stringAt(u(40)) }
 }
 
 export const readSymbolPartitionIdentity = (bytes, offset, length) => { const packed = openSymbolPartition(bytes, offset, length); return { file: packed.file, sourceHash: packed.sourceHash } }
@@ -96,7 +113,15 @@ export function decodeSymbolPartition(input, offset = 0, length = input.byteLeng
   const dependencies = Array.from({ length: counts.dependencies }, () => { const value = stringAt(u(cursor)); cursor += 4; return value })
   const unresolvedRows = Array.from({ length: counts.unresolved }, () => { const row = { specifier: stringAt(u(cursor)), start: u(cursor + 4), count: u(cursor + 8) }; cursor += SYMBOL_UNRESOLVED_BYTES; return row })
   const candidates = Array.from({ length: counts.candidates }, () => { const value = stringAt(u(cursor)); cursor += 4; return value })
-  return { file: packed.file, sourceHash: packed.sourceHash, symbols, edges, dependencies, unresolved: unresolvedRows.map(({ specifier, start, count }) => ({ specifier, candidates: candidates.slice(start, start + count) })) }
+  const bindings = Array.from({ length: counts.bindings }, () => {
+    const kind = decodeCode(BINDING_KINDS, u(cursor), 'binding kind'); const name = u(cursor + 4) === NONE ? undefined : stringAt(u(cursor + 4)); const target = stringAt(u(cursor + 8)); const remote = u(cursor + 12) === NONE ? undefined : stringAt(u(cursor + 12)); cursor += SYMBOL_BINDING_BYTES
+    if (kind === 'symbol') return { kind, name, target }
+    if (kind === 'reexport') return { kind, name, specifier: target, remote }
+    if (kind === 'namespace') return { kind, name, specifier: target }
+    return { kind, specifier: target }
+  })
+  const references = Array.from({ length: counts.references }, () => { const flags = u(cursor + 20); const row = { from: stringAt(u(cursor)), specifier: stringAt(u(cursor + 4)), remote: u(cursor + 8) === NONE ? undefined : stringAt(u(cursor + 8)), namespace: Boolean(flags & 2), property: u(cursor + 12) === NONE ? null : stringAt(u(cursor + 12)), line: u(cursor + 16), call: Boolean(flags & 1) }; cursor += SYMBOL_REFERENCE_BYTES; return row })
+  return { file: packed.file, sourceHash: packed.sourceHash, symbols, edges, dependencies, unresolved: unresolvedRows.map(({ specifier, start, count }) => ({ specifier, candidates: candidates.slice(start, start + count) })), ...(bindings.length ? { bindings } : {}), ...(references.length ? { references } : {}) }
 }
 
 export function encodeInternalPartition(input) {
@@ -264,7 +289,7 @@ export class GraphStore {
   }
   readPartition(id) {
     const packed = path.join(this.partitions, `${id}.bin`)
-    return fs.existsSync(packed) ? decodeSymbolPartition(fs.readFileSync(packed)) : JSON.parse(fs.readFileSync(path.join(this.partitions, `${id}.json`), 'utf8'))
+    return decodeSymbolPartition(fs.readFileSync(packed))
   }
   writeInternalPartition(bytes) {
     this.initialize()
@@ -317,7 +342,8 @@ export class GraphStore {
   publish(manifest) {
     this.initialize(); const generation = `${Date.now().toString(36)}-${digest(manifest).slice(0, 12)}-${crypto.randomBytes(6).toString('hex')}`
     const complete = { ...manifest, generation, createdAt: new Date().toISOString() }
-    this.#atomicWrite(path.join(this.generations, `${generation}.json`), stable(complete))
+    const serialized = stable(complete)
+    this.#atomicWrite(path.join(this.generations, `${generation}.json`), serialized)
     this.#atomicWrite(path.join(this.dir, 'CURRENT'), generation)
     return complete
   }
@@ -334,6 +360,13 @@ export class GraphStore {
       }
     }
     return JSON.parse(fs.readFileSync(path.join(this.generations, `${generation}.json`), 'utf8'))
+  }
+  currentGeneration() {
+    this.initialize()
+    let generation
+    try { generation = fs.readFileSync(path.join(this.dir, 'CURRENT'), 'utf8').trim() } catch {}
+    if (!generation || !fs.existsSync(path.join(this.generations, `${generation}.json`))) return this.readGeneration().generation
+    return generation
   }
   #atomicWrite(target, contents) {
     const temp = `${target}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`

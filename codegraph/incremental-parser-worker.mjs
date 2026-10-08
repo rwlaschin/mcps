@@ -26,6 +26,16 @@ parentPort.on('message', (message) => {
   if (message?.type !== 'parse') return
   const response = { requestId: message.requestId, fileId: message.fileId, revision: message.revision }
   try {
+    if (message.mode === 'structural') {
+      if (typeof message.source !== 'string') throw new TypeError('structural parser source must be supplied')
+      const relative = path.relative(root, path.resolve(root, message.path))
+      if (path.isAbsolute(message.path) || !relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw new Error(`parser path escapes root: ${message.path}`)
+      import('./internal-graph.mjs').then(({ buildInternalGraph }) => {
+        const parsed = buildInternalGraph({ file: message.path, source: message.source, compilerOptions: message.compilerOptions })
+        parentPort.postMessage({ type: 'result', path: message.path, ...response, parsed })
+      }).catch(error => parentPort.postMessage({ type: 'error', path: message.path, ...response, error: error?.message ?? String(error) }))
+      return
+    }
     const target = resolveTarget(message.path)
     const source = fs.readFileSync(target, 'utf8')
     const previous = retained.get(message.fileId)

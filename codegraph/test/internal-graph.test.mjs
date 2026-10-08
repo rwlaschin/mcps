@@ -230,7 +230,7 @@ test('domain analysis: GraphStore round trips every persisted artifact and hydra
   } finally { fs.rmSync(root, { recursive: true, force: true }) }
 })
 
-test('boundary value analysis: a packed symbol partition preserves Unicode text split across shared chunks exactly', () => {
+test('boundary value analysis: a packed symbol partition preserves Unicode text in a shared contiguous buffer exactly', () => {
   const partition = {
     file: 'src/跨越.ts',
     sourceHash: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
@@ -240,16 +240,114 @@ test('boundary value analysis: a packed symbol partition preserves Unicode text 
     unresolved: [{ specifier: './欠落-🚀', candidates: ['src/欠落-🚀.ts', 'src/欠落-🚀/index.ts'] }],
   }
   const layout = symbolPartitionLayout(partition)
-  const chunks = Array.from({ length: Math.ceil(layout.byteLength / 64) }, () => new Uint8Array(new SharedArrayBuffer(64)))
+  const packed = new Uint8Array(new SharedArrayBuffer(layout.byteLength))
 
-  writeSymbolPartition(partition, layout, chunks)
+  writeSymbolPartition(partition, layout, packed)
 
-  assert.deepEqual(decodeSymbolPartition(chunks), partition)
+  assert.deepEqual(decodeSymbolPartition(packed), partition)
+})
+
+test('production boundary: packed symbol partitions do not serialize the dead export surface fingerprint field', () => {
+  const partition = {
+    file: 'src/exported.ts',
+    sourceHash: 'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
+    exportSurfaceFingerprint: 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
+    symbols: [],
+    edges: [],
+    dependencies: [],
+    unresolved: [],
+  }
+  const layout = symbolPartitionLayout(partition)
+  const packed = new Uint8Array(layout.byteLength)
+
+  writeSymbolPartition(partition, layout, packed)
+
+  assert.deepEqual(decodeSymbolPartition(packed), {
+    file: 'src/exported.ts',
+    sourceHash: 'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
+    symbols: [],
+    edges: [],
+    dependencies: [],
+    unresolved: [],
+  })
+})
+
+test('equivalence partitioning: a packed symbol partition without an export surface fingerprint remains absent after decoding', () => {
+  const partition = {
+    file: 'src/private.ts',
+    sourceHash: 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
+    symbols: [],
+    edges: [],
+    dependencies: [],
+    unresolved: [],
+  }
+  const layout = symbolPartitionLayout(partition)
+  const packed = new Uint8Array(layout.byteLength)
+
+  writeSymbolPartition(partition, layout, packed)
+
+  assert.deepEqual(decodeSymbolPartition(packed), partition)
+})
+
+test('cache compatibility: a legacy v1 packed symbol partition fails closed for a schema-v2 rebuild', () => {
+  const partition = {
+    file: 'src/legacy-packed.ts',
+    sourceHash: '9999999999999999999999999999999999999999999999999999999999999999',
+    symbols: [],
+    edges: [],
+    dependencies: [],
+    unresolved: [],
+  }
+  const layout = symbolPartitionLayout(partition)
+  const packed = new Uint8Array(layout.byteLength)
+  writeSymbolPartition(partition, layout, packed)
+  new DataView(packed.buffer, packed.byteOffset, packed.byteLength).setUint32(4, 1, true)
+
+  assert.throws(() => decodeSymbolPartition(packed), /invalid packed symbol partition/)
+})
+
+test('cache fact boundary: packed symbol partitions round-trip imported-use references exactly', () => {
+  const partition = {
+    file: 'src/consumer.ts',
+    sourceHash: 'abababababababababababababababababababababababababababababababab',
+    symbols: [{ id: 'consumer-id', file: 'src/consumer.ts', name: 'consumer', kind: 'function', line: 4, qualifiedPath: '<module>', signature: '():void', ordinal: 0, exported: true }],
+    edges: [],
+    dependencies: ['src/value.ts'],
+    unresolved: [],
+    bindings: [{ kind: 'symbol', name: 'consumer', target: 'consumer-id' }],
+    references: [
+      { from: 'consumer-id', specifier: './value', remote: 'renamed', namespace: false, property: null, line: 5, call: false },
+      { from: 'consumer-id', specifier: './value', remote: undefined, namespace: true, property: 'execute', line: 6, call: true },
+    ],
+  }
+  const layout = symbolPartitionLayout(partition)
+  const packed = new Uint8Array(layout.byteLength)
+
+  writeSymbolPartition(partition, layout, packed)
+
+  assert.deepEqual(decodeSymbolPartition(packed), partition)
+})
+
+test('cache compatibility: a schema-v2 packed partition without imported-use references fails closed', () => {
+  const partition = {
+    file: 'src/schema-two.ts',
+    sourceHash: 'cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd',
+    symbols: [],
+    edges: [],
+    dependencies: [],
+    unresolved: [],
+  }
+  const layout = symbolPartitionLayout(partition)
+  const packed = new Uint8Array(layout.byteLength)
+  writeSymbolPartition(partition, layout, packed)
+  new DataView(packed.buffer, packed.byteOffset, packed.byteLength).setUint32(4, 2, true)
+
+  assert.throws(() => decodeSymbolPartition(packed), /invalid packed symbol partition/)
 })
 
 test('equivalence partitioning: a packed partition remains identical after closing and reopening its store', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-packed-reopen-'))
-  const partition = { file: 'src/value.ts', sourceHash: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', symbols: [{ id: 'value-id', file: 'src/value.ts', name: 'value', kind: 'variable', line: 1, qualifiedPath: '<module>', signature: '<>():number', ordinal: 0, exported: true }], edges: [], dependencies: [], unresolved: [] }
+  const partition = { file: 'src/value.ts', sourceHash: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', symbols: [{ id: 'value-id', file: 'src/value.ts', name: 'value', kind: 'variable', line: 1, qualifiedPath: '<module>', signature: '<>():number', ordinal: 0, exported: true }], edges: [], dependencies: [], unresolved: [], bindings: [{ kind: 'symbol', name: 'value', target: 'value-id' }, { kind: 'reexport', name: 'renamed', specifier: './base', remote: 'named' }, { kind: 'reexport', name: 'default', specifier: './base', remote: 'default' }, { kind: 'namespace', name: 'space', specifier: './base' }, { kind: 'star', specifier: './extra' }] }
   try {
     const id = new GraphStore(root).writePartition(partition)
 
@@ -259,7 +357,7 @@ test('equivalence partitioning: a packed partition remains identical after closi
   } finally { fs.rmSync(root, { recursive: true, force: true }) }
 })
 
-test('cache compatibility: a legacy JSON partition remains equivalent when opened by the packed-aware store', () => {
+test('cache compatibility: a legacy JSON partition safely misses and is replaced by a current packed partition', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-legacy-symbol-json-'))
   const partition = { file: 'src/legacy.ts', sourceHash: 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc', symbols: [{ id: 'legacy-id', file: 'src/legacy.ts', name: 'legacy', kind: 'function', line: 2, qualifiedPath: '<module>', signature: '<>():void', ordinal: 0, exported: true }], edges: [{ from: 'legacy-id', to: 'target-id', line: 3, call: false }], dependencies: ['src/target.ts'], unresolved: [{ specifier: './gone', candidates: ['src/gone.ts'] }] }
   try {
@@ -269,9 +367,11 @@ test('cache compatibility: a legacy JSON partition remains equivalent when opene
     const id = crypto.createHash('sha256').update(contents).digest('hex')
     fs.writeFileSync(path.join(store.partitions, `${id}.json`), contents)
 
-    const reopened = new GraphStore(root).readPartition(id)
+    assert.throws(() => store.readPartition(id), /ENOENT|no such file/i)
+    const rebuiltId = store.writePartition(partition)
+    const rebuilt = store.readPartition(rebuiltId)
 
-    assert.deepEqual(reopened, partition)
+    assert.deepEqual(rebuilt, partition)
   } finally { fs.rmSync(root, { recursive: true, force: true }) }
 })
 

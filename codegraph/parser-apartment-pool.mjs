@@ -3,6 +3,9 @@ import path from 'node:path'
 import { availableParallelism } from 'node:os'
 import { Worker } from 'node:worker_threads'
 import { parseFile } from './incremental-resolver.mjs'
+import { deriveWorkerProfile } from './worker-profile.mjs'
+
+export { deriveWorkerProfile }
 
 const DEFAULT_TIMEOUT_MS = 30_000
 
@@ -11,7 +14,7 @@ const DEFAULT_TIMEOUT_MS = 30_000
 // process cannot see — a second test runner, or a CI container whose quota is below the host.
 const defaultWorkerCount = () => {
   const configured = Number(process.env.CODEGRAPH_PARSER_WORKERS)
-  return Number.isInteger(configured) && configured >= 0 ? configured : Math.max(0, availableParallelism() - 1)
+  return Number.isInteger(configured) && configured >= 0 ? configured : Math.max(1, availableParallelism() - 1)
 }
 
 const workerCountOption = (value) => {
@@ -51,6 +54,7 @@ export class ParserApartmentPool {
     this.root = path.resolve(root); this.workerCount = workerCountOption(options.workerCount); this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
     this.readFileSync = options.readFileSync ?? fs.readFileSync; this.realpathSync = options.realpathSync ?? fs.realpathSync
     this.workerFactory = options.workerFactory ?? ((url, workerOptions) => new Worker(url, workerOptions))
+    this.baseExecArgv = options.baseExecArgv ?? process.execArgv
     this.latestRevisionByFile = new Map(); this.affinityByFile = new Map(); this.nextRequestId = 1; this.closed = false
     this.workers = []
     this.budgeted = options.workerFactory === undefined
@@ -67,7 +71,7 @@ export class ParserApartmentPool {
   }
   #newApartment(index) { const apartment = { index, worker: null, queue: [], active: null, replacing: null, terminated: false, requiresRequestId: false }; this.#installWorker(apartment); return apartment }
   #installWorker(apartment) {
-    const worker = this.workerFactory(new URL('./incremental-parser-worker.mjs', import.meta.url), { workerData: { root: this.root } }); apartment.worker = worker; apartment.terminated = false
+    const worker = this.workerFactory(new URL('./incremental-parser-worker.mjs', import.meta.url), { workerData: { root: this.root }, execArgv: deriveWorkerProfile(this.baseExecArgv, apartment.index).execArgv }); apartment.worker = worker; apartment.terminated = false
     worker.on('message', (message) => { if (apartment.worker === worker) this.#onMessage(apartment, message) })
     worker.on('error', (error) => { if (apartment.worker === worker) this.#replaceAfterFailure(apartment, error) })
     worker.on('exit', (code) => { if (!this.closed && apartment.worker === worker) this.#replaceAfterFailure(apartment, new Error(`parser worker exited with code ${code}`)) })
@@ -83,7 +87,9 @@ export class ParserApartmentPool {
     const identity = String(fileId); const latest = this.latestRevisionByFile.get(identity)
     if (latest !== undefined && revision < latest) return Promise.resolve(null)
     this.latestRevisionByFile.set(identity, revision)
+    if (request.mode === 'structural' && typeof request.source !== 'string') return Promise.reject(new TypeError('structural parser source must be supplied'))
     if (this.workerCount === 0) {
+      if (request.mode === 'structural') return import('./internal-graph.mjs').then(({ buildInternalGraph }) => buildInternalGraph({ file: normalizedPath, source: request.source, compilerOptions: request.compilerOptions }))
       try {
         const lexicalTarget = path.resolve(this.root, normalizedPath); let target = lexicalTarget
         try { target = this.realpathSync(lexicalTarget) } catch (error) { if (error?.code !== 'ENOENT') throw error }
@@ -103,7 +109,7 @@ export class ParserApartmentPool {
       this.affinityByFile.set(identity, apartment)
     }
     for (let index = apartment.queue.length - 1; index >= 0; index -= 1) { const queued = apartment.queue[index]; if (queued.fileId === identity && queued.revision <= revision) { apartment.queue.splice(index, 1); queued.resolve(null) } }
-    return new Promise((resolve, reject) => { apartment.queue.push({ requestId: this.nextRequestId++, path: normalizedPath, fileId: identity, revision, resolve, reject, timer: null }); this.#dispatch(apartment) })
+    return new Promise((resolve, reject) => { apartment.queue.push({ requestId: this.nextRequestId++, path: normalizedPath, fileId: identity, revision, mode: request.mode, source: request.source, compilerOptions: request.compilerOptions, resolve, reject, timer: null }); this.#dispatch(apartment) })
   }
 
   release(request, fileId, revision) {
@@ -121,8 +127,8 @@ export class ParserApartmentPool {
     const work = apartment.queue.shift()
     if (work.revision !== this.latestRevisionByFile.get(work.fileId)) { work.resolve(null); this.#dispatch(apartment); return }
     apartment.active = work; apartment.worker.ref?.()
-    work.timer = setTimeout(() => { if (apartment.active === work) { apartment.active = null; work.reject(new Error(`parser request timed out: ${work.path}`)); this.#replaceWorker(apartment) } }, this.timeoutMs)
-    apartment.worker.postMessage({ type: 'parse', requestId: work.requestId, path: work.path, fileId: work.fileId, revision: work.revision })
+    if (this.timeoutMs > 0) work.timer = setTimeout(() => { if (apartment.active === work) { apartment.active = null; work.reject(new Error(`parser request timed out: ${work.path}`)); this.#replaceWorker(apartment) } }, this.timeoutMs)
+    apartment.worker.postMessage({ type: 'parse', requestId: work.requestId, path: work.path, fileId: work.fileId, revision: work.revision, ...(work.mode === 'structural' ? { mode: work.mode, source: work.source, compilerOptions: work.compilerOptions } : {}) })
   }
   #onMessage(apartment, message) {
     const work = apartment.active

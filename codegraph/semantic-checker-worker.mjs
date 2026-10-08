@@ -4,15 +4,59 @@ import path from 'node:path'
 import crypto from 'node:crypto'
 import { EDGE_COVERAGE } from './edge-coverage.mjs'
 import { decodeSymbolPartition, GraphStore, symbolPartitionLayout, writeSymbolPartition } from './store.mjs'
+import { deriveWorkerProfile } from './worker-profile.mjs'
+import { createCachedReferenceIndex, repairCachedReferences, updateCachedGraphFacts, cachedUnresolvedEdges, cachedPublicationEdgePatches } from './cached-binding-resolver.mjs'
 
-let createSemanticProject, parsePartition, prepareSemanticProject, refreshSemanticFiles
+export { deriveWorkerProfile }
+
+let createSemanticProject, readOneFileCompilerOptions, createOneFileSemanticSession, parsePartition, prepareSemanticProject, refreshSemanticFiles
 const semanticWorker = !isMainThread && workerData?.semanticChecker === true
-if (semanticWorker) ({ createSemanticProject, parsePartition, prepareSemanticProject, refreshSemanticFiles } = await import('./parser.mjs'))
+if (semanticWorker) {
+  ({ createSemanticProject, readOneFileCompilerOptions, parsePartition, prepareSemanticProject, refreshSemanticFiles } = await import('./parser.mjs'))
+  ;({ createOneFileSemanticSession } = await import('./one-file-semantic-library.mjs'))
+}
 
-// The last validated state, kept so an edit costs the edit rather than the tree: the ts-morph
-// project, its syntax context and the partitions it produced are all reusable when the incoming
-// snapshot's base is exactly the state this cache describes.
+// Retain owned syntax sessions and partition facts across changed-file validations.
 let cache = null
+let semanticOperationId = 0
+let semanticStructuralWindow = 1
+const structuralPending = new Map()
+
+async function* structuralPartitions(context, sources, diagnostics) {
+  const iterator = sources.entries()
+  const pending = new Map()
+  const workers = new Set()
+  const compilerOptions = context.project.getCompilerOptions()
+  context.deferStructuralGraph = true
+  context.preparedStructuralGraphs = new Map()
+  const enqueue = () => {
+    const next = iterator.next()
+    if (next.done) return
+    const [file, source] = next.value
+    const promise = new Promise((resolve, reject) => {
+      structuralPending.set(file, { resolve, reject })
+      parentPort.postMessage({ id: semanticOperationId, structuralRequest: { mode: 'structural', path: file, fileId: file, revision: semanticOperationId, source, compilerOptions } })
+    }).then(result => ({ result }), error => ({ error }))
+    pending.set(file, { source, promise })
+    diagnostics.structuralJobsDispatched += 1
+  }
+  for (let index = 0; index < semanticStructuralWindow; index += 1) enqueue()
+  while (pending.size) {
+    const [file, job] = pending.entries().next().value
+    const started = performance.now()
+    const { result, error } = await job.promise
+    const waited = performance.now() - started
+    diagnostics.structuralPoolMs += waited
+    if (context.semanticTiming) context.semanticTiming.structuralCfgMs += waited
+    if (error) throw error
+    workers.add(result.workerIndex)
+    diagnostics.structuralWorkersUsed = workers.size
+    pending.delete(file)
+    context.preparedStructuralGraphs.set(path.resolve(context.root, file), result.graph)
+    yield [file, job.source]
+    enqueue()
+  }
+}
 
 const POOL_JOB_COUNT = 300
 const POOL_CANCELLED = 0
@@ -71,7 +115,6 @@ const cancelPool = (buffer) => {
   const metadata = new Int32Array(buffer, 0, POOL_HEADER_BYTES / 4)
   Atomics.store(metadata, POOL_CANCELLED, 1)
 }
-
 const sameBlobs = (left, right) => {
   if (!left || !right) return false
   const keys = Object.keys(left)
@@ -79,51 +122,6 @@ const sameBlobs = (left, right) => {
 }
 const symbolPartitions = (partitions) => Object.fromEntries(Object.entries(partitions).map(([file, { internalPartition, internalFingerprint, ...partition }]) => [file, partition]))
 const partitionFingerprints = (partitions) => Object.fromEntries(Object.entries(partitions).map(([file, partition]) => [file, partition.internalFingerprint]).filter(([, fingerprint]) => typeof fingerprint === 'string'))
-
-// A changed file whose declarations are not confined to its own module scope can alter resolution
-// in files that do not import it, which no dependency-graph closure bounds. Those go the full way.
-const globalScoped = (source) => /\bdeclare\s+(?:global|module)\b/.test(source) || /\/\/\/\s*<reference\b/.test(source)
-const moduleScoped = (file, source) => /\.(?:mjs|mts)$/i.test(file) || /(^|[\n;])\s*(?:import|export)\b/m.test(source)
-
-function partitionIndexes(partitions) {
-  const importers = new Map(); const unresolved = new Map()
-  for (const [file, partition] of Object.entries(partitions)) {
-    for (const dependency of partition.dependencies ?? []) {
-      const files = importers.get(dependency)
-      if (files) files.add(file); else importers.set(dependency, new Set([file]))
-    }
-    for (const row of partition.unresolved ?? []) for (const candidate of row.candidates ?? []) unresolved.set(candidate, (unresolved.get(candidate) ?? 0) + 1)
-  }
-  return { importers, unresolved }
-}
-
-function patchPartitionIndexes(cache, previous, next) {
-  for (const [file, partition] of Object.entries(previous)) {
-    for (const dependency of partition.dependencies ?? []) {
-      const files = cache.importers.get(dependency); files?.delete(file)
-      if (!files?.size) cache.importers.delete(dependency)
-    }
-    for (const row of partition.unresolved ?? []) for (const candidate of row.candidates ?? []) {
-      const count = cache.unresolved.get(candidate) ?? 0
-      if (count <= 1) cache.unresolved.delete(candidate); else cache.unresolved.set(candidate, count - 1)
-    }
-  }
-  for (const [file, partition] of Object.entries(next)) {
-    for (const dependency of partition.dependencies ?? []) {
-      const files = cache.importers.get(dependency)
-      if (files) files.add(file); else cache.importers.set(dependency, new Set([file]))
-    }
-    for (const row of partition.unresolved ?? []) for (const candidate of row.candidates ?? []) cache.unresolved.set(candidate, (cache.unresolved.get(candidate) ?? 0) + 1)
-  }
-}
-
-function indexedDependentClosure(importers, changed) {
-  const set = new Set(changed); const queue = [...changed]
-  while (queue.length) for (const importer of importers.get(queue.pop()) ?? []) if (!set.has(importer)) { set.add(importer); queue.push(importer) }
-  return set
-}
-
-const indexedUnresolvedCandidateMatches = (unresolved, changedFiles) => changedFiles.some((file) => unresolved.has(file.split(path.sep).join('/')))
 
 function readSources(snapshot, sourceBlobs) {
   const sourceRoot = snapshot.sourceDir && path.resolve(snapshot.sourceDir)
@@ -139,28 +137,30 @@ function readPartitions(snapshot) {
   const root = path.resolve(snapshot.partitionDir)
   return Object.fromEntries(Object.entries(snapshot.basePartitionIds ?? {}).map(([file, id]) => {
     if (!/^[a-f0-9]{64}$/.test(id)) throw new Error(`invalid SHA-256 partition id: ${id}`)
-    const packed = path.resolve(root, `${id}.bin`); const legacy = path.resolve(root, `${id}.json`); const target = fs.existsSync(packed) ? packed : legacy
+    const target = path.resolve(root, `${id}.bin`)
     if (path.dirname(target) !== root) throw new Error(`partition path escapes partitionDir: ${id}`)
     const contents = fs.readFileSync(target); if (crypto.createHash('sha256').update(contents).digest('hex') !== id) throw new Error(`partition digest mismatch: ${id}`)
-    const partition = target === packed ? decodeSymbolPartition(contents) : JSON.parse(contents.toString('utf8')); if (partition.file !== file) throw new Error(`partition key/file mismatch: ${file}`)
+    const partition = decodeSymbolPartition(contents); if (partition.file !== file) throw new Error(`partition key/file mismatch: ${file}`)
     return [file, partition]
   }))
 }
 
-function fullValidation(snapshot, sources, sourceBlobs, timing, timingMode = 'full-fallback') {
+async function fullValidation(snapshot, sources, sourceBlobs, timing, timingMode = 'full-fallback') {
   const started = performance.now()
   const context = prepareSemanticProject(createSemanticProject(snapshot.root, sources), snapshot.root, null, timing)
   timing.projectCreateMs += performance.now() - started
+  const structuralDiagnostics = { structuralWorkersUsed: 0, structuralJobsDispatched: 0, structuralPoolMs: 0 }
   const known = new Set(sources.keys()); const partitions = {}
-  for (const [file, source] of sources) partitions[file] = parsePartition(file, source, known, context, null, EDGE_COVERAGE.CALLS)
+  for await (const [file, source] of structuralPartitions(context, sources, structuralDiagnostics)) partitions[file] = parsePartition(file, source, known, context, null, EDGE_COVERAGE.COMPLETE)
   const cachedPartitions = symbolPartitions(partitions)
-  cache = { baseGeneration: snapshot.baseGeneration, sourceBlobs: { ...sourceBlobs }, sources, partitions: cachedPartitions, internalFingerprints: partitionFingerprints(partitions), context, ...partitionIndexes(cachedPartitions) }
-  return { revision: snapshot.revision, mode: 'full', timingMode, baseGeneration: snapshot.baseGeneration, sourceBlobs, partitions }
+  cache = { root: path.resolve(snapshot.root), baseGeneration: snapshot.baseGeneration, sourceBlobs: { ...sourceBlobs }, sources, partitions: cachedPartitions, internalFingerprints: partitionFingerprints(partitions), referenceIndex: createCachedReferenceIndex(cachedPartitions), compilerOptions: context.project.getCompilerOptions(), semanticSessions: new Map(), context }
+  return { revision: snapshot.revision, mode: 'full', timingMode, baseGeneration: snapshot.baseGeneration, sourceBlobs, partitions, structuralDiagnostics }
 }
 
 function ownedSnapshot(request, hydrate = false) {
   const { files, sources, sourceBlobs } = ownedSnapshotInput(request)
-  const context = prepareSemanticProject(createSemanticProject(request.root, sources), request.root)
+  const context = hydrate ? null : prepareSemanticProject(createSemanticProject(request.root, sources), request.root)
+  const compilerOptions = hydrate ? readOneFileCompilerOptions(request.root) : context.project.getCompilerOptions()
   let partitions
   if (hydrate) {
     if (!request.partitions || typeof request.partitions !== 'object') throw new Error('malformed semantic hydrate partitions')
@@ -178,7 +178,7 @@ function ownedSnapshot(request, hydrate = false) {
   const internalFingerprints = hydrate ? { ...(request.internalFingerprints ?? {}) } : partitionFingerprints(partitions)
   if (hydrate && (Object.keys(internalFingerprints).length !== files.length || files.some((file) => typeof internalFingerprints[file] !== 'string'))) throw new Error('semantic internal fingerprint membership mismatch')
   const cachedPartitions = symbolPartitions(partitions)
-  cache = { baseGeneration: request.generation ?? null, sourceBlobs, sources, partitions: cachedPartitions, internalFingerprints, context, ...partitionIndexes(cachedPartitions) }
+  cache = { root: path.resolve(request.root), baseGeneration: request.generation ?? null, sourceBlobs, sources, partitions: cachedPartitions, internalFingerprints, referenceIndex: createCachedReferenceIndex(cachedPartitions, hydrate ? request.baseEdgePatches ?? request.edgePatches ?? [] : []), compilerOptions, semanticSessions: new Map(), context }
   return { mode: 'full', sourceBlobs, partitions }
 }
 
@@ -233,7 +233,7 @@ function streamValidationResult(id, request, result, semanticTiming, operationSt
   const pool = openPartitionPool(request.partitionPool)
   pool.debugId = request.partitionPoolDebugId ?? id
   const diagnostics = { requestId: id, poolId: pool.debugId, recordsAttempted: 0, recordsStreamed: 0, recordsPersisted: 0, bytesCopied: 0, wraparounds: 0, capacityFailures: 0, parseMs: result.parseMs, transportMs: 0 }
-  const batches = createBatchWriter(id, pool, cache?.context?.semanticTraversalSummary ?? { completedFiles: 0, remainingFiles: 0, maximumTraversalsPerFile: 0 }, diagnostics)
+  const batches = createBatchWriter(id, pool, result.semanticTraversalSummary ?? cache?.context?.semanticTraversalSummary ?? { completedFiles: 0, remainingFiles: 0, maximumTraversalsPerFile: 0 }, diagnostics)
   const partitionReceipts = []
   const store = new GraphStore(request.root, request.cacheDir)
   const files = Object.keys(result.partitions ?? {}).sort()
@@ -254,7 +254,7 @@ function streamValidationResult(id, request, result, semanticTiming, operationSt
   return { ...metadata, partitionReceipts, ...(DEBUG_POOL ? { poolDiagnostics: diagnostics } : {}) }
 }
 
-function streamOwnedSnapshot(id, request) {
+async function streamOwnedSnapshot(id, request) {
   const operationStarted = performance.now()
   const semanticTiming = { projectCreateMs: 0, syntaxCollectionMs: 0, structuralCfgMs: 0, exportsMs: 0, identifierResolutionMs: 0, internalRelationsMs: 0, encodingMs: 0, completeEdgeMaterializationMs: 0, refsLookupMs: 0 }
   const { root, sources, sourceBlobs } = ownedSnapshotInput(request)
@@ -263,6 +263,7 @@ function streamOwnedSnapshot(id, request) {
   const contextStarted = performance.now()
   const context = prepareSemanticProject(createSemanticProject(root, sources), root, null, semanticTiming)
   semanticTiming.projectCreateMs += performance.now() - contextStarted
+  const structuralDiagnostics = { structuralWorkersUsed: 0, structuralJobsDispatched: 0, structuralPoolMs: 0 }
   const known = new Set(sources.keys())
   const cachedPartitions = {}
   const internalFingerprints = {}
@@ -271,7 +272,7 @@ function streamOwnedSnapshot(id, request) {
   const batches = createBatchWriter(id, pool, context.semanticTraversalSummary, diagnostics)
   const store = new GraphStore(request.root, request.cacheDir)
   const ordinals = new Map([...sources.keys()].sort().map((file, ordinal) => [file, ordinal]))
-  for (const [file, source] of sources) {
+  for await (const [file, source] of structuralPartitions(context, sources, structuralDiagnostics)) {
     assertPoolActive(pool.metadata)
     const partitionStarted = performance.now()
     const partition = parsePartition(file, source, known, context, null, request.edgeCoverage ?? EDGE_COVERAGE.COMPLETE)
@@ -287,11 +288,12 @@ function streamOwnedSnapshot(id, request) {
   }
   batches.flush(true)
   assertPoolActive(pool.metadata)
-  cache = { baseGeneration: request.generation ?? null, sourceBlobs, sources, partitions: cachedPartitions, internalFingerprints, context, ...partitionIndexes(cachedPartitions) }
+  cache = { root: path.resolve(request.root), baseGeneration: request.generation ?? null, sourceBlobs, sources, partitions: cachedPartitions, internalFingerprints, referenceIndex: createCachedReferenceIndex(cachedPartitions), compilerOptions: context.project.getCompilerOptions(), semanticSessions: new Map(), context }
   partitionReceipts.sort((a, b) => a.file < b.file ? -1 : a.file > b.file ? 1 : 0)
-  debugPool('Worker Semantic Timing Summary', id, pool.debugId, { mode: 'full', ...semanticTiming, operationElapsedMs: performance.now() - operationStarted })
+  const semanticSessionStats = { ...context.project.getSourceFiles()[0]?.session.stats }
+  debugPool('Worker Semantic Timing Summary', id, pool.debugId, { mode: 'full', ...semanticTiming, semanticSessionStats, operationElapsedMs: performance.now() - operationStarted })
   debugPool('Worker Shared Memory Summary', id, pool.debugId, { mode: 'full', ...diagnostics })
-  return { mode: 'full', sourceBlobs, partitionReceipts, semanticTraversalSummary: { ...context.semanticTraversalSummary }, ...(DEBUG_POOL ? { poolDiagnostics: diagnostics } : {}) }
+  return { mode: 'full', sourceBlobs, partitionReceipts, semanticSessionStats, semanticTraversalSummary: { ...context.semanticTraversalSummary }, poolDiagnostics: { ...structuralDiagnostics, ...(DEBUG_POOL ? diagnostics : {}) } }
 }
 
 function ownedSnapshotInput(request) {
@@ -312,10 +314,124 @@ function ownedSnapshotInput(request) {
 
 function validateSnapshot(snapshot, timing) {
   const workspaceRoot = path.resolve(snapshot.root)
-  const sourceRoot = snapshot.sourceDir && path.resolve(snapshot.sourceDir); const sourceBlobs = { ...(snapshot.baseSourceBlobs ?? {}) }
+  const sourceRoot = snapshot.sourceDir && path.resolve(snapshot.sourceDir)
+  const changes = snapshot.changes ?? []
+  const retainedCache = !snapshot.basePartitionIds && cache?.baseGeneration === snapshot.baseGeneration ? cache : null
+  if (changes.length === 1 && retainedCache) {
+    retainedCache.root = workspaceRoot
+    const changed = changes[0]
+    const retainedPartitions = retainedCache.partitions
+    const retainedFingerprints = retainedCache.internalFingerprints
+    const referenceIndex = retainedCache.referenceIndex
+    const workCounters = { sourceMembershipCopied: 0, basePartitionsOpened: 0, changedPartitionsWritten: changed.type === 'unlink' ? 0 : 1, dependentSourcesRead: 0, repositoryRecordsMaterialized: 0, repositorySizedContainersAllocated: 0 }
+    if (changed.type === 'unlink') {
+      if (!retainedPartitions[changed.path] || !retainedCache.sourceBlobs[changed.path]) throw new Error(`single-file semantic unlink cannot remove: ${changed.path}`)
+      delete retainedPartitions[changed.path]
+      delete retainedFingerprints[changed.path]
+      delete retainedCache.sourceBlobs[changed.path]
+      retainedCache.sources.delete(changed.path)
+      const edgePatches = repairCachedReferences(referenceIndex, retainedPartitions, changed.path)
+      updateCachedGraphFacts(referenceIndex, retainedPartitions, changed.path, edgePatches)
+      retainedCache.context = null
+      retainedCache.semanticSessions.delete(changed.path)
+      return { revision: snapshot.revision, mode: 'delta', timingMode: 'delta', baseGeneration: snapshot.baseGeneration, sourceBlobs: {}, partitions: {}, tombstones: [changed.path], edgePatches, unresolvedEdges: cachedUnresolvedEdges(referenceIndex), publicationEdgePatches: cachedPublicationEdgePatches(referenceIndex), workCounters, internalBuildCount: 0, internalRebuiltFiles: [], internalReusedFiles: [], semanticTraversalSummary: { completedFiles: 0, remainingFiles: 0, maximumTraversalsPerFile: 0 } }
+    }
+    let source = changed.source
+    if (source === undefined) {
+      if (path.isAbsolute(changed.path)) throw new Error(`changed source path must be relative: ${changed.path}`)
+      const diskTarget = path.resolve(workspaceRoot, changed.path); const relative = path.relative(workspaceRoot, diskTarget)
+      if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw new Error(`changed source path escapes root: ${changed.path}`)
+      const realRoot = fs.realpathSync(workspaceRoot); const realTarget = fs.realpathSync(diskTarget); const realRelative = path.relative(realRoot, realTarget)
+      if (!realRelative || realRelative === '..' || realRelative.startsWith(`..${path.sep}`) || path.isAbsolute(realRelative)) throw new Error(`changed source path escapes root through symbolic link: ${changed.path}`)
+      source = fs.readFileSync(realTarget, 'utf8')
+    }
+    const contentDigest = crypto.createHash('sha256').update(source).digest('hex')
+    const parsedDigest = crypto.createHash('sha256').update(`${changed.path}\0${source}`).digest('hex')
+    if (changed.expectedDigest !== undefined && changed.expectedDigest !== parsedDigest) throw new Error(`changed source digest mismatch after parse: ${changed.path}`)
+    const target = path.resolve(sourceRoot, contentDigest); if (path.dirname(target) !== sourceRoot) throw new Error('changed source blob path escapes sourceDir'); if (!fs.existsSync(target)) fs.writeFileSync(target, source)
+    const started = performance.now()
+    const compilerOptions = readOneFileCompilerOptions(snapshot.root)
+    const optionsKey = JSON.stringify(compilerOptions)
+    retainedCache.compilerOptions = compilerOptions
+    let retainedSession = retainedCache.semanticSessions.get(changed.path)
+    if (!retainedSession || retainedSession.root !== workspaceRoot || retainedSession.optionsKey !== optionsKey) {
+      retainedSession = { root: workspaceRoot, optionsKey, session: createOneFileSemanticSession(snapshot.root, changed.path, compilerOptions), knownFiles: { has: (file) => Object.hasOwn(retainedPartitions, file) || file === changed.path } }
+      retainedCache.semanticSessions.set(changed.path, retainedSession)
+    }
+    timing.projectCreateMs += performance.now() - started
+    const structuralStats = retainedSession.session.structuralCaches.get(retainedSession.session.absolute)?.stats
+    if (structuralStats) { structuralStats.rebuiltOwners = 0; structuralStats.reusedOwners = 0 }
+    const partition = retainedSession.session.parse(source, retainedSession.knownFiles, retainedPartitions, null, timing)
+    const context = retainedSession.session.context
+    const partitions = { [changed.path]: partition }
+    const { internalPartition, internalFingerprint, ...symbolPartition } = partition
+    retainedPartitions[changed.path] = symbolPartition
+    retainedFingerprints[changed.path] = internalFingerprint
+    retainedCache.sourceBlobs[changed.path] = contentDigest
+    retainedCache.sources.set(changed.path, source)
+    retainedCache.context = context
+    const edgePatches = repairCachedReferences(referenceIndex, retainedPartitions, changed.path)
+    updateCachedGraphFacts(referenceIndex, retainedPartitions, changed.path, edgePatches)
+    return { revision: snapshot.revision, mode: 'delta', timingMode: 'delta', baseGeneration: snapshot.baseGeneration, sourceBlobs: { [changed.path]: contentDigest }, partitions, tombstones: [], edgePatches, unresolvedEdges: cachedUnresolvedEdges(referenceIndex), publicationEdgePatches: cachedPublicationEdgePatches(referenceIndex), workCounters, semanticSessionStats: retainedSession.session.stats, internalBuildCount: 1, internalRebuiltFiles: [changed.path], internalReusedFiles: [], semanticTraversalSummary: retainedSession.session.stats.analysisCacheHits ? { completedFiles: 0, remainingFiles: 0, maximumTraversalsPerFile: 0 } : { ...context.semanticTraversalSummary } }
+  }
+  const sourceBlobs = { ...(snapshot.baseSourceBlobs ?? retainedCache?.sourceBlobs ?? {}) }
+  if (changes.length === 1 && snapshot.basePartitionIds) {
+    const retainedPartitions = readPartitions(snapshot)
+    const referenceIndex = createCachedReferenceIndex(retainedPartitions, snapshot.baseEdgePatches ?? [])
+    const compilerOptions = readOneFileCompilerOptions(snapshot.root)
+    const semanticSessions = new Map()
+    const retainedFiles = Object.keys(sourceBlobs).sort()
+    const partitionFiles = Object.keys(retainedPartitions).sort()
+    const retainedFingerprints = { ...(snapshot.baseInternalFingerprints ?? {}) }
+    const fingerprintFiles = Object.keys(retainedFingerprints).sort()
+    if (partitionFiles.length !== retainedFiles.length || partitionFiles.some((file, index) => file !== retainedFiles[index] || retainedPartitions[file]?.sourceHash !== sourceBlobs[file])) throw new Error('retained semantic partition/source membership mismatch')
+    if (fingerprintFiles.length !== retainedFiles.length || fingerprintFiles.some((file, index) => file !== retainedFiles[index] || typeof retainedFingerprints[file] !== 'string')) throw new Error('retained semantic internal fingerprint membership mismatch')
+    const changed = changes[0]
+    if (changed.type === 'unlink') {
+      if (!retainedPartitions[changed.path] || !sourceBlobs[changed.path]) throw new Error(`single-file semantic unlink cannot remove: ${changed.path}`)
+      delete retainedPartitions[changed.path]
+      delete retainedFingerprints[changed.path]
+      delete sourceBlobs[changed.path]
+      const edgePatches = repairCachedReferences(referenceIndex, retainedPartitions, changed.path)
+      updateCachedGraphFacts(referenceIndex, retainedPartitions, changed.path, edgePatches)
+      cache = { root: path.resolve(snapshot.root), baseGeneration: snapshot.baseGeneration, sourceBlobs: { ...sourceBlobs }, sources: new Map(), partitions: retainedPartitions, internalFingerprints: retainedFingerprints, referenceIndex, compilerOptions, semanticSessions, context: null }
+      return { revision: snapshot.revision, mode: 'delta', timingMode: 'delta', baseGeneration: snapshot.baseGeneration, sourceBlobs, partitions: {}, tombstones: [changed.path], edgePatches, unresolvedEdges: cachedUnresolvedEdges(referenceIndex), publicationEdgePatches: cachedPublicationEdgePatches(referenceIndex), internalBuildCount: 0, internalRebuiltFiles: [], internalReusedFiles: [], semanticTraversalSummary: { completedFiles: 0, remainingFiles: 0, maximumTraversalsPerFile: 0 } }
+    }
+    let source = changed.source
+    if (source === undefined) {
+      if (path.isAbsolute(changed.path)) throw new Error(`changed source path must be relative: ${changed.path}`)
+      const diskTarget = path.resolve(workspaceRoot, changed.path); const relative = path.relative(workspaceRoot, diskTarget)
+      if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw new Error(`changed source path escapes root: ${changed.path}`)
+      const realRoot = fs.realpathSync(workspaceRoot); const realTarget = fs.realpathSync(diskTarget); const realRelative = path.relative(realRoot, realTarget)
+      if (!realRelative || realRelative === '..' || realRelative.startsWith(`..${path.sep}`) || path.isAbsolute(realRelative)) throw new Error(`changed source path escapes root through symbolic link: ${changed.path}`)
+      source = fs.readFileSync(realTarget, 'utf8')
+    }
+    const contentDigest = crypto.createHash('sha256').update(source).digest('hex')
+    const parsedDigest = crypto.createHash('sha256').update(`${changed.path}\0${source}`).digest('hex')
+    if (changed.expectedDigest !== undefined && changed.expectedDigest !== parsedDigest) throw new Error(`changed source digest mismatch after parse: ${changed.path}`)
+    const target = path.resolve(sourceRoot, contentDigest); if (path.dirname(target) !== sourceRoot) throw new Error('changed source blob path escapes sourceDir'); if (!fs.existsSync(target)) fs.writeFileSync(target, source)
+    sourceBlobs[changed.path] = contentDigest
+    const sources = new Map([[changed.path, source]])
+    const started = performance.now()
+    const retainedSession = { root: workspaceRoot, optionsKey: JSON.stringify(compilerOptions), session: createOneFileSemanticSession(snapshot.root, changed.path, compilerOptions), knownFiles: { has: file => Object.hasOwn(retainedPartitions, file) || file === changed.path } }
+    semanticSessions.set(changed.path, retainedSession)
+    timing.projectCreateMs += performance.now() - started
+    const partition = retainedSession.session.parse(source, retainedSession.knownFiles, retainedPartitions, null, timing)
+    const context = retainedSession.session.context
+    const partitions = { [changed.path]: partition }
+    const cachedPartitions = retainedPartitions
+    const { internalPartition, internalFingerprint, ...symbolPartition } = partition
+    cachedPartitions[changed.path] = symbolPartition
+    const edgePatches = repairCachedReferences(referenceIndex, cachedPartitions, changed.path)
+    updateCachedGraphFacts(referenceIndex, cachedPartitions, changed.path, edgePatches)
+    const internalFingerprints = { ...retainedFingerprints, ...partitionFingerprints(partitions) }
+    cache = { root: path.resolve(snapshot.root), baseGeneration: snapshot.baseGeneration, sourceBlobs: { ...sourceBlobs }, sources, partitions: cachedPartitions, internalFingerprints, referenceIndex, compilerOptions, semanticSessions, context }
+    return { revision: snapshot.revision, mode: 'delta', timingMode: 'delta', baseGeneration: snapshot.baseGeneration, sourceBlobs, partitions, edgePatches, unresolvedEdges: cachedUnresolvedEdges(referenceIndex), publicationEdgePatches: cachedPublicationEdgePatches(referenceIndex), semanticSessionStats: retainedSession.session.stats, internalBuildCount: 1, internalRebuiltFiles: [changed.path], internalReusedFiles: [], semanticTraversalSummary: { ...context.semanticTraversalSummary } }
+  }
+  if (changes.length === 1) throw new Error(`single-file semantic delta cannot process: ${changes[0].path}`)
   let sources
   if (snapshot.sources) sources = new Map(snapshot.sources)
-  else if (cache && sameBlobs(cache.sourceBlobs, sourceBlobs)) { sources = new Map(cache.sources); cache.baseGeneration = snapshot.baseGeneration }
+  else if (cache && cache.sources.size === Object.keys(sourceBlobs).length && sameBlobs(cache.sourceBlobs, sourceBlobs)) { sources = new Map(cache.sources); cache.baseGeneration = snapshot.baseGeneration }
   else sources = readSources(snapshot, sourceBlobs)
   const forceHydrate = Boolean(snapshot.basePartitionIds)
   let baseHydrated = !forceHydrate && Boolean(cache && sameBlobs(cache.sourceBlobs, sourceBlobs))
@@ -327,12 +443,10 @@ function validateSnapshot(snapshot, timing) {
       const context = prepareSemanticProject(createSemanticProject(snapshot.root, sources), snapshot.root, null, timing)
       timing.projectCreateMs += performance.now() - started
       const cachedPartitions = { ...basePartitions }
-      cache = { baseGeneration: snapshot.baseGeneration, sourceBlobs: { ...sourceBlobs }, sources: new Map(sources), partitions: cachedPartitions, internalFingerprints: { ...(snapshot.baseInternalFingerprints ?? {}) }, context, ...partitionIndexes(cachedPartitions) }
+      cache = { root: path.resolve(snapshot.root), baseGeneration: snapshot.baseGeneration, sourceBlobs: { ...sourceBlobs }, sources: new Map(sources), partitions: cachedPartitions, internalFingerprints: { ...(snapshot.baseInternalFingerprints ?? {}) }, referenceIndex: createCachedReferenceIndex(cachedPartitions, snapshot.baseEdgePatches ?? []), compilerOptions: context.project.getCompilerOptions(), semanticSessions: new Map(), context }
       baseHydrated = true
     }
   }
-  const oldSource = cache?.sources.get(snapshot.changes?.[0]?.path) ?? ''
-  const changes = snapshot.changes ?? []
   for (const change of snapshot.changes ?? []) {
     if (change.type === 'unlink') { sources.delete(change.path); delete sourceBlobs[change.path] }
     else {
@@ -352,39 +466,7 @@ function validateSnapshot(snapshot, timing) {
     }
   }
 
-  const changed = changes[0]
-  const safe = baseHydrated && changes.length === 1 && changed.type === 'change' && sources.has(changed.path) &&
-    moduleScoped(changed.path, oldSource) && !globalScoped(oldSource) && moduleScoped(changed.path, sources.get(changed.path)) && !globalScoped(sources.get(changed.path)) &&
-    !indexedUnresolvedCandidateMatches(cache.unresolved, [changed.path])
-  if (!safe) return fullValidation(snapshot, sources, sourceBlobs, timing)
-
-  try {
-    cache.context.semanticTiming = timing
-    const affected = indexedDependentClosure(cache.importers, [changed.path])
-    const changedFile = cache.context.project.createSourceFile(path.join(workspaceRoot, changed.path), sources.get(changed.path), { overwrite: true })
-    const files = [...affected].map((file) => file === changed.path ? changedFile : cache.context.project.getSourceFile(path.join(workspaceRoot, file)))
-    if (files.some((file) => !file)) return fullValidation(snapshot, sources, sourceBlobs, timing)
-    refreshSemanticFiles(cache.context, files)
-    const known = new Set(sources.keys()); const partitions = {}; const internalRebuiltFiles = []; const internalReusedFiles = []; const changedFiles = new Set(changes.filter(({ type }) => type !== 'unlink').map(({ path }) => path))
-    for (const file of [...affected].sort()) {
-      const rebuildForSource = changedFiles.has(file)
-      let partition = parsePartition(file, sources.get(file), known, cache.context, null, EDGE_COVERAGE.CALLS, rebuildForSource, true)
-      if (!rebuildForSource && cache.internalFingerprints?.[file] !== partition.internalFingerprint) {
-        partition = parsePartition(file, sources.get(file), known, cache.context, null, EDGE_COVERAGE.CALLS, true)
-      } else cache.context.perFile.delete(cache.context.project.getSourceFile(path.join(workspaceRoot, file)).getFilePath())
-      partitions[file] = partition
-      if (partition.internalPartition) internalRebuiltFiles.push(file); else internalReusedFiles.push(file)
-    }
-    const symbolResults = symbolPartitions(partitions)
-    const previous = Object.fromEntries(Object.keys(symbolResults).map((file) => [file, cache.partitions[file]]))
-    patchPartitionIndexes(cache, previous, symbolResults)
-    Object.assign(cache.partitions, symbolResults)
-    Object.assign(cache.internalFingerprints, partitionFingerprints(partitions))
-    cache.sources = sources; cache.sourceBlobs = { ...sourceBlobs }
-    return { revision: snapshot.revision, mode: 'delta', timingMode: 'delta', baseGeneration: snapshot.baseGeneration, sourceBlobs, partitions, internalBuildCount: internalRebuiltFiles.length, internalRebuiltFiles, internalReusedFiles, semanticTraversalSummary: { ...cache.context.semanticTraversalSummary } }
-  } catch {
-    return fullValidation(snapshot, sources, sourceBlobs, timing)
-  }
+  return fullValidation(snapshot, sources, sourceBlobs, timing)
 }
 
 function referenceOverlay(request) {
@@ -392,6 +474,7 @@ function referenceOverlay(request) {
   if (!Array.isArray(request.staleFiles)) throw new Error('overlay stale files must be an array')
   const stale = [...new Set(request.staleFiles)]
   if (stale.length !== request.staleFiles.length || stale.some((file) => !cache.sources.has(file))) throw new Error('overlay stale files do not match worker cache')
+  if (stale.length && (!cache.context || cache.context.eligibleFiles.size !== cache.sources.size)) cache.context = prepareSemanticProject(createSemanticProject(cache.root, cache.sources), cache.root)
   const sourceFiles = stale.map((file) => cache.context.project.getSourceFile(path.join(cache.context.root, file)))
   if (sourceFiles.some((file) => !file)) throw new Error('overlay stale source is absent from worker project')
   refreshSemanticFiles(cache.context, sourceFiles)
@@ -403,17 +486,45 @@ function referenceOverlay(request) {
   return { generation: request.generation, files }
 }
 
+function advanceGeneration({ expectedGeneration, generation }) {
+  if (!cache || cache.baseGeneration !== expectedGeneration) throw new Error('semantic checker worker generation acknowledgement mismatch')
+  if (typeof generation !== 'string' || !generation) throw new Error('semantic checker worker generation acknowledgement is invalid')
+  cache.baseGeneration = generation
+  return { generation }
+}
+
+let nextSemanticProfileId = 1
 export class SemanticCheckerWorker {
-  constructor() { this.worker = null; this.nextId = 1; this.pending = new Map(); this.closed = false }
+  constructor() { this.worker = null; this.parserPool = null; this.profileId = nextSemanticProfileId++; this.nextId = 1; this.pending = new Map(); this.requestTail = Promise.resolve(); this.closed = false }
+  async #prepareParserPool(root) {
+    const { ParserApartmentPool } = await import('./parser-apartment-pool.mjs')
+    if (this.closed) throw this.failure ?? new Error('semantic checker worker is disposed')
+    if (this.parserPool && this.parserPool.root !== path.resolve(root)) { await this.parserPool.dispose(); this.parserPool = null }
+    if (this.closed) throw this.failure ?? new Error('semantic checker worker is disposed')
+    if (!this.parserPool) {
+      const profileArgv = process.execArgv.filter((argument) => /^--(?:cpu|heap)-prof(?:$|-(?:dir|name)=)/.test(argument))
+      this.parserPool = new ParserApartmentPool(root, { baseExecArgv: deriveWorkerProfile(profileArgv, `structural-${this.profileId}`).execArgv, timeoutMs: profileArgv.length ? 0 : undefined })
+      this.parserPool.workerCount = Math.max(1, this.parserPool.workerCount)
+    }
+  }
   // The thread loads its own copy of ts-morph and takes ~68ms to terminate. A query served from
   // the mmap page never validates, so spawning on construction charged every such process for a
   // thread it never used.
   #spawn() {
     if (this.worker) return this.worker
-    this.worker = new Worker(new URL(import.meta.url), { workerData: { semanticChecker: true } })
-    this.worker.on('message', ({ id, progress, result, error }) => {
+    const profileArgv = process.execArgv.filter((argument) => /^--(?:cpu|heap)-prof(?:$|-(?:dir|name)=)/.test(argument))
+    this.worker = new Worker(new URL(import.meta.url), { workerData: { semanticChecker: true }, execArgv: deriveWorkerProfile(profileArgv, this.profileId === 1 ? 'semantic' : `semantic-${this.profileId}`).execArgv })
+    this.worker.on('message', ({ id, progress, result, error, structuralRequest }) => {
       const pending = this.pending.get(id)
       if (!pending) return
+      if (structuralRequest) {
+        this.parserPool.parse(structuralRequest).then(graph => {
+          if (!pending.settled) this.worker.postMessage({ id, structuralResult: { fileId: structuralRequest.fileId, revision: structuralRequest.revision, graph, workerIndex: this.parserPool.affinityByFile.get(String(structuralRequest.fileId)).index } })
+        }, error => {
+          if (!pending.settled) this.worker.postMessage({ id, structuralResult: { fileId: structuralRequest.fileId, revision: structuralRequest.revision, error: error.message } })
+        })
+        return
+      }
       if (progress) {
         try { pending.onProgress?.(progress) } catch (progressError) { this.#settle(id, pending, progressError) }
         return
@@ -427,30 +538,72 @@ export class SemanticCheckerWorker {
     return this.worker
   }
   #settle(id, pending, error = null, result = null) { if (pending.settled) return; pending.settled = true; this.pending.delete(id); if (!this.pending.size) this.worker.unref(); if (error) { cancelPool(pending.pool); pending.reject(error) } else pending.resolve(result) }
-  #fail(error) { if (this.failure) return; this.failure = error; this.closed = true; for (const [id, pending] of this.pending) this.#settle(id, pending, error); this.worker?.unref() }
-  #request(type, payload, onProgress = null) { if (this.closed) return Promise.reject(this.failure ?? new Error('semantic checker worker is disposed')); const id = this.nextId++; const worker = this.#spawn(); worker.ref(); return new Promise((resolve, reject) => { this.pending.set(id, { resolve, reject, onProgress, pool: payload?.partitionPool, settled: false }); worker.postMessage({ id, type, payload }) }) }
-  validate(snapshot, onProgress) {
-    if (snapshot?.partitionPool && typeof onProgress !== 'function') return Promise.reject(new Error('semantic partition transport requires a progress consumer'))
-    return this.#request('validate', snapshot, onProgress)
+  #fail(error) { if (this.failure) return; this.failure = error; this.closed = true; for (const [id, pending] of this.pending) this.#settle(id, pending, error); void this.dispose().catch(() => {}) }
+  #request(type, payload, onProgress = null) {
+    if (this.closed) return Promise.reject(this.failure ?? new Error('semantic checker worker is disposed'))
+    const id = this.nextId++
+    const run = async () => {
+      if (this.closed) throw this.failure ?? new Error('semantic checker worker is disposed')
+      if (type === 'index' || type === 'validate' && (payload?.changes?.length ?? 0) !== 1) await this.#prepareParserPool(payload.root)
+      if (this.closed) throw this.failure ?? new Error('semantic checker worker is disposed')
+      const worker = this.#spawn()
+      worker.ref()
+      return new Promise((resolve, reject) => {
+        this.pending.set(id, { resolve, reject, onProgress, pool: payload?.partitionPool, settled: false })
+        worker.postMessage({ id, type, payload, structuralWindow: this.parserPool?.workerCount ?? 1 })
+      })
+    }
+    const result = this.requestTail.then(run, run)
+    this.requestTail = result.then(() => undefined, () => undefined)
+    return result
   }
-  index(request, onProgress) {
+  async validate(snapshot, onProgress) {
+    if (snapshot?.partitionPool && typeof onProgress !== 'function') return Promise.reject(new Error('semantic partition transport requires a progress consumer'))
+    const result = await this.#request('validate', snapshot, onProgress)
+    return { ...result, poolDiagnostics: { ...(result.poolDiagnostics ?? {}), workersUsed: 1, jobsDispatched: result.structuralDiagnostics?.structuralJobsDispatched ?? snapshot?.changes?.length ?? 0 } }
+  }
+  async index(request, onProgress) {
     if (request?.partitionPool && typeof onProgress !== 'function') return Promise.reject(new Error('semantic partition transport requires a progress consumer'))
-    return this.#request('index', request, onProgress)
+    const result = await this.#request('index', request, onProgress)
+    return { ...result, poolDiagnostics: { ...(result.poolDiagnostics ?? {}), workersUsed: 1, jobsDispatched: request.sources.length } }
   }
   hydrate(request) { return this.#request('hydrate', request) }
+  advanceGeneration(expectedGeneration, generation) { return this.#request('advance-generation', { expectedGeneration, generation }) }
   referenceOverlay(request) { return this.#request('reference-overlay', request) }
-  async dispose() { if (!this.closed) { this.closed = true; const error = new Error('semantic checker worker is disposed'); for (const [id, pending] of this.pending) this.#settle(id, pending, error) } await this.worker?.terminate().catch(() => {}) }
+  dispose() {
+    if (this.disposal) return this.disposal
+    if (!this.closed) { this.closed = true; const error = new Error('semantic checker worker is disposed'); for (const [id, pending] of this.pending) this.#settle(id, pending, error) }
+    this.disposal = (async () => { try { await this.parserPool?.dispose() } finally { await this.worker?.terminate().catch(() => {}) } })()
+    return this.disposal
+  }
 }
 
-if (semanticWorker) parentPort.on('message', ({ id, type, payload, snapshot }) => {
+let semanticRequestTail = Promise.resolve()
+if (semanticWorker) parentPort.on('message', (message) => {
+  if (message.structuralResult) {
+    const result = message.structuralResult
+    if (message.id !== semanticOperationId || result.revision !== semanticOperationId) return
+    const pending = structuralPending.get(result.fileId)
+    if (!pending) return
+    structuralPending.delete(result.fileId)
+    if (result.error) pending.reject(new Error(result.error))
+    else pending.resolve(result)
+    return
+  }
+  const handle = async () => {
+  const { id, type, payload, snapshot } = message
+  semanticOperationId = id
+  semanticStructuralWindow = message.structuralWindow ?? 1
   try {
     const request = payload ?? snapshot
     if (type === 'index' || type === 'validate') debugPool('Worker Start', id, request.partitionPoolDebugId ?? id)
-    const handlers = { index: () => streamOwnedSnapshot(id, payload), hydrate: () => ownedSnapshot(payload, true), validate: () => { const operationStarted = performance.now(); const timing = { projectCreateMs: 0, syntaxCollectionMs: 0, structuralCfgMs: 0, exportsMs: 0, identifierResolutionMs: 0, internalRelationsMs: 0, encodingMs: 0, completeEdgeMaterializationMs: 0, refsLookupMs: 0 }; const result = validateSnapshot(request, timing); result.parseMs = timing.projectCreateMs + timing.syntaxCollectionMs + timing.structuralCfgMs + timing.exportsMs + timing.identifierResolutionMs + timing.internalRelationsMs + timing.encodingMs; return streamValidationResult(id, request, result, timing, operationStarted) }, 'reference-overlay': () => referenceOverlay(payload) }
+    const handlers = { index: () => streamOwnedSnapshot(id, payload), hydrate: () => ownedSnapshot(payload, true), validate: async () => { const operationStarted = performance.now(); const timing = { projectCreateMs: 0, syntaxCollectionMs: 0, structuralCfgMs: 0, exportsMs: 0, identifierResolutionMs: 0, internalRelationsMs: 0, encodingMs: 0, completeEdgeMaterializationMs: 0, refsLookupMs: 0 }; const result = await validateSnapshot(request, timing); result.parseMs = timing.projectCreateMs + timing.syntaxCollectionMs + timing.structuralCfgMs + timing.exportsMs + timing.identifierResolutionMs + timing.internalRelationsMs + timing.encodingMs; return streamValidationResult(id, request, result, timing, operationStarted) }, 'advance-generation': () => advanceGeneration(payload), 'reference-overlay': () => referenceOverlay(payload) }
     if (!handlers[type]) throw new Error(`unknown semantic checker operation: ${type}`)
-    const result = handlers[type]()
+    const result = await handlers[type]()
     if (type === 'index' || type === 'validate') debugPool('Worker Complete Processing', id, request.partitionPoolDebugId ?? id)
     parentPort.postMessage({ id, result })
   }
   catch (error) { parentPort.postMessage({ id, error: { message: error.message, stack: error.stack } }) }
+  }
+  semanticRequestTail = semanticRequestTail.then(handle, handle)
 })

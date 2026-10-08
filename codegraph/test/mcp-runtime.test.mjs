@@ -7,6 +7,12 @@ import { EventEmitter } from 'node:events'
 import { spawnSync } from 'node:child_process'
 import { DebouncedBuildQueue, McpProjectRuntime } from '../mcp-runtime.mjs'
 import { DaemonQueryEngine } from '../daemon-query-engine.mjs'
+import { createSourcePolicy } from '../source-policy.mjs'
+
+const createTypeScriptPolicy = (root) => createSourcePolicy(root, {
+  extensions: ['.ts', '.tsx', '.js', '.jsx', '.mts', '.cts', '.mjs', '.cjs'],
+  controlFiles: ['tsconfig.json', 'jsconfig.json'],
+})
 
 test('debounce coalesces and preserves events arriving during a build', async () => {
   const batches = []; let release
@@ -26,7 +32,7 @@ test('MCP runtime reconciles on startup and shuts watcher down', async () => {
   let reconciled = 0
   const runtime = new McpProjectRuntime(root, {
     engine: {
-      policy: (await import('../source-policy.mjs')).createSourcePolicy(root),
+      policy: createTypeScriptPolicy(root),
       reconcile: async () => { reconciled++ },
       incremental: async () => {},
     },
@@ -35,6 +41,34 @@ test('MCP runtime reconciles on startup and shuts watcher down', async () => {
   assert.equal(reconciled, 1)
   await runtime.close()
   assert.equal(runtime.queue.closed, true)
+})
+
+test('domain analysis: MCP refresh queues only fake analyzer-owned source and control events', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-mcp-descriptor-routing-'))
+  const batches = []
+  const runtime = new McpProjectRuntime(root, {
+    debounceMs: 0,
+    engine: {
+      policy: {
+        normalize: (file) => path.relative(root, file),
+        isIgnoredRelative: () => false,
+        isSourceRelative: (file) => file.endsWith('.widget'),
+        acceptWatchPath: (file) => file.endsWith('.widget') || file.endsWith('workspace.widget'),
+        scan: () => [],
+      },
+      reconcile: async () => {},
+      incremental: async (events) => { batches.push(events) },
+      dispose: async () => {},
+    },
+    nativeWatch: () => Object.assign(new EventEmitter(), { close() {} }),
+  })
+  await runtime.start()
+  runtime.enqueue('add', path.join(root, 'card.widget'))
+  runtime.enqueue('add', path.join(root, 'workspace.widget'))
+  runtime.enqueue('add', path.join(root, 'ignored.ts'))
+  await runtime.queue.idle()
+  await runtime.close()
+  assert.deepEqual(batches.flat().map(({ type, path: file }) => `${type}:${file}`).sort(), ['add:card.widget', 'add:workspace.widget'])
 })
 
 test('polling fallback reconciles a mutation absorbed before ready and reports reconciliation failure', async () => {
@@ -49,7 +83,7 @@ test('polling fallback reconciles a mutation absorbed before ready and reports r
   let mutated = false
   const runtime = new McpProjectRuntime(root, {
     engine: {
-      policy: (await import('../source-policy.mjs')).createSourcePolicy(root),
+      policy: createTypeScriptPolicy(root),
       reconcile: async () => { reconciledStates.push(mutated); if (reconciledStates.length === 2) throw new Error('fallback reconcile failed') },
       incremental: async () => {},
       registeredFiles: () => new Set(),
@@ -77,7 +111,7 @@ test('domain analysis: first and later explicit indexes each perform one semanti
   let reconciles = 0
   const runtime = new McpProjectRuntime(root, {
     engine: {
-      policy: (await import('../source-policy.mjs')).createSourcePolicy(root),
+      policy: createTypeScriptPolicy(root),
       reconcile: async () => { reconciles += 1; return { generation: 'unexpected-reconcile' } },
       build: async () => { builds += 1; return builds === 1 ? { generation: 'generation-1', parsedFiles: ['one.ts'], validatedFiles: ['one.ts'] } : { generation: 'generation-2', parsedFiles: ['one.ts'], validatedFiles: ['one.ts'] } },
       incremental: async () => {},
@@ -143,20 +177,23 @@ process.stdout.write(JSON.stringify({ stdout, stderr }))
   )
 })
 
-test('ownership boundary: the MCP runtime creates the worker-owned engine path', () => {
+test('ownership boundary: MCP runtime exposes analyzer-owned worker creation without eagerly instantiating it', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-mcp-worker-owner-'))
   fs.writeFileSync(path.join(root, 'tsconfig.json'), '{}')
 
   const runtime = new McpProjectRuntime(root)
 
-  assert.ok(runtime.engine.validationWorker)
+  assert.deepEqual(
+    { analyzers: runtime.engine.languageAnalyzers.analyzers.map(({ id, createSemanticWorker }) => ({ id, workerFactory: typeof createSemanticWorker })), engineWorkerFactory: typeof runtime.engine.validationWorkerFactory, validationWorker: runtime.engine.validationWorker },
+    { analyzers: [{ id: 'typescript', workerFactory: 'function' }], engineWorkerFactory: 'function', validationWorker: null },
+  )
   return runtime.engine.dispose()
 })
 
 test('ownership boundary: the MCP runtime preserves an injected engine without replacing its policy', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-mcp-injected-owner-'))
   fs.writeFileSync(path.join(root, 'tsconfig.json'), '{}')
-  const injected = { policy: (await import('../source-policy.mjs')).createSourcePolicy(root), reconcile: async () => {}, incremental: async () => {}, dispose: async () => {} }
+  const injected = { policy: createTypeScriptPolicy(root), reconcile: async () => {}, incremental: async () => {}, dispose: async () => {} }
 
   const runtime = new McpProjectRuntime(root, { engine: injected })
 
@@ -205,7 +242,7 @@ test('error guessing: runtime close disposes the warm engine as well as watcher 
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-mcp-dispose-'))
   fs.writeFileSync(path.join(root, 'tsconfig.json'), '{}')
   let disposed = 0
-  const runtime = new McpProjectRuntime(root, { engine: { policy: (await import('../source-policy.mjs')).createSourcePolicy(root), reconcile: async () => {}, incremental: async () => {}, dispose: async () => { disposed += 1 } } })
+  const runtime = new McpProjectRuntime(root, { engine: { policy: createTypeScriptPolicy(root), reconcile: async () => {}, incremental: async () => {}, dispose: async () => { disposed += 1 } } })
   await runtime.start()
 
   await runtime.close()
@@ -220,7 +257,7 @@ test('combinatorial watcher policy: unlink accepts only a previously registered 
   fs.mkdirSync(path.join(root, 'node_modules'))
   fs.writeFileSync(path.join(root, 'src', 'known.ts'), 'export const known = 1\n')
   const batches = []
-  const runtime = new McpProjectRuntime(root, { debounceMs: 1, engine: { policy: (await import('../source-policy.mjs')).createSourcePolicy(root), reconcile: async () => {}, incremental: async (events) => { batches.push(events) }, registeredFiles: () => new Set(['src/known.ts']) } })
+  const runtime = new McpProjectRuntime(root, { debounceMs: 1, engine: { policy: createTypeScriptPolicy(root), reconcile: async () => {}, incremental: async (events) => { batches.push(events) }, registeredFiles: () => new Set(['src/known.ts']) } })
   await runtime.start()
   runtime.enqueue('unlink', path.join(root, 'src', 'known.ts'))
   runtime.enqueue('unlink', path.join(root, 'src', 'notes.txt'))
@@ -237,7 +274,7 @@ test('domain analysis: watcher add then unlink for a previously unregistered sou
   fs.writeFileSync(path.join(root, 'tsconfig.json'), JSON.stringify({ include: ['src'] }))
   fs.mkdirSync(path.join(root, 'src'))
   const batches = []
-  const runtime = new McpProjectRuntime(root, { debounceMs: 5, engine: { policy: (await import('../source-policy.mjs')).createSourcePolicy(root), reconcile: async () => {}, incremental: async (events) => { batches.push(events) }, registeredFiles: () => new Set() } })
+  const runtime = new McpProjectRuntime(root, { debounceMs: 5, engine: { policy: createTypeScriptPolicy(root), reconcile: async () => {}, incremental: async (events) => { batches.push(events) }, registeredFiles: () => new Set() } })
   await runtime.start()
 
   runtime.enqueue('add', path.join(root, 'src', 'new.ts'))
@@ -253,7 +290,7 @@ test('domain analysis: watcher unlink then add for a previously unregistered sou
   fs.writeFileSync(path.join(root, 'tsconfig.json'), JSON.stringify({ include: ['src'] }))
   fs.mkdirSync(path.join(root, 'src'))
   const batches = []
-  const runtime = new McpProjectRuntime(root, { debounceMs: 5, engine: { policy: (await import('../source-policy.mjs')).createSourcePolicy(root), reconcile: async () => {}, incremental: async (events) => { batches.push(events) }, registeredFiles: () => new Set() } })
+  const runtime = new McpProjectRuntime(root, { debounceMs: 5, engine: { policy: createTypeScriptPolicy(root), reconcile: async () => {}, incremental: async (events) => { batches.push(events) }, registeredFiles: () => new Set() } })
   await runtime.start()
 
   runtime.enqueue('unlink', path.join(root, 'src', 'new.ts'))
@@ -288,7 +325,7 @@ test('error guessing: runtime close waits for asynchronous engine disposal befor
   fs.writeFileSync(path.join(root, 'tsconfig.json'), '{}')
   let releaseDispose = () => {}
   let closeSettled = false
-  const runtime = new McpProjectRuntime(root, { engine: { policy: (await import('../source-policy.mjs')).createSourcePolicy(root), reconcile: async () => {}, incremental: async () => {}, dispose: async () => { await new Promise((resolve) => { releaseDispose = resolve }) } } })
+  const runtime = new McpProjectRuntime(root, { engine: { policy: createTypeScriptPolicy(root), reconcile: async () => {}, incremental: async () => {}, dispose: async () => { await new Promise((resolve) => { releaseDispose = resolve }) } } })
   await runtime.start()
 
   const closing = runtime.close().then(() => { closeSettled = true })
@@ -316,7 +353,7 @@ test('error guessing: native watcher EMFILE falls back to polling, forwards chan
   const runtime = new McpProjectRuntime(root, {
     debounceMs: 1,
     engine: {
-      policy: (await import('../source-policy.mjs')).createSourcePolicy(root),
+      policy: createTypeScriptPolicy(root),
       reconcile: async () => {},
       incremental: async (events) => { batches.push(events) },
       registeredFiles: () => new Set(['src/value.ts']),

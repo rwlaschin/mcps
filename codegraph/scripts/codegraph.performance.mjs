@@ -5,14 +5,15 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
-import { GraphStore } from '../store.mjs'
+import { deriveWorkerProfile } from '../parser-apartment-pool.mjs'
+
+export { deriveWorkerProfile }
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const PROJECT = path.resolve(HERE, '..')
 const TIMEOUT_MS = 60_000
 const STDERR_TAIL_BYTES = (64 * 1024) - 256
-const STATES = ['indexed', 'leaf', 'cascade']
-const REQUIRED_FIXTURES = ['src/query/event.ts', 'src/pages/game/GamePopoutShell.tsx', 'src/services/data/session/storyArcState.ts', 'src/utils/plotSameSelectedItem.ts', 'src/types/index.ts']
+const REQUIRED_FIXTURES = ['src/query/event.ts', 'src/pages/game/GamePopoutShell.tsx', 'src/services/data/session/storyArcState.ts', 'src/utils/eventAccess.ts', 'src/utils/plotSameSelectedItem.ts', 'src/types/index.ts']
 const EXCLUDED_DIRECTORIES = new Set(['.git', '.codegraph', 'node_modules', 'dist', 'build', 'coverage', '.next', 'out'])
 
 export const WORKLOADS = [
@@ -31,7 +32,7 @@ export const workloadsFor = (symbol) => symbol ? WORKLOADS.map((workload) => {
   if (workload.key === 'queryNamed') return { ...workload, arguments: { query: { ...workload.arguments.query, name: symbol } } }
   if (workload.key === 'querySingle') return { ...workload, arguments: { query: { type: 'symbols', name: symbol, limit: 1 } } }
   return workload
-}) : WORKLOADS
+  }) : WORKLOADS
 
 export const resolveMcpPath = () => path.join(PROJECT, 'mcp.mjs')
 
@@ -74,11 +75,6 @@ export function assertGenerationAdvanced(previous, current) {
   if (!current || previous === current) throw new Error('validated generation did not advance; generation is unchanged')
 }
 
-export function assertCascadeValidation(validatedFiles) {
-  const count = Array.isArray(validatedFiles) ? validatedFiles.length : validatedFiles
-  if (!Number.isInteger(count) || count < 2) throw new Error('cascade must validate at least two files')
-}
-
 export function assertExpectedReceipt(key, text) {
   if (!text?.trim()) throw new Error(`${key} returned an empty receipt`)
   const expected = {
@@ -96,25 +92,16 @@ export function assertExpectedReceipt(key, text) {
 }
 
 export function withTimeout(promise, milliseconds = TIMEOUT_MS, label = 'operation') {
+  if (milliseconds === 0) return Promise.resolve(promise)
   let timer
   return Promise.race([Promise.resolve(promise), new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${label} timed out after ${milliseconds} ms`)), milliseconds) })]).finally(() => clearTimeout(timer))
 }
 
-export const buildOnce = async (root, { run = spawnSync, clock = performance.now.bind(performance), timeoutMs = TIMEOUT_MS } = {}) => {
-  const started = clock()
-  const result = run(process.execPath, [path.join(PROJECT, 'tool.mjs'), 'build', '--root', root], { cwd: PROJECT, encoding: 'utf8', timeout: timeoutMs })
-  if (result.error) throw result.error
-  if (result.status !== 0) throw new Error(`cold build failed (${result.status ?? result.signal}): ${result.stderr.trim()}`)
-  return readUpdate({ text: result.stdout.trim(), ms: clock() - started })
-}
-
-export const measureColdBuild = (root, { build = buildOnce } = {}) => build(root)
-
 const countFiles = (value) => Array.isArray(value) ? value.length : Number(value ?? 0)
 
-export async function measureWatcherUpdate({ root, state, previousGeneration, phase, timeoutMs = TIMEOUT_MS, mutate = applyStateMutation, readMetadata, afterValidated = async () => {}, wait = () => new Promise((resolve) => setTimeout(resolve, 25)), clock = performance.now.bind(performance) }) {
+export async function measureWatcherUpdate({ root, state, mutationIndex = 1, previousGeneration, label, timeoutMs = TIMEOUT_MS, mutate = applyStateMutation, readMetadata, afterValidated = async () => {}, wait = () => new Promise((resolve) => setTimeout(resolve, 25)), clock = performance.now.bind(performance) }) {
   const started = clock()
-  mutate(root, state)
+  mutate(root, state, mutationIndex)
   return withTimeout((async () => {
     for (;;) {
       const metadata = await readMetadata(root, previousGeneration)
@@ -122,17 +109,18 @@ export async function measureWatcherUpdate({ root, state, previousGeneration, ph
       const status = metadata.status ?? metadata.freshness
       if (generation && generation !== previousGeneration && status === 'validated') {
         await afterValidated(root, generation)
-        return { ms: clock() - started, generation, parsedFiles: countFiles(metadata.parsedFiles), validatedFiles: countFiles(metadata.validatedFiles) }
+        const parsedFileSet = Array.isArray(metadata.parsedFiles) ? [...metadata.parsedFiles].sort() : undefined
+        const validatedFileSet = Array.isArray(metadata.validatedFiles) ? [...metadata.validatedFiles].sort() : undefined
+        return { ms: clock() - started, generation, parsedFiles: countFiles(metadata.parsedFiles), validatedFiles: countFiles(metadata.validatedFiles), ...(parsedFileSet && { parsedFileSet }), ...(validatedFileSet && { validatedFileSet }) }
       }
       await wait()
     }
-  })(), timeoutMs, phase)
+  })(), timeoutMs, label)
 }
 
-export function applyStateMutation(root, state) {
-  const relative = state === 'leaf' ? 'src/utils/plotSameSelectedItem.ts' : state === 'cascade' ? 'src/types/index.ts' : null
-  if (!relative) throw new Error(`unknown benchmark state: ${state}`)
-  fs.appendFileSync(path.join(root, relative), '// codegraph performance benchmark\n')
+export function applyStateMutation(root, state, mutationIndex = 1) {
+  if (state !== 'update') throw new Error(`unknown benchmark state: ${state}`)
+  fs.appendFileSync(path.join(root, 'src/types/index.ts'), `export type CodeGraphPerformanceSurface${mutationIndex} = Id\n`)
 }
 
 const excluded = (source) => {
@@ -152,7 +140,7 @@ export async function withDisposableMirror(sourceRoot, operation) {
   try { return await operation(mirror) } finally { fs.rmSync(path.dirname(mirror), { recursive: true, force: true }) }
 }
 
-export const startMcp = ({ root, profile, diagnosticLog, spawnChild = spawn, platform = process.platform, killProcess = process.kill, controller = process, requestTimeoutMs = TIMEOUT_MS, shutdownTimeoutMs = 10_000 } = {}) => {
+export const startMcp = ({ root, profile, diagnosticLog, spawnChild = spawn, platform = process.platform, killProcess = process.kill, controller = process, requestTimeoutMs = TIMEOUT_MS, shutdownTimeoutMs } = {}) => {
   const args = []
   const cpuDestination = profile?.cpu ? path.resolve(profile.cpu) : null
   const cpuDirectory = cpuDestination ? path.dirname(cpuDestination) : null
@@ -161,20 +149,25 @@ export const startMcp = ({ root, profile, diagnosticLog, spawnChild = spawn, pla
   }
   const diagnosticPath = diagnosticLog ? path.resolve(diagnosticLog) : null
   if (diagnosticPath) fs.mkdirSync(path.dirname(diagnosticPath), { recursive: true })
-  const existingCpuProfiles = cpuDirectory
-    ? new Set(fs.readdirSync(cpuDirectory).filter((name) => name.startsWith('CPU.')))
-    : null
   if (profile) {
-    if (profile.cpu) args.push('--cpu-prof', `--cpu-prof-dir=${cpuDirectory}`)
+    if (profile.cpu) args.push('--cpu-prof', `--cpu-prof-dir=${cpuDirectory}`, `--cpu-prof-name=${path.basename(cpuDestination)}`)
     if (profile.heap) args.push('--heap-prof', `--heap-prof-dir=${path.dirname(path.resolve(profile.heap))}`, `--heap-prof-name=${path.basename(profile.heap)}`)
     if (profile.trace) args.push('--trace-event-categories=v8,node,node.async_hooks', `--trace-event-file-pattern=${path.resolve(profile.trace)}`)
   }
   args.push(resolveMcpPath())
   const diagnosticFd = diagnosticPath ? fs.openSync(diagnosticPath, 'w') : null
+  let diagnosticClosed = false
+  const closeDiagnostic = () => {
+    if (diagnosticFd === null || diagnosticClosed) return
+    diagnosticClosed = true
+    fs.closeSync(diagnosticFd)
+  }
   const environment = root || diagnosticPath
     ? { ...process.env, ...(root && { CODEGRAPH_ROOT: root }), ...(diagnosticPath && { CODEGRAPH_DEBUG_POOL: '1' }) }
     : process.env
-  const child = spawnChild(process.execPath, args, { cwd: PROJECT, env: environment, stdio: ['pipe', 'pipe', 'pipe'], detached: platform !== 'win32' })
+  let child
+  try { child = spawnChild(process.execPath, args, { cwd: PROJECT, env: environment, stdio: ['pipe', 'pipe', 'pipe'], detached: platform !== 'win32' }) }
+  catch (error) { closeDiagnostic(); throw error }
   const signalChild = (signal) => platform === 'win32' ? child.kill(signal) : killProcess(-child.pid, signal)
   let lifecycleActive = true
   const controllerSignals = ['SIGINT', 'SIGTERM', 'SIGHUP']
@@ -193,13 +186,8 @@ export const startMcp = ({ root, profile, diagnosticLog, spawnChild = spawn, pla
   }
   for (const [signal, handler] of signalHandlers) controller.once(signal, handler)
   controller.once('exit', onControllerExit)
-  let output = ''; let errors = Buffer.alloc(0); let id = 0; let diagnosticClosed = false
+  let output = ''; let errors = Buffer.alloc(0); let id = 0
   const waiting = new Map()
-  const closeDiagnostic = () => {
-    if (diagnosticFd === null || diagnosticClosed) return
-    diagnosticClosed = true
-    fs.closeSync(diagnosticFd)
-  }
   const errorText = () => errors.toString('utf8').trim()
   child.stderr.on('data', (chunk) => {
     const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
@@ -229,36 +217,26 @@ export const startMcp = ({ root, profile, diagnosticLog, spawnChild = spawn, pla
     child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: requestId, method, params })}\n`)
   }), requestTimeoutMs, 'MCP request')
   const timed = async (method, params, label = 'MCP request') => { const started = performance.now(); const message = await withTimeout(request(method, params), requestTimeoutMs, label); return { message, ms: performance.now() - started } }
-  let shutdownArtifacts
-  const retainCpuProfiles = () => {
-    if (!cpuDestination) return undefined
-    if (shutdownArtifacts) return shutdownArtifacts
-    const extension = '.cpuprofile'
-    const stem = cpuDestination.endsWith(extension) ? cpuDestination.slice(0, -extension.length) : cpuDestination
-    const generated = fs.readdirSync(cpuDirectory)
-      .filter((name) => name.startsWith('CPU.') && !existingCpuProfiles.has(name))
-      .sort()
-    const cpu = generated.map((name, index) => {
-      const destination = `${stem}-${index + 1}${extension}`
-      fs.renameSync(path.join(cpuDirectory, name), destination)
-      return destination
-    })
-    shutdownArtifacts = { cpu }
-    return shutdownArtifacts
-  }
+  const profileReceipt = profile ? {
+    main: { ...(profile.cpu && { cpu: cpuDestination }), ...(profile.heap && { heap: path.resolve(profile.heap) }), ...(profile.trace && { trace: path.resolve(profile.trace) }) },
+    workers: [
+      { label: 'semantic', ...deriveWorkerProfile(deriveWorkerProfile(args, 'server').execArgv, 'semantic').artifacts },
+      { label: 'server', ...deriveWorkerProfile(args, 'server').artifacts },
+    ],
+  } : undefined
   const stop = () => new Promise((resolve, reject) => {
     unregisterLifecycle()
     if (child.exitCode !== null || child.signalCode !== null) {
       closeDiagnostic()
-      return child.exitCode === 0 || child.signalCode === 'SIGTERM' ? resolve(retainCpuProfiles()) : reject(new Error(`MCP shutdown failed (${child.exitCode ?? child.signalCode})`))
+      return child.exitCode === 0 || child.signalCode === 'SIGTERM' ? resolve(profileReceipt) : reject(new Error(`MCP shutdown failed (${child.exitCode ?? child.signalCode})`))
     }
-    const timer = setTimeout(() => {
-      try { signalChild('SIGKILL') } catch (error) { retainCpuProfiles(); closeDiagnostic(); reject(error); return }
-      retainCpuProfiles()
+    const shutdownAfter = shutdownTimeoutMs ?? (profile ? 0 : 10_000)
+    const timer = shutdownAfter === 0 ? null : setTimeout(() => {
+      try { signalChild('SIGKILL') } catch (error) { closeDiagnostic(); reject(error); return }
       closeDiagnostic()
       reject(new Error('MCP shutdown timed out'))
-    }, shutdownTimeoutMs)
-    child.once('exit', (code, signal) => { clearTimeout(timer); const artifacts = retainCpuProfiles(); closeDiagnostic(); code === 0 || signal === 'SIGTERM' ? resolve(artifacts) : reject(new Error(`MCP shutdown failed (${code ?? signal}): ${errorText()}`)) })
+    }, shutdownAfter)
+    child.once('exit', (code, signal) => { if (timer) clearTimeout(timer); closeDiagnostic(); code === 0 || signal === 'SIGTERM' ? resolve(profileReceipt) : reject(new Error(`MCP shutdown failed (${code ?? signal}): ${errorText()}`)) })
     child.stdin.end()
     if (platform === 'win32') child.kill('SIGTERM')
     else signalChild('SIGTERM')
@@ -266,15 +244,15 @@ export const startMcp = ({ root, profile, diagnosticLog, spawnChild = spawn, pla
   return { timed, stop }
 }
 
-export const stopAfter = async (mcp, operation) => {
-  let result; let failure
+export const stopAfter = async (mcp, operation, afterStop = (result) => result) => {
+  let result; let stopped; let failure
   try { result = await operation() } catch (error) { failure = error }
-  try { await mcp.stop() } catch (error) {
+  try { stopped = await mcp.stop() } catch (error) {
     if (!failure) throw error
     failure.message += `; MCP shutdown also failed: ${error.message}`
   }
   if (failure) throw failure
-  return result
+  return afterStop(result, stopped)
 }
 
 const toolCall = async (mcp, root, name, args, label = name) => {
@@ -319,9 +297,10 @@ const readUpdate = ({ text, ms }) => {
   return { ms, generation: result.generation, parsedFiles, validatedFiles: result.validatedFiles?.length ?? parsedFiles }
 }
 
-export const assertReceiptsMatch = (expected, actual) => {
-  for (const { key } of WORKLOADS) if (expected[key].sha256 !== actual[key].sha256) throw new Error(`${key} semantic output drifted across update states`)
+export const assertReceiptsMatch = (expected, actual, workloads = WORKLOADS) => {
+  for (const { key } of workloads) if (expected[key].sha256 !== actual[key].sha256) throw new Error(`${key} semantic output drifted across update states`)
 }
+const comparableWorkloads = (workloads) => workloads.filter(({ key }) => key !== 'queryCapped')
 
 export const validateFixtures = (root) => {
   if (!fs.existsSync(root) || !fs.statSync(root).isDirectory()) throw new Error(`repository root is not a directory: ${root}`)
@@ -430,61 +409,87 @@ export function resolvePerformanceSnapshot(root, { refresh = false } = {}) {
 
 export const watcherMetadata = (root, previousGeneration, state) => {
   const cache = path.join(root, '.codegraph')
-  const store = new GraphStore(root)
   const generation = fs.readFileSync(path.join(cache, 'CURRENT'), 'utf8').trim()
   if (generation === previousGeneration) return { generation, status: 'validated' }
   const readManifest = (id) => JSON.parse(fs.readFileSync(path.join(cache, 'generations', `${id}.json`), 'utf8'))
-  const before = readManifest(previousGeneration); const after = readManifest(generation)
-  const changed = state === 'leaf' ? ['src/utils/plotSameSelectedItem.ts'] : ['src/types/index.ts']
-  const importers = new Map()
-  for (const [file, id] of Object.entries(before.partitions)) {
-    const partition = store.readPartition(id)
-    for (const dependency of partition.dependencies ?? []) {
-      const files = importers.get(dependency)
-      if (files) files.push(file); else importers.set(dependency, [file])
-    }
-  }
-  const validated = new Set(changed); const queue = [...changed]
-  while (queue.length) for (const file of importers.get(queue.pop()) ?? []) if (!validated.has(file)) { validated.add(file); queue.push(file) }
-  const parsedFiles = Object.keys(after.sources).filter((file) => before.sources[file] !== after.sources[file])
-  return { generation, status: 'validated', parsedFiles, validatedFiles: [...validated] }
+  const after = readManifest(generation)
+  if (!Array.isArray(after.parsedFiles) || !Array.isArray(after.validatedFiles)) throw new Error('validated generation omitted authoritative parsedFiles or validatedFiles work sets')
+  return { generation, status: 'validated', parsedFiles: after.parsedFiles, validatedFiles: after.validatedFiles }
 }
 
-export const captureLifecycle = async (sourceRoot, { samples = 1, withMirror = withDisposableMirror, start = startMcp, coldBuild = measureColdBuild, watcherUpdate = measureWatcherUpdate, readMetadata = watcherMetadata, progress = (phase) => process.stderr.write(`[${new Date().toISOString()}] ${phase}\n`), profile, diagnosticLog, symbol } = {}) => withMirror(sourceRoot, async (root) => {
-  progress('cold index')
-  const initialIndex = await coldBuild(root)
+const parsedArtifact = (file, kind) => {
+  const text = fs.readFileSync(file, 'utf8')
+  if (kind === 'diagnosticLog') for (const line of text.trim().split('\n')) JSON.parse(line)
+  else JSON.parse(text)
+  return { path: path.resolve(file), parseable: true }
+}
+
+const semanticLifecycleArtifacts = (profile, diagnosticLog, stopped = {}) => {
+  const artifacts = {}
+  const serverProfile = profile ? deriveWorkerProfile(process.execArgv, 'server') : null
+  const workerPaths = serverProfile ? deriveWorkerProfile(serverProfile.execArgv, 'semantic').artifacts : {}
+  if (profile?.cpu) {
+    const mainCpu = stopped.main?.cpu ?? profile.cpu
+    if (!mainCpu) throw new Error('profiled semantic lifecycle omitted the main CPU artifact')
+    artifacts.cpu = parsedArtifact(mainCpu, 'cpu')
+  }
+  if (profile?.heap) artifacts.heap = parsedArtifact(profile.heap, 'heap')
+  if (profile?.trace) artifacts.trace = parsedArtifact(profile.trace, 'trace')
+  if (diagnosticLog) artifacts.diagnosticLog = parsedArtifact(diagnosticLog, 'diagnosticLog')
+  if (profile?.cpu || profile?.heap) {
+    const worker = stopped.workers?.find(({ label }) => label === 'semantic') ?? {}
+    const cpu = worker.cpu ?? workerPaths.cpu
+    const heap = worker.heap ?? workerPaths.heap
+    artifacts.workers = [{ label: 'semantic', ...(profile.cpu && { cpu: parsedArtifact(cpu, 'cpu') }), ...(profile.heap && { heap: parsedArtifact(heap, 'heap') }) }]
+    const server = stopped.workers?.find(({ label }) => label === 'server') ?? serverProfile.artifacts
+    artifacts.workers.push({ label: 'server', ...(profile.cpu && { cpu: parsedArtifact(server.cpu, 'cpu') }), ...(profile.heap && { heap: parsedArtifact(server.heap, 'heap') }) })
+    for (const kind of ['cpu', 'heap']) {
+      if (!profile[kind]) continue
+      const destination = path.resolve(profile[kind])
+      const extension = path.extname(destination)
+      const prefix = `${path.basename(destination, extension)}.worker-server`
+      for (const name of fs.readdirSync(path.dirname(destination)).sort()) {
+        if (!name.startsWith(prefix) || !name.endsWith(extension)) continue
+        const file = path.join(path.dirname(destination), name)
+        if (artifacts.workers.some((worker) => worker[kind]?.path === file)) continue
+        const label = name.slice(path.basename(destination, extension).length + '.worker-'.length, -extension.length)
+        let worker = artifacts.workers.find((entry) => entry.label === label)
+        if (!worker) { worker = { label }; artifacts.workers.push(worker) }
+        worker[kind] = parsedArtifact(file, kind)
+      }
+    }
+  }
+  return artifacts
+}
+
+export const captureLifecycle = async (sourceRoot, { samples = 1, withMirror = withDisposableMirror, start = startMcp, watcherUpdate = measureWatcherUpdate, readMetadata = watcherMetadata, progress = (step) => process.stderr.write(`[${new Date().toISOString()}] ${step}\n`), profile, diagnosticLog, symbol } = {}) => withMirror(sourceRoot, async (root) => {
+  const timeoutMs = profile ? 0 : TIMEOUT_MS
   progress('start MCP')
-  const mcp = start({ root, profile, ...(diagnosticLog && { diagnosticLog }) })
+  const mcp = start({ root, profile, requestTimeoutMs: timeoutMs, ...(diagnosticLog && { diagnosticLog }) })
   return stopAfter(mcp, async () => {
     await mcp.timed('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'codegraph-performance', version: '2' } })
-    const workloads = workloadsFor(symbol)
-    progress(samples === 1 ? 'indexed queries' : `sample 1/${samples}: indexed queries`)
-    let indexed = await runSweep(mcp, root, workloads, symbol, Boolean(diagnosticLog))
+    progress('initial index')
+    const initialIndex = readUpdate(await toolCall(mcp, root, 'codegraph_index', {}, 'initial index'))
     progress('watcher readiness')
     await toolCall(mcp, root, 'codegraph_refresh', {}, 'watcher readiness')
+    const workloads = workloadsFor(symbol)
+    const indexed = await runSweep(mcp, root, workloads, symbol, Boolean(diagnosticLog))
     const captured = []
     let generation = initialIndex.generation
     for (let index = 0; index < samples; index += 1) {
-      if (index) {
-        progress(`sample ${index + 1}/${samples}: indexed queries`)
-        indexed = await runSweep(mcp, root, workloads, symbol, Boolean(diagnosticLog))
-      }
-      progress(samples === 1 ? 'leaf update' : `sample ${index + 1}/${samples}: leaf update`)
-      const leaf = await watcherUpdate({ root, state: 'leaf', previousGeneration: generation, phase: 'leaf incremental update', readMetadata: (target, previous) => readMetadata(target, previous, 'leaf'), afterValidated: async () => { const result = await toolCall(mcp, root, 'codegraph_refs', structuredClone(workloads[0].arguments), 'first complete refs query'); assertWorkloadReceipt(workloads[0], result.text, symbol) } })
-      assertGenerationAdvanced(generation, leaf.generation)
-      const leafSweep = await runSweep(mcp, root, workloads, symbol, Boolean(diagnosticLog)); assertReceiptsMatch(indexed, leafSweep)
-      progress(samples === 1 ? 'cascade update' : `sample ${index + 1}/${samples}: cascade update`)
-      const cascade = await watcherUpdate({ root, state: 'cascade', previousGeneration: leaf.generation, phase: 'cascade incremental update', readMetadata: (target, previous) => readMetadata(target, previous, 'cascade') })
-      assertGenerationAdvanced(leaf.generation, cascade.generation); assertCascadeValidation(cascade.validatedFiles)
-      const cascadeSweep = await runSweep(mcp, root, workloads, symbol, Boolean(diagnosticLog)); assertReceiptsMatch(indexed, cascadeSweep)
-      generation = cascade.generation
-      captured.push({ root, sourceFiles: initialIndex.parsedFiles, sweeps: { indexed, leaf: leafSweep, cascade: cascadeSweep }, updates: { leaf, cascade } })
+      progress(`sample ${index + 1}/${samples}: one-file update`)
+      const update = await watcherUpdate({ root, state: 'update', mutationIndex: index + 1, previousGeneration: generation, label: 'incremental update', timeoutMs, readMetadata: (target, previous) => readMetadata(target, previous, 'update') })
+      assertGenerationAdvanced(generation, update.generation)
+      const updated = await runSweep(mcp, root, workloads, symbol, Boolean(diagnosticLog))
+      assertReceiptsMatch(indexed, updated, comparableWorkloads(workloads))
+      generation = update.generation
+      captured.push({ root, sourceFiles: initialIndex.parsedFiles, sweeps: { indexed, updated }, updates: { update } })
     }
-    progress('full reindex')
-    const fullReindex = readUpdate(await toolCall(mcp, root, 'codegraph_index', {}, 'full reindex'))
     captured[0].updates.initialIndex = initialIndex
-    captured.at(-1).updates.fullReindex = fullReindex
     return captured
+  }, (captured, stopped) => {
+    const artifacts = semanticLifecycleArtifacts(profile, diagnosticLog, stopped)
+    return Object.keys(artifacts).length ? captured.map((sample) => ({ ...sample, artifacts })) : captured
   })
 })
 
@@ -493,9 +498,9 @@ export const captureSample = async (sourceRoot, options = {}) => (await captureL
 export const gitValue = (root, args, fallback) => { const result = spawnSync('git', ['-C', root, ...args], { encoding: 'utf8' }); return result.status === 0 ? result.stdout.trim() || fallback : fallback }
 
 export function assertCompleteReport(report) {
-  for (const { key } of WORKLOADS) for (const state of STATES) if (!report.benchmarks?.[key]?.[state]) throw new Error(`report is missing ${key} ${state}`)
-  for (const update of ['initialIndex', 'leaf', 'cascade', 'fullReindex']) if (!report.updates?.[update]) throw new Error(`report is missing ${update}`)
-  for (const update of ['initialIndex', 'cascade', 'fullReindex']) {
+  for (const { key } of WORKLOADS) for (const state of ['indexed', 'updated']) if (!report.benchmarks?.[key]?.[state]) throw new Error(`report is missing ${key} ${state}`)
+  for (const update of ['initialIndex', 'update']) {
+    if (!report.updates?.[update]) throw new Error(`report is missing ${update}`)
     if (!Number.isFinite(report.updates[update].parsedFiles)) throw new Error(`${update} parsed-file count is missing`)
     if (!Number.isFinite(report.updates[update].validatedFiles)) throw new Error(`${update} validated-file count is missing`)
   }
@@ -513,26 +518,18 @@ export async function captureReport(options, { snapshot = resolvePerformanceSnap
     const frozen = await snapshot(sourceRoot, { refresh: options.refreshSnapshot === true })
     const snapshotRoot = typeof frozen === 'string' ? frozen : frozen.root
     if (typeof frozen !== 'string') validateFixtures(snapshotRoot)
-    const samples = []
-    for (let index = 0; index < options.samples; index += 1) {
-      const lifecycle = await capture(snapshotRoot, { samples: 1, profile: options.profile, diagnosticLog: options.diagnosticLog, symbol: options.symbol })
-      if (!Array.isArray(lifecycle) || lifecycle.length !== 1) throw new Error(`benchmark lifecycle returned ${lifecycle?.length ?? 0} samples; expected 1`)
-      samples.push(lifecycle[0])
-    }
+    const samples = await capture(snapshotRoot, { samples: options.samples, profile: options.profile, diagnosticLog: options.diagnosticLog, symbol: options.symbol })
+    if (!Array.isArray(samples) || samples.length !== options.samples) throw new Error(`benchmark lifecycle returned ${samples?.length ?? 0} samples; expected ${options.samples}`)
+    const selectedWorkloads = workloadsFor(options.symbol)
     const expectedReceipts = samples[0].sweeps.indexed
-    for (const sample of samples) for (const state of STATES) assertReceiptsMatch(expectedReceipts, sample.sweeps[state])
-    const benchmarks = Object.fromEntries(WORKLOADS.map(({ key }) => [key, Object.fromEntries(STATES.map((state) => [state, summarizeSamples(samples.map((sample) => sample.sweeps[state][key].ms))]))]))
-    const updates = {
-      initialIndex: summarizeSamples(samples.map((sample) => sample.updates.initialIndex.ms)),
-      leaf: summarizeSamples(samples.map((sample) => sample.updates.leaf.ms)),
-      cascade: summarizeSamples(samples.map((sample) => sample.updates.cascade.ms)),
-      fullReindex: summarizeSamples(samples.map((sample) => sample.updates.fullReindex.ms)),
-    }
-    for (const key of ['initialIndex', 'leaf', 'cascade', 'fullReindex']) {
-      updates[key].parsedFiles = Math.max(...samples.map((sample) => sample.updates[key].parsedFiles))
-      updates[key].validatedFiles = Math.max(...samples.map((sample) => sample.updates[key].validatedFiles))
-    }
-    return assertCompleteReport({ schemaVersion: 2, provenance: { root: samples[0].root, sourceRoot: frozen.manifest?.sourceRoot ?? sourceRoot, repository: path.basename(sourceRoot), sourceFiles: samples[0].sourceFiles, commit: frozen.manifest?.commit ?? gitValue(sourceRoot, ['rev-parse', 'HEAD'], 'unavailable'), snapshot: { root: snapshotRoot, sha256: frozen.manifest?.sha256 ?? sourceSnapshot(snapshotRoot), createdAt: frozen.manifest?.createdAt ?? 'injected' } }, benchmarks, updates, correctness: { consistent: true, originalRepositoryUnchanged: true, cleanShutdown: true } })
+    for (const sample of samples) assertReceiptsMatch(expectedReceipts, sample.sweeps.updated, comparableWorkloads(selectedWorkloads))
+    const benchmarks = Object.fromEntries(selectedWorkloads.map(({ key }) => [key, {
+      indexed: summarizeSamples([samples[0].sweeps.indexed[key].ms]),
+      updated: summarizeSamples(samples.map((sample) => sample.sweeps.updated[key].ms)),
+    }]))
+    const initialIndex = { ...summarizeSamples([samples[0].updates.initialIndex.ms]), parsedFiles: samples[0].updates.initialIndex.parsedFiles, validatedFiles: samples[0].updates.initialIndex.validatedFiles }
+    const update = { ...summarizeSamples(samples.map((sample) => sample.updates.update.ms)), parsedFiles: Math.max(...samples.map((sample) => sample.updates.update.parsedFiles)), validatedFiles: Math.max(...samples.map((sample) => sample.updates.update.validatedFiles)), parsedFileSet: samples.map((sample) => sample.updates.update.parsedFileSet), validatedFileSet: samples.map((sample) => sample.updates.update.validatedFileSet) }
+    return assertCompleteReport({ schemaVersion: 2, provenance: { root: samples[0].root, sourceRoot: frozen.manifest?.sourceRoot ?? sourceRoot, repository: path.basename(sourceRoot), sourceFiles: samples[0].sourceFiles, commit: frozen.manifest?.commit ?? gitValue(sourceRoot, ['rev-parse', 'HEAD'], 'unavailable'), snapshot: { root: snapshotRoot, sha256: frozen.manifest?.sha256 ?? sourceSnapshot(snapshotRoot), createdAt: frozen.manifest?.createdAt ?? 'injected' } }, ...(samples[0].artifacts && { artifacts: samples[0].artifacts }), benchmarks, updates: { initialIndex, update }, correctness: { consistent: true, originalRepositoryUnchanged: true, cleanShutdown: true } })
   })
 }
 
@@ -541,14 +538,12 @@ const formatPair = ({ p50Ms, p90Ms }) => `${p50Ms.toFixed(2)} / ${p90Ms.toFixed(
 export function renderMarkdown(report) {
   assertCompleteReport(report)
   const rows = [
-    `CodeGraph was tested against the ${report.provenance.sourceFiles.toLocaleString('en-US')}-source-file D&D Community and Marketplace project, covering all query endpoints, initial indexing, leaf updates, cascade updates, and full reindexing.`,
-    '', '## Metrics', '', '| Operation | Indexed | Leaf update | Cascade update |', '| :--- | ---: | ---: | ---: |',
-    ...WORKLOADS.map(({ key, label }) => `| ${label} | ${formatPair(report.benchmarks[key].indexed)} | ${formatPair(report.benchmarks[key].leaf)} | ${formatPair(report.benchmarks[key].cascade)} |`),
+    `CodeGraph was tested against the ${report.provenance.sourceFiles.toLocaleString('en-US')}-source-file D&D Community and Marketplace project in one production MCP lifecycle.`,
+    '', '## Metrics', '', '| Operation | Indexed | Post-update |', '| :--- | ---: | ---: |',
+    ...WORKLOADS.map(({ key, label }) => `| ${label} | ${formatPair(report.benchmarks[key].indexed)} | ${formatPair(report.benchmarks[key].updated)} |`),
     '', '| Update | p50 / p90 | Parsed files | Validated files |', '| :--- | ---: | ---: | ---: |',
-    `| CLI cold index | ${formatPair(report.updates.initialIndex)} | ${report.updates.initialIndex.parsedFiles} | ${report.updates.initialIndex.validatedFiles} |`,
-    `| Leaf incremental update | ${formatPair(report.updates.leaf)} | ${report.updates.leaf.parsedFiles} | ${report.updates.leaf.validatedFiles} |`,
-    `| Cascade incremental update | ${formatPair(report.updates.cascade)} | ${report.updates.cascade.parsedFiles} | ${report.updates.cascade.validatedFiles} |`,
-    `| Full reindex | ${formatPair(report.updates.fullReindex)} | ${report.updates.fullReindex.parsedFiles} | ${report.updates.fullReindex.validatedFiles} |`,
+    `| Initial index | ${formatPair(report.updates.initialIndex)} | ${report.updates.initialIndex.parsedFiles} | ${report.updates.initialIndex.validatedFiles} |`,
+    `| One-file update | ${formatPair(report.updates.update)} | ${report.updates.update.parsedFiles} | ${report.updates.update.validatedFiles} |`,
   ]
   return `${rows.join('\n')}\n`
 }

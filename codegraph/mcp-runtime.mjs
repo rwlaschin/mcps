@@ -104,5 +104,10 @@ export class McpProjectRuntime {
     const resolved = type ?? (!fs.existsSync(file) ? 'unlink' : this.registered.has(relative) ? 'change' : 'add')
     if (resolved === 'unlink' ? (this.registered.has(relative) || this.queue.hasPending(relative)) : policy.acceptWatchPath(file)) this.queue.push({ type: resolved, path: relative })
   }
-  async close() { await this.watcher?.close(); if (this.queue) await this.queue.close(); await this.engine.dispose?.() }
+  async close() {
+    const queueClose = this.queue?.close()
+    const engineClose = this.engine.dispose?.()
+    const cleanup = await Promise.allSettled([Promise.resolve().then(() => this.watcher?.close()), queueClose, engineClose])
+    for (const result of cleanup) if (result.status === 'rejected') throw result.reason
+  }
 }

@@ -238,7 +238,7 @@ filesystem, results, and watcher or path-normalization failures in a
 ## Performance and Product Comparison
 
 <!-- codegraph-performance:start -->
-CodeGraph was tested against the 877-source-file D&D Community and Marketplace project, covering all query endpoints, initial indexing, leaf updates, cascade updates, and full reindexing.
+CodeGraph was tested against the 877-source-file D&D Community and Marketplace project. The broad lifecycle table below is historical pre-fix evidence; its 395-file cascade validation does not describe the current changed-file-only path.
 
 ## Metrics
 
@@ -261,18 +261,19 @@ CodeGraph was tested against the 877-source-file D&D Community and Marketplace p
 | Full reindex | 25927.54 / 43766.40 ms | 877 | 877 |
 <!-- codegraph-performance:end -->
 
+Current real-repository changed-surface receipts are separate cold and warm runs: cold initial index 44,209.01 ms; cold `src/types/index.ts` update 6,038.29 ms with 1 parsed/1 validated; warm update 5,785.94 ms with 1 parsed/1 validated.
+
 ### Updating Performance Metrics
 
-Run the production MCP server against a real, already-indexed repository. The reporter writes both machine-readable JSON
-and the Markdown used above.
+Run the external reporter against a real repository. Named phases require an explicit cold or warm run; do not combine their receipts. Profiling uses the production MCP path and disables the operation timeout so V8 capture can finish naturally. Run profiles with host process access, outside a sandbox.
 
 ```shell
-npm run performance -- --root /absolute/path/to/repository --symbol useSessionEvent --samples 5 --json /absolute/path/to/report.json --markdown /absolute/path/to/report.md --readme README.md
+npm run performance -- --root /absolute/path/to/repository --samples 1 --phase changed-surface --temperature cold --profile --cpu /absolute/path/to/cpu.cpuprofile --heap /absolute/path/to/heap.heapprofile --trace /absolute/path/to/trace.json --diagnostic-log /absolute/path/to/pool.jsonl --json /absolute/path/to/cold.json --markdown /absolute/path/to/cold.md
+
+npm run performance -- --root /absolute/path/to/repository --samples 1 --phase changed-surface --temperature warm --profile --cpu /absolute/path/to/cpu.cpuprofile --heap /absolute/path/to/heap.heapprofile --trace /absolute/path/to/trace.json --diagnostic-log /absolute/path/to/pool.jsonl --json /absolute/path/to/warm.json --markdown /absolute/path/to/warm.md
 ```
 
-Profile artifacts are optional and remain with the trace analyzer. To include existing artifacts,
-pass `--profile` and set `CODEGRAPH_PROFILE_CPU`, `CODEGRAPH_PROFILE_HEAP`,
-`CODEGRAPH_PROFILE_TRACE`, and optionally `CODEGRAPH_PROFILE_GC_SAMPLES`.
+Available named phases are `mmap-query`, `unchanged-surface`, `changed-surface`, and `provisional-delta`. CPU and heap files are per process/worker; trace output is process-wide. Profile artifacts remain with the trace analyzer.
 
 ## License
 

@@ -5,19 +5,22 @@ import { Minimatch } from 'minimatch'
 
 export const MANDATORY_IGNORES = new Set(['node_modules', 'vendor', 'third_party', '.git', '.codegraph', '.codegraph-v2'])
 export const BUILD_IGNORES = new Set(['dist', 'build', 'coverage', '.next', '.nuxt', '.output', '.svelte-kit', '.turbo', '.cache', 'target', 'out'])
-const SOURCE_EXTENSIONS = new Set(['.ts', '.tsx', '.js', '.jsx', '.mts', '.cts', '.mjs', '.cjs'])
-const CONTROL_FILES = ['.codegraphignore', '.gitignore', 'jsconfig.json', 'tsconfig.json']
+const CORE_CONTROL_FILES = ['.codegraphignore', '.gitignore']
 
 export const fileContentHash = (file) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex')
-export const controlFileHashes = (root) => Object.fromEntries(CONTROL_FILES.map((name) => {
+export const controlFileHashes = (root, metadata = {}) => Object.fromEntries([...CORE_CONTROL_FILES, ...(metadata.analyzers?.flatMap((analyzer) => analyzer.controlFiles) ?? metadata.controlFiles ?? [])].map((name) => {
   const file = path.join(root, name)
   return [name, fs.existsSync(file) ? fileContentHash(file) : null]
 }))
 
 const posix = (value) => value.split(path.sep).join('/')
 
-export function createSourcePolicy(root) {
+export function createSourcePolicy(root, metadata = {}) {
   root = path.resolve(root)
+  const extensions = metadata.analyzers?.flatMap((analyzer) => analyzer.extensions) ?? metadata.extensions ?? []
+  const controlFiles = metadata.analyzers?.flatMap((analyzer) => analyzer.controlFiles) ?? metadata.controlFiles ?? []
+  const sourceExtensions = new Set(extensions)
+  const controls = new Set([...CORE_CONTROL_FILES, ...controlFiles])
   const symlinkDirs = new Set()
   const normalize = (file) => posix(path.relative(root, path.resolve(file)))
   const segments = (rel) => rel.split('/')
@@ -26,9 +29,15 @@ export function createSourcePolicy(root) {
   }
   const ignorePatterns = [...readPatterns('.gitignore'), ...readPatterns('.codegraphignore')]
   const config = (() => {
-    const file = ['tsconfig.json', 'jsconfig.json'].map((name) => path.join(root, name)).find(fs.existsSync)
-    if (!file) return {}
-    try { return JSON.parse(fs.readFileSync(file, 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '').replace(/,\s*([}\]])/g, '$1')) } catch { return {} }
+    for (const name of controlFiles) {
+      const file = path.join(root, name)
+      if (!fs.existsSync(file)) continue
+      try {
+        const parsed = JSON.parse(fs.readFileSync(file, 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '').replace(/,\s*([}\]])/g, '$1'))
+        return parsed
+      } catch {}
+    }
+    return {}
   })()
   const compilePattern = (raw) => {
     let pattern = raw.replace(/^\//, '').replace(/\/$/, '/**')
@@ -71,9 +80,9 @@ export function createSourcePolicy(root) {
     }
     return ignored
   }
-  const sourceCandidateRelative = (rel) => configured(rel) && SOURCE_EXTENSIONS.has(path.extname(rel).toLowerCase())
+  const sourceCandidateRelative = (rel) => configured(rel) && sourceExtensions.has(path.extname(rel).toLowerCase())
   const sourceRelative = (rel) => !ignoredRelative(rel) && sourceCandidateRelative(rel)
-  const controlRelative = (rel) => CONTROL_FILES.includes(rel)
+  const controlRelative = (rel) => controls.has(rel)
 
   function scan() {
     const found = []
@@ -87,7 +96,7 @@ export function createSourcePolicy(root) {
         if (ignoredRelative(rel)) continue
         if (entry.isSymbolicLink()) { if (entry.isDirectory() || safeDirectory(absolute)) symlinkDirs.add(rel); continue }
         if (entry.isDirectory()) visit(absolute, rel)
-        else if (entry.isFile() && sourceCandidateRelative(rel)) found.push(rel)
+        else if (entry.isFile() && !controlRelative(rel) && sourceCandidateRelative(rel)) found.push(rel)
       }
     }
     if (fs.existsSync(root)) visit(root)

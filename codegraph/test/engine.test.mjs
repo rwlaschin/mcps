@@ -11,6 +11,7 @@ import { CodeGraphEngine } from '../tool-engine.mjs'
 import { FileLocalResolver } from '../incremental-resolver.mjs'
 import { SemanticCheckerWorker } from '../semantic-checker-worker.mjs'
 import { contentHash, createSemanticProject, parsePartition, prepareSemanticProject } from '../parser.mjs'
+import { openInternalPartition } from '../store.mjs'
 
 class EngineFakeMmapAdapter {
   constructor() { this.files = new Map(); this.maps = []; this.unmaps = 0; this.closes = 0; this.flushes = 0 }
@@ -35,6 +36,8 @@ const trackedEngine = (root, options) => {
         ...fake,
         index: fake.index?.bind(fake) ?? semantic.index.bind(semantic),
         hydrate: fake.hydrate?.bind(fake) ?? semantic.hydrate.bind(semantic),
+        validate: fake.validate?.bind(fake) ?? semantic.validate.bind(semantic),
+        advanceGeneration: fake.advanceGeneration?.bind(fake) ?? semantic.advanceGeneration.bind(semantic),
         referenceOverlay: fake.referenceOverlay?.bind(fake) ?? semantic.referenceOverlay.bind(semantic),
         dispose: async () => { await fake.dispose?.(); await semantic.dispose() },
       }
@@ -49,6 +52,46 @@ test.afterEach(async () => {
   const engines = [...trackedEngines]
   trackedEngines.clear()
   await Promise.all(engines.map((engine) => engine.disposed ? undefined : engine.dispose()))
+})
+
+test('language metadata: initial TypeScript build publishes the descriptor cache key', async () => {
+  const root = fixture()
+  const engine = trackedEngine(root)
+  const built = await engine.build()
+  assert.deepEqual(engine.readGeneration(built.generation).analyzers, { typescript: 'typescript-2' })
+})
+
+test('language metadata: TypeScript control change forced-full publication retains the descriptor cache key', async () => {
+  const root = fixture()
+  const engine = trackedEngine(root)
+  await engine.build()
+  fs.writeFileSync(path.join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { module: 'NodeNext' }, include: ['src'] }))
+  const changed = await engine.incremental([{ type: 'change', path: 'tsconfig.json' }])
+  assert.deepEqual(engine.readGeneration(changed.generation).analyzers, { typescript: 'typescript-2' })
+})
+
+test('language metadata: ordinary TypeScript incremental publication retains the descriptor cache key', async () => {
+  const root = fixture()
+  const engine = trackedEngine(root)
+  await engine.build()
+  fs.writeFileSync(path.join(root, 'src', 'a.ts'), 'export function a(){ return 2 }\n')
+  const changed = await engine.incremental([{ type: 'change', path: 'src/a.ts' }])
+  assert.deepEqual(engine.readGeneration(changed.generation).analyzers, { typescript: 'typescript-2' })
+})
+
+test('equivalence partitioning: incremental publication persists the sorted parsed and validated file receipts from a body edit', async () => {
+  const root = fixture()
+  const engine = trackedEngine(root)
+  await engine.build()
+  fs.writeFileSync(path.join(root, 'src', 'a.ts'), 'export function a(){ return 2 }\n')
+
+  const changed = await engine.incremental([{ type: 'change', path: 'src/a.ts' }])
+  await changed.validation
+
+  assert.deepEqual(
+    { parsedFiles: engine.readGeneration(changed.generation).parsedFiles, validatedFiles: engine.readGeneration(changed.generation).validatedFiles },
+    { parsedFiles: ['src/a.ts'], validatedFiles: ['src/a.ts'] },
+  )
 })
 
 function fixture() {
@@ -217,7 +260,150 @@ test('boundary analysis: a fresh engine hydrates a persisted base and validates 
   )
 })
 
-test('domain analysis: a changed export validates each member of a converging diamond exactly once', async () => {
+test('domain analysis: restart reconcile reads parses and validates only the one changed source', async () => {
+  const root = fixture()
+  fs.writeFileSync(path.join(root, 'src', 'c.ts'), "import { b } from './b'; export function c(){ return b() }\n")
+  const builder = trackedEngine(root)
+  const built = await builder.build()
+  const persisted = builder.readGeneration(built.generation)
+  await builder.dispose()
+  fs.writeFileSync(path.join(root, 'src', 'a.ts'), 'export function a(){ return 2 }\n')
+  const reads = []
+  const restarted = trackedEngine(root, { sourceReaderDeps: { readFile: async (file, encoding) => { reads.push(path.relative(root, file).split(path.sep).join('/')); return fsp.readFile(file, encoding) } } })
+
+  const result = await restarted.reconcile()
+  await result.validation
+
+  assert.deepEqual(
+    {
+      retainedDetectionFiles: Object.keys(persisted.sourceMetadata ?? {}).sort(),
+      reads,
+      parsedFiles: result.parsedFiles,
+      validatedFiles: result.validatedFiles,
+      validationMode: result.validationMode,
+    },
+    {
+      retainedDetectionFiles: ['src/a.ts', 'src/b.ts', 'src/c.ts'],
+      reads: ['src/a.ts'],
+      parsedFiles: ['src/a.ts'],
+      validatedFiles: ['src/a.ts'],
+      validationMode: 'delta',
+    },
+  )
+})
+
+test('boundary and state-transition analysis: restart no-change reconcile creates no worker and the next one-file mutation lazily creates exactly one', async () => {
+  const root = fixture()
+  const builder = trackedEngine(root)
+  const built = await builder.build()
+  const persisted = builder.readGeneration(built.generation)
+  await builder.dispose()
+  const reads = []
+  let semanticWorkers = 0
+  const restarted = trackedEngine(root, {
+    sourceReaderDeps: { readFile: async (file, encoding) => { reads.push(path.relative(root, file).split(path.sep).join('/')); return fsp.readFile(file, encoding) } },
+    validationWorkerFactory: () => { semanticWorkers += 1; return new SemanticCheckerWorker() },
+  })
+
+  const result = await restarted.reconcile()
+  const unchangedState = {
+    retainedDetectionFiles: Object.keys(persisted.sourceMetadata ?? {}).sort(),
+    reads: [...reads],
+    parsedFiles: result.parsedFiles,
+    semanticWorkers,
+  }
+  fs.writeFileSync(path.join(root, 'src', 'b.ts'), "import { a } from './a'; export function b(){ return a()+2 }\n")
+  const changed = await restarted.incremental([{ type: 'change', path: 'src/b.ts' }])
+  const validated = await changed.validation
+
+  assert.deepEqual(
+    {
+      unchangedState,
+      changedState: {
+        reads,
+        parsedFiles: changed.parsedFiles,
+        validatedFiles: validated.validatedFiles,
+        semanticWorkers,
+      },
+    },
+    {
+      unchangedState: {
+        retainedDetectionFiles: ['src/a.ts', 'src/b.ts'],
+        reads: [],
+        parsedFiles: [],
+        semanticWorkers: 0,
+      },
+      changedState: {
+        reads: ['src/b.ts'],
+        parsedFiles: ['src/b.ts'],
+        validatedFiles: ['src/b.ts'],
+        semanticWorkers: 1,
+      },
+    },
+  )
+})
+
+test('boundary and state-transition analysis: restart reconcile reads parses and validates only one added source and patches detection metadata', async () => {
+  const root = fixture()
+  const builder = trackedEngine(root)
+  await builder.build()
+  await builder.dispose()
+  fs.writeFileSync(path.join(root, 'src', 'c.ts'), "import { b } from './b'; export function c(){ return b() }\n")
+  const reads = []
+  const restarted = trackedEngine(root, { sourceReaderDeps: { readFile: async (file, encoding) => { reads.push(path.relative(root, file).split(path.sep).join('/')); return fsp.readFile(file, encoding) } } })
+
+  const result = await restarted.reconcile()
+  await result.validation
+
+  assert.deepEqual(
+    {
+      reads,
+      parsedFiles: result.parsedFiles,
+      validatedFiles: result.validatedFiles,
+      validationMode: result.validationMode,
+      retainedDetectionFiles: Object.keys(restarted.readGeneration().sourceMetadata ?? {}).sort(),
+    },
+    {
+      reads: ['src/c.ts'],
+      parsedFiles: ['src/c.ts'],
+      validatedFiles: ['src/c.ts'],
+      validationMode: 'delta',
+      retainedDetectionFiles: ['src/a.ts', 'src/b.ts', 'src/c.ts'],
+    },
+  )
+})
+
+test('boundary and state-transition analysis: restart reconcile unlinks one source without reading or processing its survivor and patches detection metadata', async () => {
+  const root = fixture()
+  const builder = trackedEngine(root)
+  await builder.build()
+  await builder.dispose()
+  fs.unlinkSync(path.join(root, 'src', 'a.ts'))
+  const reads = []
+  const restarted = trackedEngine(root, { sourceReaderDeps: { readFile: async (file, encoding) => { reads.push(path.relative(root, file).split(path.sep).join('/')); return fsp.readFile(file, encoding) } } })
+
+  const result = await restarted.reconcile()
+  await result.validation
+
+  assert.deepEqual(
+    {
+      reads,
+      parsedFiles: result.parsedFiles,
+      validatedFiles: result.validatedFiles,
+      validationMode: result.validationMode,
+      retainedDetectionFiles: Object.keys(restarted.readGeneration().sourceMetadata ?? {}).sort(),
+    },
+    {
+      reads: [],
+      parsedFiles: [],
+      validatedFiles: ['src/a.ts'],
+      validationMode: 'delta',
+      retainedDetectionFiles: ['src/b.ts'],
+    },
+  )
+})
+
+test('domain analysis: a single changed export validates only that file and never walks its converging dependents', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-engine-diamond-'))
   fs.writeFileSync(path.join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { module: 'ESNext' }, include: ['src'] }))
   fs.mkdirSync(path.join(root, 'src'))
@@ -233,16 +419,14 @@ test('domain analysis: a changed export validates each member of a converging di
   fs.writeFileSync(path.join(root, 'src', 'base.ts'), 'export interface Value { id: string; revision?: number }\n')
 
   const result = await engine.incremental([{ type: 'change', path: 'src/base.ts' }])
-  const clean = trackedEngine(root, { cacheDir: '.clean-diamond-delta' })
-  await clean.build()
-
+  const validation = await result.validation
   assert.deepEqual(
-    { validationMode: result.validationMode, validatedFiles: result.validatedFiles, writes, graph: canon(engine.snapshot()) },
-    { validationMode: 'delta', validatedFiles: ['src/base.ts', 'src/left.ts', 'src/right.ts', 'src/top.ts'], writes: 4, graph: canon(clean.snapshot()) },
+    { validationMode: validation.validationMode, parsedFiles: result.parsedFiles, validatedFiles: validation.validatedFiles, writes },
+    { validationMode: 'delta', parsedFiles: ['src/base.ts'], validatedFiles: ['src/base.ts'], writes: 1 },
   )
 })
 
-test('equivalence partition and domain analysis: an unrelated unresolved stylesheet does not expand a leaf edit beyond its reverse closure', async () => {
+test('equivalence partition and domain analysis: an unrelated unresolved stylesheet does not expand changed-file-only validation', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-engine-unrelated-unresolved-'))
   fs.writeFileSync(path.join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { module: 'ESNext' }, include: ['src'] }))
   fs.mkdirSync(path.join(root, 'src'))
@@ -262,7 +446,7 @@ test('equivalence partition and domain analysis: an unrelated unresolved stylesh
   )
 })
 
-test('boundary value and domain analysis: a changed path matching an unresolved candidate retains full validation', async () => {
+test('boundary value and domain analysis: adding one unresolved candidate validates only the added file', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-engine-matching-unresolved-'))
   fs.writeFileSync(path.join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { module: 'ESNext' }, include: ['src'] }))
   fs.mkdirSync(path.join(root, 'src'))
@@ -272,32 +456,39 @@ test('boundary value and domain analysis: a changed path matching an unresolved 
   fs.writeFileSync(path.join(root, 'src', 'later.ts'), 'export const later = () => 7\n')
 
   const result = await engine.incremental([{ type: 'change', path: 'src/later.ts' }])
-  const clean = trackedEngine(root, { cacheDir: '.clean-matching-unresolved' })
-  await clean.build()
-
+  const validation = await result.validation
   assert.deepEqual(
-    { validationMode: result.validationMode, validatedFiles: result.validatedFiles, graph: canon(engine.snapshot()) },
-    { validationMode: 'full', validatedFiles: ['src/later.ts', 'src/waiting.ts'], graph: canon(clean.snapshot()) },
+    { validationMode: validation.validationMode, parsedFiles: result.parsedFiles, validatedFiles: validation.validatedFiles },
+    { validationMode: 'delta', parsedFiles: ['src/later.ts'], validatedFiles: ['src/later.ts'] },
   )
 })
 
-test('error guessing and domain analysis: the coordinator rejects a delta when an unresolved candidate matches the changed path', async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-engine-unsafe-unresolved-delta-'))
-  fs.writeFileSync(path.join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { module: 'ESNext' }, include: ['src'] }))
-  fs.mkdirSync(path.join(root, 'src'))
-  fs.writeFileSync(path.join(root, 'src', 'waiting.ts'), "import { later } from './later'\nexport const waiting = () => later()\n")
-  let engine
-  engine = trackedEngine(root, { validationWorkerFactory: () => ({ validate: async (payload) => {
-    const complete = fullWorkerResult(engine, payload)
-    return { ...complete, mode: 'delta', partitionReceipts: complete.partitionReceipts.filter(({ file }) => file === 'src/later.ts') }
-  }, dispose: async () => {} }) })
-  const built = await engine.build()
-  const before = manifestBytes(engine)
+test('boundary analysis: unlinking one file parses no source and publishes only its tombstone receipt without dependent validation', async () => {
+  const root = fixture()
+  const closureObservations = []
+  const engine = trackedEngine(root, { validationClosureObserver: (observation) => closureObservations.push(observation) })
+  await engine.build()
+  fs.unlinkSync(path.join(root, 'src', 'a.ts'))
 
-  const refreshed = engine.applyChanges([{ type: 'change', path: 'src/later.ts', source: 'export const later = () => 7\n' }])
-  await assert.rejects(refreshed.validation, /unresolved|candidate|unsafe/i)
+  const result = await engine.incremental([{ type: 'unlink', path: 'src/a.ts' }])
+  await result.validation
 
-  assert.deepEqual({ generation: engine.readGeneration().generation, manifest: manifestBytes(engine) }, { generation: built.generation, manifest: before })
+  assert.deepEqual(
+    {
+      validationMode: result.validationMode,
+      parsedFiles: result.parsedFiles,
+      validatedFiles: result.validatedFiles,
+      partitionPresent: Object.hasOwn(engine.readGeneration().partitions, 'src/a.ts'),
+      closureObservations,
+    },
+    {
+      validationMode: 'delta',
+      parsedFiles: [],
+      validatedFiles: ['src/a.ts'],
+      partitionPresent: false,
+      closureObservations: [{ reverseClosureWalks: 0, importerIndexBuilds: 0, unresolvedIndexBuilds: 0 }],
+    },
+  )
 })
 
 test('equivalence partition: two simultaneous source edits use full validation and publish a complete clean-build-equivalent generation', async () => {
@@ -345,6 +536,48 @@ test('error guessing: a delta for a stale base generation is rejected before CUR
   assert.deepEqual({ generation: engine.readGeneration().generation, manifest: manifestBytes(engine) }, { generation: built.generation, manifest: before })
 })
 
+test('error guessing: an older worker receipt revision rejects instead of returning null or publishing', async () => {
+  const root = fixture()
+  let engine
+  engine = trackedEngine(root, { validationWorkerFactory: () => ({ validate: async (payload) => {
+    const complete = fullWorkerResult(engine, payload)
+    return {
+      ...complete,
+      revision: 0,
+      mode: 'delta',
+      partitionReceipts: complete.partitionReceipts.filter(({ file }) => file === 'src/b.ts'),
+    }
+  }, dispose: async () => {} }) })
+  const built = await engine.build()
+  const before = manifestBytes(engine)
+
+  const changed = engine.applyChanges([{ type: 'change', path: 'src/b.ts', source: "import { a } from './a'; export function b(){ return a()+2 }\n" }])
+
+  await assert.rejects(changed.validation, /revision|receipt|request|mismatch/i)
+  assert.deepEqual({ generation: engine.readGeneration().generation, manifest: manifestBytes(engine) }, { generation: built.generation, manifest: before })
+})
+
+test('error guessing: a newer worker receipt revision rejects instead of returning null or publishing', async () => {
+  const root = fixture()
+  let engine
+  engine = trackedEngine(root, { validationWorkerFactory: () => ({ validate: async (payload) => {
+    const complete = fullWorkerResult(engine, payload)
+    return {
+      ...complete,
+      revision: 2,
+      mode: 'delta',
+      partitionReceipts: complete.partitionReceipts.filter(({ file }) => file === 'src/b.ts'),
+    }
+  }, dispose: async () => {} }) })
+  const built = await engine.build()
+  const before = manifestBytes(engine)
+
+  const changed = engine.applyChanges([{ type: 'change', path: 'src/b.ts', source: "import { a } from './a'; export function b(){ return a()+2 }\n" }])
+
+  await assert.rejects(changed.validation, /revision|receipt|request|mismatch/i)
+  assert.deepEqual({ generation: engine.readGeneration().generation, manifest: manifestBytes(engine) }, { generation: built.generation, manifest: before })
+})
+
 test('error guessing: a delta containing an unknown partition key is rejected before CURRENT changes', async () => {
   const root = fixture()
   const engine = trackedEngine(root, { validationWorkerFactory: () => ({ validate: async (payload) => ({ revision: payload.revision, mode: 'delta', baseGeneration: payload.baseGeneration, sourceBlobs: payload.baseSourceBlobs, partitions: { 'src/ghost.ts': { file: 'src/ghost.ts', sourceHash: 'ghost', symbols: [], edges: [], dependencies: [], unresolved: [] } } }), dispose: async () => {} }) })
@@ -357,7 +590,7 @@ test('error guessing: a delta containing an unknown partition key is rejected be
   assert.deepEqual({ generation: engine.readGeneration().generation, manifest: manifestBytes(engine) }, { generation: built.generation, manifest: before })
 })
 
-test('domain analysis: changing a global script into a module uses full validation and removes its stale cross-script edge', async () => {
+test('domain analysis: changing one global script into a module validates only that changed file', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-engine-script-module-'))
   fs.writeFileSync(path.join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { module: 'ESNext' }, include: ['src'] }))
   fs.mkdirSync(path.join(root, 'src'))
@@ -368,26 +601,11 @@ test('domain analysis: changing a global script into a module uses full validati
   fs.writeFileSync(path.join(root, 'src', 'global.ts'), 'export function shared(){ return 1 }\n')
 
   const result = await engine.incremental([{ type: 'change', path: 'src/global.ts' }])
-  const clean = trackedEngine(root, { cacheDir: '.clean-script-module' })
-  await clean.build()
-
+  const validation = await result.validation
   assert.deepEqual(
-    { validationMode: result.validationMode, validatedFiles: result.validatedFiles, graph: canon(engine.snapshot()) },
-    { validationMode: 'full', validatedFiles: ['src/global.ts', 'src/use.ts'], graph: canon(clean.snapshot()) },
+    { validationMode: validation.validationMode, parsedFiles: result.parsedFiles, validatedFiles: validation.validatedFiles },
+    { validationMode: 'delta', parsedFiles: ['src/global.ts'], validatedFiles: ['src/global.ts'] },
   )
-})
-
-test('domain analysis: a delta omitting a required reverse dependent is rejected before CURRENT changes', async () => {
-  const root = fixture()
-  let engine
-  engine = trackedEngine(root, { validationWorkerFactory: () => ({ validate: async (payload) => { const base = engine.readGeneration(payload.baseGeneration); return { revision: payload.revision, mode: 'delta', baseGeneration: payload.baseGeneration, sourceBlobs: payload.baseSourceBlobs, partitions: { 'src/a.ts': engine.store.readPartition(base.partitions['src/a.ts']) } } }, dispose: async () => {} }) })
-  const built = await engine.build()
-  const before = manifestBytes(engine)
-
-  const refreshed = engine.applyChanges([{ type: 'change', path: 'src/a.ts', source: 'export function a(){ return 1 }\n' }])
-  await assert.rejects(refreshed.validation, /dependent|closure|missing|incomplete/i)
-
-  assert.deepEqual({ generation: engine.readGeneration().generation, manifest: manifestBytes(engine) }, { generation: built.generation, manifest: before })
 })
 
 test('domain analysis: a delta cannot change an unchanged source blob while omitting that file partition', async () => {
@@ -442,6 +660,131 @@ test('domain analysis: explicit base partitions replace a warm worker cache even
   assert.deepEqual({ mode: result.mode, validatedFiles: result.partitionReceipts.map(({ file }) => file).sort() }, { mode: 'delta', validatedFiles: ['src/a.ts'] })
 })
 
+test('error guessing and domain analysis: an unhydrated public-surface delta uses retained partitions without reading dependent source content', async () => {
+  const root = fixture()
+  const engine = trackedEngine(root)
+  const built = await engine.build()
+  const manifest = engine.readGeneration(built.generation)
+  const baseInternalFingerprints = Object.fromEntries(Object.entries(manifest.internalPartitions).map(([file, id]) => [file, openInternalPartition(engine.store.readInternalPartition(id)).compilerFingerprint]))
+  const worker = new SemanticCheckerWorker()
+  fs.unlinkSync(path.join(engine.store.sources, manifest.sources['src/b.ts']))
+
+  const result = await worker.validate({
+    revision: 1,
+    root,
+    cacheDir: '.codegraph',
+    baseGeneration: built.generation,
+    baseSourceBlobs: manifest.sources,
+    basePartitionIds: manifest.partitions,
+    baseInternalFingerprints,
+    partitionDir: engine.store.partitions,
+    sourceDir: engine.store.sources,
+    partitionPool: new SharedArrayBuffer(4096 + 300 * 65536),
+    changes: [{ type: 'change', path: 'src/a.ts', source: 'export function renamed(){ return 2 }\n' }],
+  }, () => {})
+  await worker.dispose()
+
+  assert.deepEqual(
+    { mode: result.mode, validatedFiles: result.partitionReceipts.map(({ file }) => file), tombstones: result.tombstones ?? [], internalRebuiltFiles: result.internalRebuiltFiles },
+    { mode: 'delta', validatedFiles: ['src/a.ts'], tombstones: [], internalRebuiltFiles: ['src/a.ts'] },
+  )
+})
+
+test('error guessing and boundary analysis: an unhydrated unlink uses retained partitions without reading any source content', async () => {
+  const root = fixture()
+  const engine = trackedEngine(root)
+  const built = await engine.build()
+  const manifest = engine.readGeneration(built.generation)
+  const baseInternalFingerprints = Object.fromEntries(Object.entries(manifest.internalPartitions).map(([file, id]) => [file, openInternalPartition(engine.store.readInternalPartition(id)).compilerFingerprint]))
+  const worker = new SemanticCheckerWorker()
+  fs.unlinkSync(path.join(engine.store.sources, manifest.sources['src/a.ts']))
+  fs.unlinkSync(path.join(engine.store.sources, manifest.sources['src/b.ts']))
+
+  const result = await worker.validate({
+    revision: 1,
+    root,
+    cacheDir: '.codegraph',
+    baseGeneration: built.generation,
+    baseSourceBlobs: manifest.sources,
+    basePartitionIds: manifest.partitions,
+    baseInternalFingerprints,
+    partitionDir: engine.store.partitions,
+    sourceDir: engine.store.sources,
+    partitionPool: new SharedArrayBuffer(4096 + 300 * 65536),
+    changes: [{ type: 'unlink', path: 'src/a.ts' }],
+  }, () => {})
+  await worker.dispose()
+
+  assert.deepEqual(
+    { mode: result.mode, validatedFiles: result.partitionReceipts.map(({ file }) => file), tombstones: result.tombstones, internalRebuiltFiles: result.internalRebuiltFiles },
+    { mode: 'delta', validatedFiles: [], tombstones: ['src/a.ts'], internalRebuiltFiles: [] },
+  )
+})
+
+test('domain and state-transition analysis: one unhydrated worker processes sequential change change unlink requests only at each requested path', async () => {
+  const root = fixture()
+  fs.writeFileSync(path.join(root, 'src', 'c.ts'), "import { b } from './b'; export function c(){ return b() }\n")
+  const engine = trackedEngine(root)
+  const built = await engine.build()
+  const manifest = engine.readGeneration(built.generation)
+  const baseInternalFingerprints = Object.fromEntries(Object.entries(manifest.internalPartitions).map(([file, id]) => [file, openInternalPartition(engine.store.readInternalPartition(id)).compilerFingerprint]))
+  const worker = new SemanticCheckerWorker()
+  for (const sourceId of new Set(Object.values(manifest.sources))) fs.unlinkSync(path.join(engine.store.sources, sourceId))
+  const partitionPool = () => new SharedArrayBuffer(4096 + 300 * 65536)
+
+  const first = await worker.validate({
+    revision: 1,
+    root,
+    cacheDir: '.codegraph',
+    baseGeneration: built.generation,
+    baseSourceBlobs: manifest.sources,
+    basePartitionIds: manifest.partitions,
+    baseInternalFingerprints,
+    partitionDir: engine.store.partitions,
+    sourceDir: engine.store.sources,
+    partitionPool: partitionPool(),
+    changes: [{ type: 'change', path: 'src/a.ts', source: 'export function a(){ return 2 }\n' }],
+  }, () => {})
+  const second = await worker.validate({
+    revision: 2,
+    root,
+    cacheDir: '.codegraph',
+    baseGeneration: built.generation,
+    baseSourceBlobs: first.sourceBlobs,
+    partitionDir: engine.store.partitions,
+    sourceDir: engine.store.sources,
+    partitionPool: partitionPool(),
+    changes: [{ type: 'change', path: 'src/b.ts', source: "import { a } from './a'; export function b(){ return a()+2 }\n" }],
+  }, () => {})
+  const third = await worker.validate({
+    revision: 3,
+    root,
+    cacheDir: '.codegraph',
+    baseGeneration: built.generation,
+    baseSourceBlobs: second.sourceBlobs,
+    partitionDir: engine.store.partitions,
+    sourceDir: engine.store.sources,
+    partitionPool: partitionPool(),
+    changes: [{ type: 'unlink', path: 'src/c.ts' }],
+  }, () => {})
+  await worker.dispose()
+
+  assert.deepEqual(
+    [first, second, third].map((result) => ({
+      mode: result.mode,
+      validatedFiles: result.partitionReceipts.map(({ file }) => file),
+      tombstones: result.tombstones ?? [],
+      internalBuildCount: result.internalBuildCount,
+      internalRebuiltFiles: result.internalRebuiltFiles,
+    })),
+    [
+      { mode: 'delta', validatedFiles: ['src/a.ts'], tombstones: [], internalBuildCount: 1, internalRebuiltFiles: ['src/a.ts'] },
+      { mode: 'delta', validatedFiles: ['src/b.ts'], tombstones: [], internalBuildCount: 1, internalRebuiltFiles: ['src/b.ts'] },
+      { mode: 'delta', validatedFiles: [], tombstones: ['src/c.ts'], internalBuildCount: 0, internalRebuiltFiles: [] },
+    ],
+  )
+})
+
 test('domain analysis: a delta cannot replace an unchanged dependent blob and partition together', async () => {
   const root = fixture()
   let engine
@@ -455,17 +798,61 @@ test('domain analysis: a delta cannot replace an unchanged dependent blob and pa
   assert.deepEqual({ generation: engine.readGeneration().generation, manifest: manifestBytes(engine) }, { generation: built.generation, manifest: before })
 })
 
-test('domain analysis: delta partitions must equal the exact reverse closure without extra known files', async () => {
+test('domain analysis: consecutive single-file public-surface deltas never walk or build dependent closure indexes', async () => {
   const root = fixture()
+  const closureObservations = []
   let engine
-  engine = trackedEngine(root, { validationWorkerFactory: () => ({ validate: async (payload) => ({ ...fullWorkerResult(engine, payload), mode: 'delta' }), dispose: async () => {} }) })
-  const built = await engine.build()
-  const before = manifestBytes(engine)
+  engine = trackedEngine(root, {
+    validationClosureObserver: (observation) => closureObservations.push(observation),
+    validationWorkerFactory: () => ({ validate: async (payload) => {
+      const complete = fullWorkerResult(engine, payload)
+      return {
+        ...complete,
+        mode: 'delta',
+        partitionReceipts: complete.partitionReceipts.filter(({ file }) => file === 'src/a.ts'),
+      }
+    }, dispose: async () => {} }),
+  })
+  await engine.build()
 
-  const refreshed = engine.applyChanges([{ type: 'change', path: 'src/b.ts', source: "import { a } from './a'; export function b(){ return a()+2 }\n" }])
-  await assert.rejects(refreshed.validation, /closure|extra|unexpected|validated/i)
+  const first = engine.applyChanges([{ type: 'change', path: 'src/a.ts', source: 'export function a(){ return 2 }\nexport const firstSurface = 1\n' }])
+  const firstValidation = await first.validation
+  const firstGraph = engine.snapshot()
 
-  assert.deepEqual({ generation: engine.readGeneration().generation, manifest: manifestBytes(engine) }, { generation: built.generation, manifest: before })
+  const second = engine.applyChanges([{ type: 'change', path: 'src/a.ts', source: "export function a(){ return 3 }\nexport const secondSurface = 'changed'\n" }])
+  const secondValidation = await second.validation
+  const secondGraph = engine.snapshot()
+
+  assert.deepEqual({
+    closureObservations,
+    firstValidatedFiles: firstValidation.validatedFiles,
+    firstReferences: firstGraph.edges.map(({ from, to, line, call }) => ({
+      fromFile: firstGraph.symbols.find(({ id }) => id === from)?.file,
+      fromName: firstGraph.symbols.find(({ id }) => id === from)?.name,
+      toFile: firstGraph.symbols.find(({ id }) => id === to)?.file,
+      toName: firstGraph.symbols.find(({ id }) => id === to)?.name,
+      line,
+      call,
+    })),
+    secondValidatedFiles: secondValidation.validatedFiles,
+    secondReferences: secondGraph.edges.map(({ from, to, line, call }) => ({
+      fromFile: secondGraph.symbols.find(({ id }) => id === from)?.file,
+      fromName: secondGraph.symbols.find(({ id }) => id === from)?.name,
+      toFile: secondGraph.symbols.find(({ id }) => id === to)?.file,
+      toName: secondGraph.symbols.find(({ id }) => id === to)?.name,
+      line,
+      call,
+    })),
+  }, {
+    closureObservations: [
+      { reverseClosureWalks: 0, importerIndexBuilds: 0, unresolvedIndexBuilds: 0 },
+      { reverseClosureWalks: 0, importerIndexBuilds: 0, unresolvedIndexBuilds: 0 },
+    ],
+    firstValidatedFiles: ['src/a.ts'],
+    firstReferences: [{ fromFile: 'src/b.ts', fromName: 'b', toFile: 'src/a.ts', toName: 'a', line: 1, call: true }],
+    secondValidatedFiles: ['src/a.ts'],
+    secondReferences: [{ fromFile: 'src/b.ts', fromName: 'b', toFile: 'src/a.ts', toName: 'a', line: 1, call: true }],
+  })
 })
 
 test('incremental edit/add/delete/rename is equivalent to clean full build and reuses partitions', async () => {
@@ -539,7 +926,7 @@ test('domain analysis: consecutive incremental edits publish successive provisio
   assert.notEqual(secondGeneration, firstGeneration)
 })
 
-test('domain analysis: adding a previously unresolved import returns the provisional changed file and validates to a clean-build-equivalent reverse closure', async () => {
+test('domain analysis: adding a previously unresolved import validates only the added file and matches a clean build', async () => {
   const root = fixture()
   fs.writeFileSync(path.join(root, 'src', 'waiting.ts'), "import { later } from './later'; export function waiting(){ return later() }\n")
   const engine = trackedEngine(root)
@@ -1026,7 +1413,7 @@ test('stream query is cancellable and bounded', async () => {
   assert.equal(rows.length, 1)
 })
 
-test('export surface changes return the provisional changed file and validate reverse dependency removal', async () => {
+test('export surface changes keep the old validated graph before background validation and publish dependency removal afterward', async () => {
   const root = fixture(); const parsed = []
   const engine = trackedEngine(root, { instrument: (event) => parsed.push(event.file) })
   await engine.build(); parsed.length = 0
@@ -1034,6 +1421,8 @@ test('export surface changes return the provisional changed file and validate re
   const result = await engine.incremental([{ type: 'change', path: 'src/a.ts' }])
   assert.deepEqual(result.parsedFiles, ['src/a.ts'])
   assert.deepEqual(parsed, [])
+  assert.equal(engine.snapshot().edges.length, 1)
+  await result.validation
   assert.equal(engine.snapshot().edges.length, 0)
 })
 
@@ -1261,25 +1650,34 @@ test('error guessing: reconcile upgrades a legacy current manifest without contr
   )
 })
 
-test('equivalence partition: a v3 build persists an exact source snapshot and only call-complete base edges', async () => {
+test('equivalence partition: a v3 build persists complete base edges and its first graph query starts no overlay work', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-lazy-base-'))
   fs.writeFileSync(path.join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { module: 'ESNext' }, include: ['src'] }))
   fs.mkdirSync(path.join(root, 'src'))
   fs.writeFileSync(path.join(root, 'src', 'value.ts'), 'export const value = 41\n')
   fs.writeFileSync(path.join(root, 'src', 'consumer.ts'), "import { value } from './value'\nexport function read(){ return value }\nexport function call(){ return read() }\n")
-  const engine = trackedEngine(root)
+  const checker = new SemanticCheckerWorker()
+  let overlayRequests = 0
+  const engine = trackedEngine(root, { validationWorkerFactory: () => ({
+    index: (payload, onProgress) => checker.index(payload, onProgress),
+    hydrate: (payload) => checker.hydrate(payload),
+    validate: (payload, onProgress) => checker.validate(payload, onProgress),
+    referenceOverlay: (payload) => { overlayRequests += 1; return checker.referenceOverlay(payload) },
+    dispose: () => checker.dispose(),
+  }) })
 
   const result = await engine.build()
   const manifest = engine.readGeneration(result.generation)
   const consumer = engine.store.readPartition(manifest.partitions['src/consumer.ts'])
+  const rows = await engine.queryBatch({ type: 'graph' })
 
   assert.deepEqual(
-    { version: manifest.version, edgeCoverage: manifest.edgeCoverage, sourceFiles: Object.keys(manifest.sources).sort(), consumerSource: engine.store.readSource(manifest.sources['src/consumer.ts']), edgeKinds: consumer.edges.map((edge) => edge.call) },
-    { version: 3, edgeCoverage: 'calls', sourceFiles: ['src/consumer.ts', 'src/value.ts'], consumerSource: "import { value } from './value'\nexport function read(){ return value }\nexport function call(){ return read() }\n", edgeKinds: [true] },
+    { version: manifest.version, edgeCoverage: manifest.edgeCoverage, sourceFiles: Object.keys(manifest.sources).sort(), consumerSource: engine.store.readSource(manifest.sources['src/consumer.ts']), partitionEdgeKinds: consumer.edges.map((edge) => edge.call), queryEdgeKinds: rows[0].edges.map((edge) => edge.call), overlayRequests },
+    { version: 3, edgeCoverage: 'complete', sourceFiles: ['src/consumer.ts', 'src/value.ts'], consumerSource: "import { value } from './value'\nexport function read(){ return value }\nexport function call(){ return read() }\n", partitionEdgeKinds: [false, true], queryEdgeKinds: [false, true], overlayRequests: 0 },
   )
 })
 
-test('domain analysis: build incremental and unchanged reconcile report call-complete public coverage', async () => {
+test('domain analysis: build incremental and unchanged reconcile report complete public coverage', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-result-coverage-'))
   fs.writeFileSync(path.join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { module: 'ESNext' }, include: ['src'] }))
   fs.mkdirSync(path.join(root, 'src'))
@@ -1293,17 +1691,25 @@ test('domain analysis: build incremental and unchanged reconcile report call-com
 
   assert.deepEqual(
     { build: built.edgeCoverage, incremental: incremented.edgeCoverage, unchangedReconcile: reconciled.edgeCoverage },
-    { build: 'calls', incremental: 'calls', unchangedReconcile: 'calls' },
+    { build: 'complete', incremental: 'complete', unchangedReconcile: 'complete' },
   )
 })
 
-test('domain analysis: refs enrich the requested generation from its source blobs after disk and CURRENT advance', async () => {
+test('domain analysis: pinned complete refs stay queryable after CURRENT advances without source-dependent overlay work', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-lazy-pinned-'))
   fs.writeFileSync(path.join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { module: 'ESNext' }, include: ['src'] }))
   fs.mkdirSync(path.join(root, 'src'))
   fs.writeFileSync(path.join(root, 'src', 'value.ts'), 'export const value = 41\n')
   fs.writeFileSync(path.join(root, 'src', 'consumer.ts'), "import { value } from './value'\nexport function read(){ return value }\n")
-  const engine = trackedEngine(root)
+  const checker = new SemanticCheckerWorker()
+  let overlayRequests = 0
+  const engine = trackedEngine(root, { validationWorkerFactory: () => ({
+    index: (payload, onProgress) => checker.index(payload, onProgress),
+    hydrate: (payload) => checker.hydrate(payload),
+    validate: (payload, onProgress) => checker.validate(payload, onProgress),
+    referenceOverlay: (payload) => { overlayRequests += 1; return checker.referenceOverlay(payload) },
+    dispose: () => checker.dispose(),
+  }) })
   const old = await engine.build()
   fs.writeFileSync(path.join(root, 'src', 'consumer.ts'), "export function read(){ return 0 }\n")
   await engine.incremental([{ type: 'change', path: 'src/consumer.ts' }])
@@ -1312,10 +1718,10 @@ test('domain analysis: refs enrich the requested generation from its source blob
   for await (const row of engine.query({ type: 'refs', name: 'value', generation: old.generation })) rows.push(row)
   const overlay = engine.store.readOverlay(old.generation)
 
-  assert.deepEqual({ rows: rows.map(({ call, line }) => ({ call, line })), coverage: overlay.edgeCoverage, generation: overlay.generation }, { rows: [{ call: false, line: 2 }], coverage: 'complete', generation: old.generation })
+  assert.deepEqual({ rows: rows.map(({ call, line }) => ({ call, line })), overlay, overlayRequests }, { rows: [{ call: false, line: 2 }], overlay: null, overlayRequests: 0 })
 })
 
-test('domain analysis: a post-cascade refs query asks the warm worker for exactly the stale files without rereading sources on the main thread', async () => {
+test('domain analysis: a target-only change keeps complete importer references without overlay refresh or source rereads', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-warm-overlay-cascade-'))
   fs.writeFileSync(path.join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { module: 'ESNext' }, include: ['src'] }))
   fs.mkdirSync(path.join(root, 'src'))
@@ -1323,27 +1729,16 @@ test('domain analysis: a post-cascade refs query asks the warm worker for exactl
   fs.writeFileSync(path.join(root, 'src', 'left.ts'), "import type { Value } from './value'\nexport const left = (value: Value) => value.id\n")
   fs.writeFileSync(path.join(root, 'src', 'right.ts'), "import type { Value } from './value'\nexport const right = (value: Value) => value.id\n")
   fs.writeFileSync(path.join(root, 'src', 'unrelated.ts'), 'export const unrelated = 1\n')
-  let engine
-  let workerReadSource
+  const checker = new SemanticCheckerWorker()
   const overlayRequests = []
-  const worker = {
-    validate: async (payload) => fullWorkerResult(engine, payload),
-    referenceOverlay: async (payload) => {
-      overlayRequests.push(payload)
-      const sources = new Map(Object.entries(payload.sourceBlobs).map(([file, id]) => [file, workerReadSource(id)]))
-      const context = prepareSemanticProject(createSemanticProject(root, sources), root)
-      const known = new Set(sources.keys())
-      return {
-        generation: payload.generation,
-        files: Object.fromEntries(payload.staleFiles.map((file) => [file, { edges: parsePartition(file, sources.get(file), known, context).edges.filter((edge) => !edge.call) }])),
-      }
-    },
-    dispose: async () => {},
-  }
-  engine = trackedEngine(root, { validationWorkerFactory: () => worker })
-  workerReadSource = engine.store.readSource.bind(engine.store)
+  const engine = trackedEngine(root, { validationWorkerFactory: () => ({
+    index: (payload, onProgress) => checker.index(payload, onProgress),
+    hydrate: (payload) => checker.hydrate(payload),
+    validate: (payload, onProgress) => checker.validate(payload, onProgress),
+    referenceOverlay: (payload) => { overlayRequests.push(payload.staleFiles); return checker.referenceOverlay(payload) },
+    dispose: () => checker.dispose(),
+  }) })
   await engine.build()
-  for await (const ignored of engine.query({ type: 'refs', name: 'Value' })) void ignored
   fs.writeFileSync(path.join(root, 'src', 'value.ts'), 'export interface Value { id: string; revision?: number }\n')
   const changed = await engine.incremental([{ type: 'change', path: 'src/value.ts' }])
   await changed.validation
@@ -1356,44 +1751,42 @@ test('domain analysis: a post-cascade refs query asks the warm worker for exactl
   assert.deepEqual(
     {
       requestCount: overlayRequests.length,
-      requestedGeneration: overlayRequests[0]?.generation,
-      currentGeneration: engine.readGeneration().generation,
-      staleFiles: overlayRequests[0]?.staleFiles,
+      staleFiles: overlayRequests,
       sourceReads,
+      parsedFiles: changed.parsedFiles,
+      validatedFiles: changed.validatedFiles,
       rows: rows.map(({ fromSymbol, toSymbol, line, call }) => ({ fromFile: fromSymbol.file, toFile: toSymbol.file, line, call })).toSorted((left, right) => left.fromFile.localeCompare(right.fromFile)),
     },
     {
-      requestCount: 1,
-      requestedGeneration: engine.readGeneration().generation,
-      currentGeneration: engine.readGeneration().generation,
-      staleFiles: ['src/left.ts', 'src/right.ts', 'src/value.ts'],
+      requestCount: 0,
+      staleFiles: [],
       sourceReads: 0,
+      parsedFiles: ['src/value.ts'],
+      validatedFiles: ['src/value.ts'],
       rows: [
         { fromFile: 'src/left.ts', toFile: 'src/value.ts', line: 2, call: false },
-        { fromFile: 'src/left.ts', toFile: 'src/value.ts', line: 2, call: false },
-        { fromFile: 'src/right.ts', toFile: 'src/value.ts', line: 2, call: false },
         { fromFile: 'src/right.ts', toFile: 'src/value.ts', line: 2, call: false },
       ],
     },
   )
 })
 
-test('domain analysis: one retained leaf update preserves unchanged overlay content and exact clean-build call and reference results', async () => {
+test('domain analysis: one retained leaf update preserves exact clean-build call and reference results without overlay work', async () => {
   const root = fixture()
   fs.writeFileSync(path.join(root, 'src', 'unchanged.ts'), 'export const unchanged = 1\n')
   const checker = new SemanticCheckerWorker()
   let overlayRequests = 0
+  const reads = []
   const retained = trackedEngine(root, { cacheDir: '.parse-once-retained', validationWorkerFactory: () => ({
     index: (payload, onProgress) => checker.index(payload, onProgress),
     hydrate: (payload) => checker.hydrate(payload),
     validate: (payload, onProgress) => checker.validate(payload, onProgress),
     referenceOverlay: (payload) => { overlayRequests += 1; return checker.referenceOverlay(payload) },
     dispose: () => checker.dispose(),
-  }) })
+  }), sourceReaderDeps: { readFile: async (file, encoding) => { reads.push(path.relative(root, file).split(path.sep).join('/')); return fsp.readFile(file, encoding) } } })
   const clean = trackedEngine(root, { cacheDir: '.parse-once-clean' })
   await retained.build()
-  await retained.queryBatch({ type: 'refs', name: 'a', resolved: true })
-  const unchangedOverlayKey = retained.store.readOverlay(retained.readGeneration().generation).files['src/unchanged.ts'].key
+  reads.length = 0
   overlayRequests = 0
   fs.writeFileSync(path.join(root, 'src', 'b.ts'), "import { a } from './a'; export function b(){ const selected = a; return a()+selected() }\n")
 
@@ -1408,19 +1801,21 @@ test('domain analysis: one retained leaf update preserves unchanged overlay cont
   assert.deepEqual(
     {
       overlayRequests,
+      reads,
       parsedFiles: changed.parsedFiles,
       validatedFiles: changed.validatedFiles,
-      unchangedOverlayWasReused: retained.store.readOverlay(retained.readGeneration().generation).files['src/unchanged.ts'].key === unchangedOverlayKey,
+      overlay: retained.store.readOverlay(retained.readGeneration().generation),
       retainedCalls: retainedCalls.map(({ fromSymbol, toSymbol, line, call }) => ({ from: `${fromSymbol.file}:${fromSymbol.name}`, to: `${toSymbol.file}:${toSymbol.name}`, line, call })),
       cleanCalls: cleanCalls.map(({ fromSymbol, toSymbol, line, call }) => ({ from: `${fromSymbol.file}:${fromSymbol.name}`, to: `${toSymbol.file}:${toSymbol.name}`, line, call })),
       retainedRefs: retainedRefs.map(({ fromSymbol, toSymbol, line, call }) => ({ from: `${fromSymbol.file}:${fromSymbol.name}`, to: `${toSymbol.file}:${toSymbol.name}`, line, call })),
       cleanRefs: cleanRefs.map(({ fromSymbol, toSymbol, line, call }) => ({ from: `${fromSymbol.file}:${fromSymbol.name}`, to: `${toSymbol.file}:${toSymbol.name}`, line, call })),
     },
     {
-      overlayRequests: 1,
+      overlayRequests: 0,
+      reads: ['src/b.ts'],
       parsedFiles: ['src/b.ts'],
       validatedFiles: ['src/b.ts'],
-      unchangedOverlayWasReused: true,
+      overlay: null,
       retainedCalls: [{ from: 'src/b.ts:b', to: 'src/a.ts:a', line: 1, call: true }, { from: 'src/b.ts:b', to: 'src/b.ts:selected', line: 1, call: true }],
       cleanCalls: [{ from: 'src/b.ts:b', to: 'src/a.ts:a', line: 1, call: true }, { from: 'src/b.ts:b', to: 'src/b.ts:selected', line: 1, call: true }],
       retainedRefs: [{ from: 'src/b.ts:b', to: 'src/a.ts:a', line: 1, call: true }, { from: 'src/b.ts:selected', to: 'src/a.ts:a', line: 1, call: false }],
@@ -1429,7 +1824,7 @@ test('domain analysis: one retained leaf update preserves unchanged overlay cont
   )
 })
 
-test('all-pairs parity: warm and fallback overlays resolve aliases re-exports namespace and default imports identically after a cascade', async () => {
+test('all-pairs parity: complete generations resolve aliases re-exports namespace and default imports identically after a single-file change', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-overlay-parity-'))
   fs.writeFileSync(path.join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { module: 'ESNext', target: 'ES2022' }, include: ['src'] }))
   fs.mkdirSync(path.join(root, 'src'))
@@ -1438,25 +1833,25 @@ test('all-pairs parity: warm and fallback overlays resolve aliases re-exports na
   fs.writeFileSync(path.join(root, 'src', 'consumer.ts'), "import primary, { alias, renamed, space } from './barrel'\nimport * as namespace from './barrel'\nexport const consume = () => primary() + alias() + renamed + space.named + namespace.renamed\n")
   fs.writeFileSync(path.join(root, 'src', 'donor.ts'), 'export const donor = 3\nexport const readDonor = () => donor\n')
   const warmChecker = new SemanticCheckerWorker()
-  let warmStaleFiles
+  let overlayRequests = 0
   const warm = trackedEngine(root, { cacheDir: '.warm-parity', validationWorkerFactory: () => ({
+    index: (payload, onProgress) => warmChecker.index(payload, onProgress),
+    hydrate: (payload) => warmChecker.hydrate(payload),
     validate: (payload, onProgress) => warmChecker.validate(payload, onProgress),
-    referenceOverlay: (payload) => { warmStaleFiles = payload.staleFiles; return warmChecker.referenceOverlay(payload) },
+    referenceOverlay: (payload) => { overlayRequests += 1; return warmChecker.referenceOverlay(payload) },
     dispose: () => warmChecker.dispose(),
   }) })
   const checker = new SemanticCheckerWorker()
-  const fallbackWorker = {
+  const comparisonWorker = {
+    index: (payload, onProgress) => checker.index(payload, onProgress),
+    hydrate: (payload) => checker.hydrate(payload),
     validate: (payload, onProgress) => checker.validate(payload, onProgress),
-    referenceOverlay: async () => { throw new Error('force existing fallback') },
+    referenceOverlay: async () => { throw new Error('complete generation requested an overlay') },
     dispose: () => checker.dispose(),
   }
-  const fallback = trackedEngine(root, { cacheDir: '.fallback-parity', validationWorkerFactory: () => fallbackWorker })
+  const fallback = trackedEngine(root, { cacheDir: '.fallback-parity', validationWorkerFactory: () => comparisonWorker })
   await warm.build()
   await fallback.build()
-  await warm.queryBatch({ type: 'refs', resolved: true })
-  await fallback.queryBatch({ type: 'refs', resolved: true })
-  const warmDonor = warm.store.readOverlay(warm.readGeneration().generation).files['src/donor.ts']
-  const fallbackDonor = fallback.store.readOverlay(fallback.readGeneration().generation).files['src/donor.ts']
   fs.writeFileSync(path.join(root, 'src', 'base.ts'), 'export default function primary(){ return 10 }\nexport const named = 20\nexport const added = 30\n')
   const warmChange = await warm.incremental([{ type: 'change', path: 'src/base.ts' }])
   const fallbackChange = await fallback.incremental([{ type: 'change', path: 'src/base.ts' }])
@@ -1465,67 +1860,21 @@ test('all-pairs parity: warm and fallback overlays resolve aliases re-exports na
 
   const warmRows = await warm.queryBatch({ type: 'refs', resolved: true })
   const fallbackRows = await fallback.queryBatch({ type: 'refs', resolved: true })
-  const warmOverlay = warm.store.readOverlay(warm.readGeneration().generation)
-  const fallbackOverlay = fallback.store.readOverlay(fallback.readGeneration().generation)
   const normalizeRows = (rows) => rows.map(({ fromSymbol, toSymbol, line, call }) => ({ from: `${fromSymbol.file}:${fromSymbol.name}`, to: `${toSymbol.file}:${toSymbol.name}`, line, call })).toSorted((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)))
-  const normalizeFiles = (files) => Object.fromEntries(Object.entries(files).toSorted(([left], [right]) => left.localeCompare(right)).map(([file, fragment]) => [file, { key: fragment.key, edges: fragment.edges.toSorted((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right))) }]))
 
   assert.deepEqual(
     {
       rows: normalizeRows(warmRows),
-      files: normalizeFiles(warmOverlay.files),
-      warmStaleFiles,
-      donorFragmentWasReused: warmOverlay.files['src/donor.ts']?.key === warmDonor.key && fallbackOverlay.files['src/donor.ts']?.key === fallbackDonor.key,
+      overlayRequests,
+      warmOverlay: warm.store.readOverlay(warm.readGeneration().generation),
+      comparisonOverlay: fallback.store.readOverlay(fallback.readGeneration().generation),
     },
     {
       rows: normalizeRows(fallbackRows),
-      files: normalizeFiles(fallbackOverlay.files),
-      warmStaleFiles: ['src/barrel.ts', 'src/base.ts', 'src/consumer.ts'],
-      donorFragmentWasReused: true,
+      overlayRequests: 0,
+      warmOverlay: null,
+      comparisonOverlay: null,
     },
-  )
-})
-
-test('equivalence partition: malformed warm-worker overlay fragments reject the refs query and persist no partial overlay', async () => {
-  const root = fixture()
-  const checker = new SemanticCheckerWorker()
-  const worker = {
-    validate: (payload, onProgress) => checker.validate(payload, onProgress),
-    referenceOverlay: async (payload) => ({ generation: payload.generation, files: { 'src/b.ts': { edges: [{ from: 'missing-from', to: 'missing-to', line: 2, call: true }] } } }),
-    dispose: () => checker.dispose(),
-  }
-  const engine = trackedEngine(root, { validationWorkerFactory: () => worker })
-  await engine.build()
-  fs.writeFileSync(path.join(root, 'src', 'b.ts'), "import { a } from './a'; export function b(){ return a()+2 }\n")
-  const changed = await engine.incremental([{ type: 'change', path: 'src/b.ts' }])
-  await changed.validation
-
-  await assert.rejects(engine.queryBatch({ type: 'refs', name: 'a' }), /overlay|fragment|edge|endpoint|call/i)
-
-  assert.equal(engine.store.readOverlay(engine.readGeneration().generation), null)
-})
-
-test('error guessing: a rejected warm-worker overlay request falls back to the existing builder and returns exact references', async () => {
-  const root = fixture()
-  let engine
-  let overlayRequests = 0
-  const checker = new SemanticCheckerWorker()
-  const worker = {
-    validate: (payload, onProgress) => checker.validate(payload, onProgress),
-    referenceOverlay: async () => { overlayRequests += 1; throw new Error('overlay worker exited') },
-    dispose: () => checker.dispose(),
-  }
-  engine = trackedEngine(root, { validationWorkerFactory: () => worker })
-  await engine.build()
-  fs.writeFileSync(path.join(root, 'src', 'b.ts'), "import { a } from './a'; export function b(){ return a()+2 }\n")
-  const changed = await engine.incremental([{ type: 'change', path: 'src/b.ts' }])
-  await changed.validation
-
-  const rows = await engine.queryBatch({ type: 'refs', name: 'a', resolved: true })
-
-  assert.deepEqual(
-    { overlayRequests, rows: rows.map(({ fromSymbol, toSymbol, line, call }) => ({ fromFile: fromSymbol.file, toFile: toSymbol.file, line, call })), overlayCoverage: engine.store.readOverlay(engine.readGeneration().generation)?.edgeCoverage },
-    { overlayRequests: 1, rows: [{ fromFile: 'src/b.ts', toFile: 'src/a.ts', line: 1, call: true }], overlayCoverage: 'complete' },
   )
 })
 
@@ -1549,7 +1898,7 @@ test('domain boundary: a historical refs query bypasses the warm worker and uses
   assert.deepEqual({ overlayRequests, rows: rows.map(({ fromSymbol, toSymbol, line, call }) => ({ fromFile: fromSymbol.file, toFile: toSymbol.file, line, call })) }, { overlayRequests: 0, rows: [{ fromFile: 'src/b.ts', toFile: 'src/a.ts', line: 1, call: true }] })
 })
 
-test('error guessing: concurrent cold refs coalesce into one overlay build and both receive the complete result', async () => {
+test('error guessing: concurrent cold refs read the complete generation without building an overlay', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-lazy-coalesce-'))
   fs.writeFileSync(path.join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { module: 'ESNext' }, include: ['src'] }))
   fs.mkdirSync(path.join(root, 'src'))
@@ -1564,10 +1913,10 @@ test('error guessing: concurrent cold refs coalesce into one overlay build and b
     (async () => { const rows = []; for await (const row of engine.query({ type: 'refs', name: 'value' })) rows.push(row); return rows })(),
   ])
 
-  assert.deepEqual({ overlayBuilds, left: left.map((edge) => edge.call), right: right.map((edge) => edge.call) }, { overlayBuilds: 1, left: [false], right: [false] })
+  assert.deepEqual({ overlayBuilds, left: left.map((edge) => edge.call), right: right.map((edge) => edge.call) }, { overlayBuilds: 0, left: [false], right: [false] })
 })
 
-test('error guessing: a cancelled cold refs query publishes no partial overlay and a retry returns every reference', async () => {
+test('error guessing: a cancelled cold refs query leaves complete storage unchanged and a retry returns every reference', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-lazy-cancel-'))
   fs.writeFileSync(path.join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { module: 'ESNext' }, include: ['src'] }))
   fs.mkdirSync(path.join(root, 'src'))
@@ -1587,7 +1936,7 @@ test('error guessing: a cancelled cold refs query publishes no partial overlay a
   assert.deepEqual({ cancelled, afterCancellation, retried: retried.map(({ call, line }) => ({ call, line })) }, { cancelled: [], afterCancellation: null, retried: [{ call: false, line: 2 }, { call: false, line: 3 }] })
 })
 
-test('error guessing: overlay source failure rejects refs and leaves no readable partial cache', async () => {
+test('error guessing: complete refs do not reread unavailable source blobs', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-lazy-failure-'))
   fs.writeFileSync(path.join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { module: 'ESNext' }, include: ['src'] }))
   fs.mkdirSync(path.join(root, 'src'))
@@ -1597,13 +1946,13 @@ test('error guessing: overlay source failure rejects refs and leaves no readable
   const result = await engine.build()
   engine.store.readSource = () => { throw new Error('source blob unavailable') }
 
-  let message
-  try { for await (const ignored of engine.query({ type: 'refs', name: 'value' })) void ignored } catch (error) { message = error.message }
+  const rows = []
+  for await (const row of engine.query({ type: 'refs', name: 'value' })) rows.push(row)
 
-  assert.deepEqual({ message, overlay: engine.store.readOverlay(result.generation) }, { message: 'source blob unavailable', overlay: null })
+  assert.deepEqual({ rows: rows.map(({ call, line }) => ({ call, line })), overlay: engine.store.readOverlay(result.generation) }, { rows: [{ call: false, line: 2 }], overlay: null })
 })
 
-test('combinatorial all-pairs: eager deps uses call coverage without creating a complete overlay', async () => {
+test('combinatorial all-pairs: complete deps returns call edges without creating an overlay', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-lazy-deps-'))
   fs.writeFileSync(path.join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { module: 'ESNext' }, include: ['src'] }))
   fs.mkdirSync(path.join(root, 'src'))
@@ -1618,7 +1967,7 @@ test('combinatorial all-pairs: eager deps uses call coverage without creating a 
   assert.deepEqual({ rows: rows.map(({ call, line }) => ({ call, line })), overlay: engine.store.readOverlay(result.generation) }, { rows: [{ call: true, line: 3 }], overlay: null })
 })
 
-test('domain analysis: the default graph query forces complete coverage and atomically caches it', async () => {
+test('domain analysis: the default graph query reads complete generation coverage without an overlay', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-lazy-default-graph-'))
   fs.writeFileSync(path.join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { module: 'ESNext' }, include: ['src'] }))
   fs.mkdirSync(path.join(root, 'src'))
@@ -1630,7 +1979,118 @@ test('domain analysis: the default graph query forces complete coverage and atom
   const rows = []
   for await (const row of engine.query({ type: 'graph' })) rows.push(row)
 
-  assert.deepEqual({ coverage: rows[0].edgeCoverage, edgeKinds: rows[0].edges.map((edge) => edge.call), overlayCoverage: engine.store.readOverlay(result.generation).edgeCoverage }, { coverage: 'complete', edgeKinds: [false], overlayCoverage: 'complete' })
+  assert.deepEqual({ coverage: rows[0].edgeCoverage, edgeKinds: rows[0].edges.map((edge) => edge.call), overlay: engine.store.readOverlay(result.generation) }, { coverage: 'complete', edgeKinds: [false], overlay: null })
+})
+
+test('domain and state-transition analysis: deleting and re-adding one exported target retains its cached importer partition and repairs its dangling call', async () => {
+  const root = fixture()
+  const checker = new SemanticCheckerWorker()
+  const overlayRequests = []
+  const engine = trackedEngine(root, { validationWorkerFactory: () => ({
+    index: (payload, onProgress) => checker.index(payload, onProgress),
+    hydrate: (payload) => checker.hydrate(payload),
+    validate: (payload, onProgress) => checker.validate(payload, onProgress),
+    referenceOverlay: (payload) => { overlayRequests.push(payload.staleFiles); return checker.referenceOverlay(payload) },
+    dispose: () => checker.dispose(),
+  }) })
+  const built = await engine.build()
+  const beforeRows = []
+  for await (const row of engine.query({ type: 'graph' })) beforeRows.push(row)
+  const beforeManifest = engine.readGeneration(built.generation)
+  const missingTargetId = beforeRows[0].symbols.find(({ file, name }) => file === 'src/a.ts' && name === 'a').id
+  const importerPartitionId = beforeManifest.partitions['src/b.ts']
+  overlayRequests.length = 0
+  fs.unlinkSync(path.join(root, 'src', 'a.ts'))
+
+  const result = await engine.reconcile()
+  await result.validation
+  const afterRows = []
+  for await (const row of engine.query({ type: 'graph' })) afterRows.push(row)
+  const afterManifest = engine.readGeneration()
+  const deleteState = {
+    parsedFiles: result.parsedFiles,
+    validatedFiles: result.validatedFiles,
+    importerPartitionReused: afterManifest.partitions['src/b.ts'] === importerPartitionId,
+    overlay: engine.store.readOverlay(afterManifest.generation),
+    overlayRequests: [...overlayRequests],
+    resolvedEdges: afterRows[0].edges,
+    unresolvedEdges: afterRows[0].unresolvedEdges,
+  }
+  overlayRequests.length = 0
+  fs.writeFileSync(path.join(root, 'src', 'a.ts'), 'export function a(){ return 1 }\n')
+  const repaired = await engine.reconcile()
+  await repaired.validation
+  const repairedRows = []
+  for await (const row of engine.query({ type: 'graph' })) repairedRows.push(row)
+  const repairedManifest = engine.readGeneration()
+
+  assert.deepEqual(
+    {
+      deleteState,
+      repairState: {
+        parsedFiles: repaired.parsedFiles,
+        validatedFiles: repaired.validatedFiles,
+        importerPartitionReused: repairedManifest.partitions['src/b.ts'] === importerPartitionId,
+        overlay: engine.store.readOverlay(repairedManifest.generation),
+        overlayRequests,
+        resolvedTargets: repairedRows[0].edges.map(({ to }) => to),
+        unresolvedEdges: repairedRows[0].unresolvedEdges,
+      },
+    },
+    {
+      deleteState: {
+        parsedFiles: [],
+        validatedFiles: ['src/a.ts'],
+        importerPartitionReused: true,
+        overlay: null,
+        overlayRequests: [],
+        resolvedEdges: [],
+        unresolvedEdges: [{
+          from: beforeRows[0].symbols.find(({ file, name }) => file === 'src/b.ts' && name === 'b').id,
+          to: missingTargetId,
+          line: 1,
+          reason: 'dangling-symbol-target',
+        }],
+      },
+      repairState: {
+        parsedFiles: ['src/a.ts'],
+        validatedFiles: ['src/a.ts'],
+        importerPartitionReused: true,
+        overlay: null,
+        overlayRequests: [],
+        resolvedTargets: [missingTargetId],
+        unresolvedEdges: [],
+      },
+    },
+  )
+})
+
+test('persistence boundary: a reopened cached complete graph retains user-visible dangling edges', async () => {
+  const root = fixture()
+  const writer = trackedEngine(root)
+  await writer.build()
+  const baselineRows = []
+  for await (const row of writer.query({ type: 'graph' })) baselineRows.push(row)
+  const missingTargetId = baselineRows[0].symbols.find(({ file, name }) => file === 'src/a.ts' && name === 'a').id
+  const importerId = baselineRows[0].symbols.find(({ file, name }) => file === 'src/b.ts' && name === 'b').id
+  fs.unlinkSync(path.join(root, 'src', 'a.ts'))
+  const deleted = await writer.reconcile()
+  await deleted.validation
+  const publishedRows = []
+  for await (const row of writer.query({ type: 'graph' })) publishedRows.push(row)
+  await writer.dispose()
+  const reopened = trackedEngine(root)
+
+  const reopenedRows = []
+  for await (const row of reopened.query({ type: 'graph' })) reopenedRows.push(row)
+
+  assert.deepEqual(
+    { published: publishedRows[0].unresolvedEdges, reopened: reopenedRows[0].unresolvedEdges },
+    {
+      published: [{ from: importerId, to: missingTargetId, line: 1, reason: 'dangling-symbol-target' }],
+      reopened: [{ from: importerId, to: missingTargetId, line: 1, reason: 'dangling-symbol-target' }],
+    },
+  )
 })
 
 test('equivalence partition: a legacy v2 generation remains readable as fully covered without source blobs', async () => {
@@ -1888,6 +2348,7 @@ test('domain analysis: warmed resolved rows stay pinned to one generation and pe
   await engine.queryBatch({ type: 'deps', name: 'b', resolved: true, generation: old.generation, limit: 200 })
   fs.writeFileSync(path.join(root, 'src', 'b.ts'), "import { a } from './a'; export function changed(){ return a() }\n")
   const advanced = await engine.incremental([{ type: 'change', path: 'src/b.ts' }])
+  const validated = await advanced.validation
   const reads = { generation: 0, partition: 0, overlay: 0, graph: 0 }
   engine.store.readGeneration = () => { reads.generation += 1; throw new Error('resolved query read generation storage') }
   engine.store.readPartition = () => { reads.partition += 1; throw new Error('resolved query read partition storage') }
@@ -1896,7 +2357,7 @@ test('domain analysis: warmed resolved rows stay pinned to one generation and pe
 
   const rows = await engine.queryBatch({ type: 'deps', name: 'b', resolved: true, generation: old.generation, limit: 200 })
 
-  assert.deepEqual({ currentAdvanced: advanced.generation !== old.generation, reads, rows }, {
+  assert.deepEqual({ currentAdvanced: validated.generation !== old.generation, reads, rows }, {
     currentAdvanced: true,
     reads: { generation: 0, partition: 0, overlay: 0, graph: 0 },
     rows: [{
@@ -2009,6 +2470,7 @@ test('mapped-cache regression: a comment-only delta reuses the complete query pa
   fs.writeFileSync(path.join(root, 'src', 'b.ts'), "import { a } from './a'; export function b(){ return a() } // comment only\n")
 
   const changed = await engine.incremental([{ type: 'change', path: 'src/b.ts' }])
+  await changed.validation
   const flushesAfterPublication = adapter.flushes
   const after = await engine.queryBatch({ type: 'refs', name: 'a', resolved: true, generation: changed.generation })
 
@@ -2546,6 +3008,184 @@ test('shared delta transport: a gated one-file validation streams an engine-owne
   })
 })
 
+test('hotpath contract: a hydrated one-file change sends and publishes only its sparse semantic delta', async () => {
+  const root = fixture()
+  const checker = new SemanticCheckerWorker()
+  const changedSource = "import { a } from './a'; export function b(){ return a()+1 }\n"
+  const changedHash = contentHash(changedSource)
+  const expectedDigest = contentHash(`src/b.ts\0${changedSource}`)
+  const workCounters = {
+    sourceMembershipCopied: 0,
+    basePartitionsOpened: 0,
+    changedPartitionsWritten: 1,
+    dependentSourcesRead: 0,
+    repositoryRecordsMaterialized: 0,
+    repositorySizedContainersAllocated: 0,
+  }
+  let request
+  let workerReceipt
+  const engine = trackedEngine(root, { cacheDir: '.sparse-semantic-delta', validationWorkerFactory: () => ({
+    index: (payload, onProgress) => checker.index(payload, onProgress),
+    hydrate: (payload) => checker.hydrate(payload),
+    validate: async (payload, onProgress) => {
+      request = payload
+      const result = await checker.validate(payload, onProgress)
+      workerReceipt = {
+        revision: result.revision,
+        mode: result.mode,
+        baseGeneration: result.baseGeneration,
+        sourceBlobs: { 'src/b.ts': result.sourceBlobs['src/b.ts'] },
+        partitionReceipts: result.partitionReceipts,
+        tombstones: result.tombstones ?? [],
+        edgePatches: result.edgePatches ?? [],
+        workCounters: result.workCounters,
+      }
+      return workerReceipt
+    },
+    advanceGeneration: (...args) => checker.advanceGeneration(...args),
+    referenceOverlay: (payload) => checker.referenceOverlay(payload),
+    dispose: () => checker.dispose(),
+  }) })
+  const built = await engine.build()
+
+  const submitted = engine.applyChanges([{ type: 'change', path: 'src/b.ts', source: changedSource }])
+  const published = await submitted.validation
+  const { partitionPool, partitionPoolDebugId, ...requestFields } = request
+
+  assert.deepEqual({
+    request: requestFields,
+    requestUsesSharedPartitionPool: partitionPool instanceof SharedArrayBuffer,
+    requestDebugIdType: partitionPoolDebugId === undefined ? 'absent' : typeof partitionPoolDebugId,
+    workerReceipt: {
+      revision: workerReceipt.revision,
+      mode: workerReceipt.mode,
+      baseGeneration: workerReceipt.baseGeneration,
+      sourceBlobs: workerReceipt.sourceBlobs,
+      partitionFiles: workerReceipt.partitionReceipts.map(({ file }) => file),
+      tombstones: workerReceipt.tombstones,
+      edgePatches: workerReceipt.edgePatches,
+      workCounters: workerReceipt.workCounters,
+    },
+    published: {
+      parsedFiles: published.parsedFiles,
+      validatedFiles: published.validatedFiles,
+      workCounters: published.workCounters,
+    },
+  }, {
+    request: {
+      revision: 1,
+      root,
+      cacheDir: '.sparse-semantic-delta',
+      baseGeneration: built.generation,
+      changes: [{ type: 'change', path: 'src/b.ts', source: changedSource, expectedDigest }],
+      sourceDir: path.join(root, '.sparse-semantic-delta', 'sources'),
+    },
+    requestUsesSharedPartitionPool: true,
+    requestDebugIdType: 'absent',
+    workerReceipt: {
+      revision: 1,
+      mode: 'delta',
+      baseGeneration: built.generation,
+      sourceBlobs: { 'src/b.ts': changedHash },
+      partitionFiles: ['src/b.ts'],
+      tombstones: [],
+      edgePatches: [],
+      workCounters,
+    },
+    published: {
+      parsedFiles: ['src/b.ts'],
+      validatedFiles: ['src/b.ts'],
+      workCounters,
+    },
+  })
+})
+
+test('error guessing: two sequential hydrated one-file changes advance the worker generation without widening either sparse request', async () => {
+  const root = fixture()
+  const checker = new SemanticCheckerWorker()
+  const firstSource = "import { a } from './a'; export function b(){ return a()+1 }\n"
+  const secondSource = "import { a } from './a'; export function b(){ return a()+2 }\n"
+  const requests = []
+  const engine = trackedEngine(root, { cacheDir: '.sequential-sparse-semantic-delta', validationWorkerFactory: () => ({
+    index: (payload, onProgress) => checker.index(payload, onProgress),
+    hydrate: (payload) => checker.hydrate(payload),
+    validate: (payload, onProgress) => { requests.push(payload); return checker.validate(payload, onProgress) },
+    advanceGeneration: (...args) => checker.advanceGeneration(...args),
+    referenceOverlay: (payload) => checker.referenceOverlay(payload),
+    dispose: () => checker.dispose(),
+  }) })
+  const built = await engine.build()
+
+  const firstSubmitted = engine.applyChanges([{ type: 'change', path: 'src/b.ts', source: firstSource }])
+  const firstPublished = await firstSubmitted.validation
+  const secondSubmitted = engine.applyChanges([{ type: 'change', path: 'src/b.ts', source: secondSource }])
+  const secondPublished = await secondSubmitted.validation
+  const { partitionPool: firstPool, partitionPoolDebugId: firstDebugId, ...firstRequest } = requests[0]
+  const { partitionPool: secondPool, partitionPoolDebugId: secondDebugId, ...secondRequest } = requests[1]
+
+  assert.deepEqual({
+    firstRequest,
+    secondRequest,
+    pools: [firstPool instanceof SharedArrayBuffer, secondPool instanceof SharedArrayBuffer],
+    debugIds: [firstDebugId === undefined, secondDebugId === undefined],
+    published: [
+      { parsedFiles: firstPublished.parsedFiles, validatedFiles: firstPublished.validatedFiles, workCounters: firstPublished.workCounters },
+      { parsedFiles: secondPublished.parsedFiles, validatedFiles: secondPublished.validatedFiles, workCounters: secondPublished.workCounters },
+    ],
+  }, {
+    firstRequest: {
+      revision: 1,
+      root,
+      cacheDir: '.sequential-sparse-semantic-delta',
+      baseGeneration: built.generation,
+      changes: [{ type: 'change', path: 'src/b.ts', source: firstSource, expectedDigest: 'ff4af09b9988388eca704b188fa6fb52f3936d565c9eb509434f50afbc7b7683' }],
+      sourceDir: path.join(root, '.sequential-sparse-semantic-delta', 'sources'),
+    },
+    secondRequest: {
+      revision: 2,
+      root,
+      cacheDir: '.sequential-sparse-semantic-delta',
+      baseGeneration: firstPublished.generation,
+      changes: [{ type: 'change', path: 'src/b.ts', source: secondSource, expectedDigest: '53596b5ee4a853889fde217c6198b2960e9b37e5ccf93f5e47e30ad6f0c4df4a' }],
+      sourceDir: path.join(root, '.sequential-sparse-semantic-delta', 'sources'),
+    },
+    pools: [true, true],
+    debugIds: [true, true],
+    published: [
+      { parsedFiles: ['src/b.ts'], validatedFiles: ['src/b.ts'], workCounters: { sourceMembershipCopied: 0, basePartitionsOpened: 0, changedPartitionsWritten: 1, dependentSourcesRead: 0, repositoryRecordsMaterialized: 0, repositorySizedContainersAllocated: 0 } },
+      { parsedFiles: ['src/b.ts'], validatedFiles: ['src/b.ts'], workCounters: { sourceMembershipCopied: 0, basePartitionsOpened: 0, changedPartitionsWritten: 1, dependentSourcesRead: 0, repositoryRecordsMaterialized: 0, repositorySizedContainersAllocated: 0 } },
+    ],
+  })
+})
+
+test('compatibility: publishing a version-3 generation writes only its manifest advances CURRENT and remains readable', async () => {
+  const root = fixture()
+  const engine = trackedEngine(root, { cacheDir: '.generation-v3-publication' })
+  const built = await engine.build()
+  const complete = engine.readGeneration(built.generation)
+
+  const published = engine.store.publish({ ...complete, version: 3 })
+  const manifestPath = path.join(engine.store.generations, `${published.generation}.json`)
+  const summaryPath = path.join(engine.store.generations, `${published.generation}.summary`)
+  const read = engine.store.readGeneration()
+
+  assert.deepEqual({
+    manifestExists: fs.existsSync(manifestPath),
+    manifestGeneration: JSON.parse(fs.readFileSync(manifestPath, 'utf8')).generation,
+    summaryExists: fs.existsSync(summaryPath),
+    currentFile: fs.readFileSync(path.join(root, '.generation-v3-publication', 'CURRENT'), 'utf8'),
+    currentRead: read.generation,
+    currentVersion: read.version,
+  }, {
+    manifestExists: true,
+    manifestGeneration: published.generation,
+    summaryExists: false,
+    currentFile: published.generation,
+    currentRead: published.generation,
+    currentVersion: 3,
+  })
+})
+
 test('shared delta boundary: an oversized validation uses one variable journal record and matches clean partition internal and query output', async () => {
   const root = fixture()
   const checker = new SemanticCheckerWorker()
@@ -2903,7 +3543,7 @@ test('worker ownership atomicity: a prepared index is invisible until publicatio
   const built = await engine.build()
   const rows = await engine.queryBatch({ type: 'refs', name: 'a', resolved: true, generation: built.generation })
 
-  assert.deepEqual({ queryWhilePrepared, currentAfterFailure, indexRequests, overlayRequests, rows: rows.map(({ fromSymbol, toSymbol, line, call }) => ({ fromFile: fromSymbol.file, toFile: toSymbol.file, line, call })), retainedWorkspace: engine.workspace !== null }, { queryWhilePrepared: 'unavailable', currentAfterFailure: false, indexRequests: 2, overlayRequests: 1, rows: [{ fromFile: 'src/b.ts', toFile: 'src/a.ts', line: 1, call: true }], retainedWorkspace: false })
+  assert.deepEqual({ queryWhilePrepared, currentAfterFailure, indexRequests, overlayRequests, rows: rows.map(({ fromSymbol, toSymbol, line, call }) => ({ fromFile: fromSymbol.file, toFile: toSymbol.file, line, call })), mainThreadWorkspaceAbsent: engine.workspace === undefined }, { queryWhilePrepared: 'unavailable', currentAfterFailure: false, indexRequests: 2, overlayRequests: 0, rows: [{ fromFile: 'src/b.ts', toFile: 'src/a.ts', line: 1, call: true }], mainThreadWorkspaceAbsent: true })
 })
 
 test('worker ownership recovery: failed persisted hydration preserves CURRENT and read queries then retries hydration without a main workspace', async () => {
@@ -2963,18 +3603,26 @@ test('internal reuse contract: a no-change reconcile preserves each content-addr
   assert.deepEqual(after, before)
 })
 
-test('dependency-only cascade reuses unchanged internal partitions and builds only the changed source CFG', async () => {
+test('changed-only validation reuses every dependent internal partition and builds only the changed source CFG', async () => {
   const root = fixture()
   fs.writeFileSync(path.join(root, 'src', 'c.ts'), "import { b } from './b'; export function c(){ return b() }\n")
   fs.writeFileSync(path.join(root, 'src', 'd.ts'), "import { c } from './c'; export function d(){ return c() }\n")
   fs.writeFileSync(path.join(root, 'src', 'e.ts'), "import { d } from './d'; export function e(){ return d() }\n")
-  const engine = trackedEngine(root, {  })
+  const checker = new SemanticCheckerWorker()
+  const engine = trackedEngine(root, { validationWorkerFactory: () => ({
+    index: (payload, onProgress) => checker.index(payload, onProgress),
+    hydrate: (payload) => checker.hydrate(payload),
+    validate: (payload, onProgress) => checker.validate(payload, onProgress),
+    referenceOverlay: (payload) => checker.referenceOverlay(payload),
+    dispose: () => checker.dispose(),
+  }) })
   const built = await engine.build()
-  const before = engine.readGeneration(built.generation).internalPartitions
+  const before = engine.readGeneration(built.generation)
 
   fs.writeFileSync(path.join(root, 'src', 'a.ts'), "export function a(){ const value = 2; return value }\n")
   const result = await engine.reconcile()
-  const after = engine.readGeneration(result.generation).internalPartitions
+  const clean = trackedEngine(root, { cacheDir: '.clean-unchanged-export-surface' })
+  await clean.build()
 
   assert.deepEqual(
     {
@@ -2983,22 +3631,52 @@ test('dependency-only cascade reuses unchanged internal partitions and builds on
       internalBuildCount: result.internalBuildCount,
       internalRebuiltFiles: result.internalRebuiltFiles,
       internalReusedFiles: result.internalReusedFiles,
-      changedIdWasReplaced: after['src/a.ts'] !== before['src/a.ts'],
-      literalUnchangedIds: ['src/b.ts', 'src/c.ts', 'src/d.ts', 'src/e.ts'].map((file) => [file, after[file], before[file]]),
+      dependentInternalPartitionsRetained: ['src/b.ts', 'src/c.ts', 'src/d.ts', 'src/e.ts'].map((file) => engine.readGeneration().internalPartitions[file] === before.internalPartitions[file]),
+      graph: canon(engine.snapshot()),
     },
     {
       validationMode: 'delta',
-      validatedFiles: ['src/a.ts', 'src/b.ts', 'src/c.ts', 'src/d.ts', 'src/e.ts'],
+      validatedFiles: ['src/a.ts'],
       internalBuildCount: 1,
       internalRebuiltFiles: ['src/a.ts'],
-      internalReusedFiles: ['src/b.ts', 'src/c.ts', 'src/d.ts', 'src/e.ts'],
-      changedIdWasReplaced: true,
-      literalUnchangedIds: ['src/b.ts', 'src/c.ts', 'src/d.ts', 'src/e.ts'].map((file) => [file, before[file], before[file]]),
+      internalReusedFiles: [],
+      dependentInternalPartitionsRetained: [true, true, true, true],
+      graph: canon(clean.snapshot()),
     },
   )
 })
 
-test('dependency-only validation rebuilds an unchanged source when its semantic fingerprint changes', async () => {
+test('domain analysis: a body edit changing an inferred exported return type validates only the changed file', async () => {
+  const root = fixture()
+  fs.writeFileSync(path.join(root, 'src', 'c.ts'), "import { b } from './b'; export function c(){ return b() }\n")
+  const checker = new SemanticCheckerWorker()
+  const engine = trackedEngine(root, { validationWorkerFactory: () => ({
+    index: (payload, onProgress) => checker.index(payload, onProgress),
+    hydrate: (payload) => checker.hydrate(payload),
+    validate: (payload, onProgress) => checker.validate(payload, onProgress),
+    referenceOverlay: (payload) => checker.referenceOverlay(payload),
+    dispose: () => checker.dispose(),
+  }) })
+  const built = await engine.build()
+  const before = engine.readGeneration(built.generation)
+  fs.writeFileSync(path.join(root, 'src', 'a.ts'), "export function a(){ return 'one' }\n")
+
+  const result = await engine.reconcile()
+  await result.validation
+
+  assert.deepEqual(
+    {
+      validatedFiles: result.validatedFiles,
+      retainedDependentPartitions: ['src/b.ts', 'src/c.ts'].map((file) => engine.readGeneration().partitions[file] === before.partitions[file]),
+    },
+    {
+      validatedFiles: ['src/a.ts'],
+      retainedDependentPartitions: [true, true],
+    },
+  )
+})
+
+test('removing an exported symbol rebuilds only its owner and retains the importer as a dangling edge', async () => {
   const root = fixture()
   const checker = new SemanticCheckerWorker()
   let traversalSummary = null
@@ -3014,14 +3692,15 @@ test('dependency-only validation rebuilds an unchanged source when its semantic 
     dispose: () => checker.dispose(),
   }) })
   const built = await engine.build()
-  const before = engine.readGeneration(built.generation).internalPartitions
+  const beforeManifest = engine.readGeneration(built.generation)
+  const before = beforeManifest.internalPartitions
+  const missingTargetId = engine.snapshot().symbols.find(({ file, name }) => file === 'src/a.ts' && name === 'a').id
+  const importerId = engine.snapshot().symbols.find(({ file, name }) => file === 'src/b.ts' && name === 'b').id
 
   fs.writeFileSync(path.join(root, 'src', 'a.ts'), 'export function renamed(){ return 1 }\n')
   const result = await engine.reconcile()
+  await result.validation
   const after = engine.readGeneration(result.generation).internalPartitions
-  const clean = trackedEngine(root, { cacheDir: '.clean-semantic-fingerprint' })
-  const cleanBuild = await clean.build()
-  const cleanManifest = clean.readGeneration(cleanBuild.generation)
   const rows = await engine.queryBatch({ type: 'refs', name: 'renamed', resolved: true, generation: result.generation })
 
   assert.deepEqual(
@@ -3031,18 +3710,23 @@ test('dependency-only validation rebuilds an unchanged source when its semantic 
       internalRebuiltFiles: result.internalRebuiltFiles,
       changedIds: ['src/a.ts', 'src/b.ts'].map((file) => after[file] !== before[file]),
       traversalSummary,
-      internalIdsMatchClean: ['src/a.ts', 'src/b.ts'].map((file) => after[file] === cleanManifest.internalPartitions[file]),
-      partitionIdsMatchClean: ['src/a.ts', 'src/b.ts'].map((file) => engine.readGeneration(result.generation).partitions[file] === cleanManifest.partitions[file]),
+      importerPartitionRetained: engine.readGeneration(result.generation).partitions['src/b.ts'] === beforeManifest.partitions['src/b.ts'],
+      unresolvedEdges: engine.snapshot().unresolvedEdges,
       rows,
     },
     {
-      validatedFiles: ['src/a.ts', 'src/b.ts'],
-      internalBuildCount: 2,
-      internalRebuiltFiles: ['src/a.ts', 'src/b.ts'],
-      changedIds: [true, true],
-      traversalSummary: { completedFiles: 2, remainingFiles: 0, maximumTraversalsPerFile: 1 },
-      internalIdsMatchClean: [true, true],
-      partitionIdsMatchClean: [true, true],
+      validatedFiles: ['src/a.ts'],
+      internalBuildCount: 1,
+      internalRebuiltFiles: ['src/a.ts'],
+      changedIds: [true, false],
+      traversalSummary: { completedFiles: 1, remainingFiles: 0, maximumTraversalsPerFile: 1 },
+      importerPartitionRetained: true,
+      unresolvedEdges: [{
+        from: importerId,
+        to: missingTargetId,
+        line: 1,
+        reason: 'dangling-symbol-target',
+      }],
       rows: [],
     },
   )
@@ -3084,6 +3768,77 @@ test('worker reopen: the first disk-backed update publishes through semantic val
   })
 })
 
+test('error guessing: a reopened changed consumer reads parses and validates only itself while retaining imported call and alias-reference edges', async () => {
+  const root = fixture()
+  const builder = trackedEngine(root, { cacheDir: '.retained-reopen-import-edges' })
+  await builder.build()
+  await builder.dispose()
+  const reads = []
+  const reopened = trackedEngine(root, { cacheDir: '.retained-reopen-import-edges', sourceReaderDeps: { readFile: async (file, encoding) => { reads.push(path.relative(root, file).split(path.sep).join('/')); return fsp.readFile(file, encoding) } } })
+  const clean = trackedEngine(root, { cacheDir: '.retained-reopen-import-edges-clean' })
+  fs.writeFileSync(path.join(root, 'src', 'b.ts'), "import { a } from './a'; export function b(){ const selected=a; return a()+selected() }\n")
+
+  const submitted = await reopened.applyFileChanges([{ type: 'change', path: 'src/b.ts' }])
+  const accepted = await submitted.validation
+  const cleanBuild = await clean.build()
+  const retainedRows = await reopened.queryBatch({ type: 'refs', name: 'a', resolved: true, generation: accepted.generation })
+  const cleanRows = await clean.queryBatch({ type: 'refs', name: 'a', resolved: true, generation: cleanBuild.generation })
+  const normalize = (rows) => rows.map(({ fromSymbol, toSymbol, call }) => ({ from: `${fromSymbol.file}:${fromSymbol.name}`, to: `${toSymbol.file}:${toSymbol.name}`, call }))
+
+  assert.deepEqual(
+    { reads, parsedFiles: accepted.parsedFiles, validatedFiles: accepted.validatedFiles, retained: normalize(retainedRows), clean: normalize(cleanRows) },
+    {
+      reads: ['src/b.ts'],
+      parsedFiles: ['src/b.ts'],
+      validatedFiles: ['src/b.ts'],
+      retained: [{ from: 'src/b.ts:b', to: 'src/a.ts:a', call: true }, { from: 'src/b.ts:selected', to: 'src/a.ts:a', call: false }],
+      clean: [{ from: 'src/b.ts:b', to: 'src/a.ts:a', call: true }, { from: 'src/b.ts:selected', to: 'src/a.ts:a', call: false }],
+    },
+  )
+})
+
+test('combinatorial all-pairs: a changed consumer resolves cached default named alias namespace and re-export routes like a clean build', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-retained-binding-routes-'))
+  fs.writeFileSync(path.join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { module: 'ESNext', target: 'ES2022' }, include: ['src'] }))
+  fs.mkdirSync(path.join(root, 'src'))
+  fs.writeFileSync(path.join(root, 'src', 'base.ts'), 'export default function primary(){ return 1 }\nexport const named = 2\n')
+  fs.writeFileSync(path.join(root, 'src', 'barrel.ts'), "export { default, default as alias, named as renamed } from './base'\nexport * as space from './base'\n")
+  fs.writeFileSync(path.join(root, 'src', 'consumer.ts'), "import primary, { alias, renamed, space } from './barrel'\nimport * as namespace from './barrel'\nexport const consume = () => primary() + alias() + renamed + space.named + namespace.renamed\n")
+  const retained = trackedEngine(root, { cacheDir: '.retained-binding-routes' })
+  const clean = trackedEngine(root, { cacheDir: '.retained-binding-routes-clean' })
+  await retained.build()
+  fs.writeFileSync(path.join(root, 'src', 'consumer.ts'), "import primary, { alias, renamed, space } from './barrel'\nimport * as namespace from './barrel'\nexport const consume = () => primary() + alias() + renamed + space.named + namespace.renamed + 1\n")
+
+  const changed = await retained.incremental([{ type: 'change', path: 'src/consumer.ts' }])
+  await changed.validation
+  const cleanBuild = await clean.build()
+  const retainedRows = await retained.queryBatch({ type: 'deps', name: 'consume', resolved: true, generation: changed.generation })
+  const cleanRows = await clean.queryBatch({ type: 'deps', name: 'consume', resolved: true, generation: cleanBuild.generation })
+  const normalize = (rows) => rows.map(({ toSymbol, call }) => ({ file: toSymbol.file, name: toSymbol.name, call })).toSorted((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)))
+
+  assert.deepEqual(
+    { parsedFiles: changed.parsedFiles, validatedFiles: changed.validatedFiles, retained: normalize(retainedRows), clean: normalize(cleanRows) },
+    {
+      parsedFiles: ['src/consumer.ts'],
+      validatedFiles: ['src/consumer.ts'],
+      retained: [
+        { file: 'src/base.ts', name: 'named', call: false },
+        { file: 'src/base.ts', name: 'named', call: false },
+        { file: 'src/base.ts', name: 'named', call: false },
+        { file: 'src/base.ts', name: 'primary', call: true },
+        { file: 'src/base.ts', name: 'primary', call: true },
+      ],
+      clean: [
+        { file: 'src/base.ts', name: 'named', call: false },
+        { file: 'src/base.ts', name: 'named', call: false },
+        { file: 'src/base.ts', name: 'named', call: false },
+        { file: 'src/base.ts', name: 'primary', call: true },
+        { file: 'src/base.ts', name: 'primary', call: true },
+      ],
+    },
+  )
+})
+
 test('retained pending update: latest mapped rows remain on the validated generation and report validated metadata', async () => {
   const root = fixture()
   const checker = new SemanticCheckerWorker()
@@ -3118,6 +3873,136 @@ test('retained revision boundary: applyChanges and applyFileChanges reject the s
 
   assert.throws(() => engine.applyChanges([{ type: 'change', path: 'src/b.ts', source: 'export function changed(){ return 3 }\n' }], { baseRevision: 1 }), /stale base revision 1; latest is 0/)
   await assert.rejects(engine.applyFileChanges([{ type: 'change', path: 'src/b.ts' }], { baseRevision: 1 }), /stale base revision 1; latest is 0/)
+})
+
+test('equivalence partitioning and boundary analysis: malformed public change requests reject without advancing revision or CURRENT', async (t) => {
+  await t.test('source-backed applyChanges rejects an unknown change type', async () => {
+    const root = fixture()
+    const engine = trackedEngine(root)
+    const built = await engine.build()
+    assert.throws(() => engine.applyChanges([{ type: 'replace', path: 'src/a.ts', source: 'export function a(){ return 2 }\n' }]), /type|change|add|unlink|unknown/i)
+    assert.deepEqual({ revision: engine.provisionalSnapshot().revision, generation: engine.readGeneration().generation }, { revision: 0, generation: built.generation })
+  })
+
+  await t.test('source-backed applyChanges rejects an empty path', async () => {
+    const root = fixture()
+    const engine = trackedEngine(root)
+    const built = await engine.build()
+    assert.throws(() => engine.applyChanges([{ type: 'change', path: '', source: 'export const invalid = true\n' }]), /path|empty|relative/i)
+    assert.deepEqual({ revision: engine.provisionalSnapshot().revision, generation: engine.readGeneration().generation }, { revision: 0, generation: built.generation })
+  })
+
+  await t.test('source-backed applyChanges rejects an absolute path', async () => {
+    const root = fixture()
+    const engine = trackedEngine(root)
+    const built = await engine.build()
+    assert.throws(() => engine.applyChanges([{ type: 'change', path: '/tmp/outside.ts', source: 'export const invalid = true\n' }]), /path|absolute|relative|escape/i)
+    assert.deepEqual({ revision: engine.provisionalSnapshot().revision, generation: engine.readGeneration().generation }, { revision: 0, generation: built.generation })
+  })
+
+  await t.test('source-backed applyChanges rejects an escaping path', async () => {
+    const root = fixture()
+    const engine = trackedEngine(root)
+    const built = await engine.build()
+    assert.throws(() => engine.applyChanges([{ type: 'change', path: '../outside.ts', source: 'export const invalid = true\n' }]), /path|relative|escape|outside/i)
+    assert.deepEqual({ revision: engine.provisionalSnapshot().revision, generation: engine.readGeneration().generation }, { revision: 0, generation: built.generation })
+  })
+
+  await t.test('source-backed applyChanges rejects missing source text', async () => {
+    const root = fixture()
+    const engine = trackedEngine(root)
+    const built = await engine.build()
+    assert.throws(() => engine.applyChanges([{ type: 'change', path: 'src/a.ts' }]), /source|string|required/i)
+    assert.deepEqual({ revision: engine.provisionalSnapshot().revision, generation: engine.readGeneration().generation }, { revision: 0, generation: built.generation })
+  })
+
+  await t.test('source-backed applyChanges rejects non-string source text', async () => {
+    const root = fixture()
+    const engine = trackedEngine(root)
+    const built = await engine.build()
+    assert.throws(() => engine.applyChanges([{ type: 'add', path: 'src/c.ts', source: 42 }]), /source|string|required/i)
+    assert.deepEqual({ revision: engine.provisionalSnapshot().revision, generation: engine.readGeneration().generation }, { revision: 0, generation: built.generation })
+  })
+
+  await t.test('disk-backed applyFileChanges rejects supplied source text', async () => {
+    const root = fixture()
+    const engine = trackedEngine(root)
+    const built = await engine.build()
+    await assert.rejects(engine.applyFileChanges([{ type: 'change', path: 'src/a.ts', source: 'export function a(){ return 2 }\n' }]), /disk|source|must not include/i)
+    assert.deepEqual({ revision: engine.provisionalSnapshot().revision, generation: engine.readGeneration().generation }, { revision: 0, generation: built.generation })
+  })
+})
+
+test('domain and error-guessing analysis: malformed delta partition and tombstone receipts reject without publishing', async (t) => {
+  const runMalformedReceipt = async ({ change, receiptFiles, tombstones }) => {
+    const root = fixture()
+    let engine
+    engine = trackedEngine(root, { validationWorkerFactory: () => ({ validate: async (payload) => {
+      const complete = fullWorkerResult(engine, change.type === 'unlink' && receiptFiles.length ? { ...payload, changes: [] } : payload)
+      const sourceBlobs = { ...complete.sourceBlobs }
+      if (change.type === 'unlink') delete sourceBlobs[change.path]
+      return {
+        ...complete,
+        mode: 'delta',
+        sourceBlobs,
+        partitionReceipts: complete.partitionReceipts.filter(({ file }) => receiptFiles.includes(file)),
+        tombstones,
+      }
+    }, dispose: async () => {} }) })
+    const built = await engine.build()
+    const before = manifestBytes(engine)
+    const result = engine.applyChanges([change])
+    await assert.rejects(result.validation, /partition|tombstone|changed|unknown|unexpected|mismatch|membership/i)
+    assert.deepEqual({ generation: engine.readGeneration().generation, manifest: manifestBytes(engine) }, { generation: built.generation, manifest: before })
+  }
+
+  await t.test('a mismatched tombstone for another known file rejects', () => runMalformedReceipt({
+    change: { type: 'unlink', path: 'src/a.ts' },
+    receiptFiles: [],
+    tombstones: ['src/b.ts'],
+  }))
+
+  await t.test('an extra unknown tombstone rejects', () => runMalformedReceipt({
+    change: { type: 'unlink', path: 'src/a.ts' },
+    receiptFiles: [],
+    tombstones: ['src/a.ts', 'src/ghost.ts'],
+  }))
+
+  await t.test('multiple tombstones reject a one-file unlink', () => runMalformedReceipt({
+    change: { type: 'unlink', path: 'src/a.ts' },
+    receiptFiles: [],
+    tombstones: ['src/a.ts', 'src/b.ts'],
+  }))
+
+  await t.test('a changed partition mixed with a tombstone rejects', () => runMalformedReceipt({
+    change: { type: 'change', path: 'src/a.ts', source: 'export function a(){ return 2 }\n' },
+    receiptFiles: ['src/a.ts'],
+    tombstones: ['src/a.ts'],
+  }))
+
+  await t.test('a tombstone for a changed file rejects', () => runMalformedReceipt({
+    change: { type: 'change', path: 'src/a.ts', source: 'export function a(){ return 2 }\n' },
+    receiptFiles: [],
+    tombstones: ['src/a.ts'],
+  }))
+
+  await t.test('a tombstone for an added file rejects', () => runMalformedReceipt({
+    change: { type: 'add', path: 'src/c.ts', source: 'export const c = 3\n' },
+    receiptFiles: [],
+    tombstones: ['src/c.ts'],
+  }))
+
+  await t.test('a partition receipt for an unlinked file rejects', () => runMalformedReceipt({
+    change: { type: 'unlink', path: 'src/a.ts' },
+    receiptFiles: ['src/a.ts'],
+    tombstones: [],
+  }))
+
+  await t.test('an unknown partition path rejects', () => runMalformedReceipt({
+    change: { type: 'change', path: 'src/a.ts', source: 'export function a(){ return 2 }\n' },
+    receiptFiles: ['src/b.ts'],
+    tombstones: [],
+  }))
 })
 
 test('compatibility: concurrent retained cold builds leave one readable equivalent graph', async () => {

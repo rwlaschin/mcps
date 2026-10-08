@@ -7,6 +7,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { performance } from 'node:perf_hooks'
 import { ParserApartmentPool } from '../parser-apartment-pool.mjs'
+import * as parserPoolModule from '../parser-apartment-pool.mjs'
 
 class FakeWorker extends EventEmitter {
   constructor(workerData) { super(); this.workerData = workerData; this.messages = []; this.terminated = 0 }
@@ -117,6 +118,89 @@ test('error guessing: a timed out parse rejects and clears observable in-flight 
 
   assert.deepEqual(pool.snapshot(), { workerCount: 1, queued: 0, inFlight: 0, latestRevisionByFile: { 'file-slow': 1 } })
   await pool.dispose()
+})
+
+test('boundary value: timeout zero leaves a parser request pending across an event-loop turn until its worker responds', async () => {
+  let worker
+  let settled = false
+  const pool = new ParserApartmentPool('/repo', { workerCount: 1, timeoutMs: 0, workerFactory: (_url, options) => { worker = new FakeWorker(options.workerData); return worker } })
+
+  const pending = pool.parse({ path: 'src/profiled.ts', fileId: 'profiled-file', revision: 1 }).then((value) => value, () => null).finally(() => { settled = true })
+  await new Promise((resolve) => setImmediate(resolve))
+  const beforeResponse = { settled, snapshot: pool.snapshot() }
+  worker.emit('message', { type: 'result', requestId: 1, fileId: 'profiled-file', revision: 1, parsed: { file: 'src/profiled.ts', digest: 'profiled-digest' } })
+
+  assert.deepEqual(
+    { beforeResponse, digest: (await pending)?.digest },
+    { beforeResponse: { settled: false, snapshot: { workerCount: 1, queued: 0, inFlight: 1, latestRevisionByFile: { 'profiled-file': 1 } } }, digest: 'profiled-digest' },
+  )
+  await pool.dispose()
+})
+
+test('combinatorial profiling boundary: three parser workers receive unique CPU heap and trace destinations while preserving unrelated exec arguments', async () => {
+  const workers = []
+  const optionsByWorker = []
+  const pool = new ParserApartmentPool('/repo', {
+    workerCount: 3,
+    baseExecArgv: ['--cpu-prof', '--cpu-prof-dir=/profiles', '--cpu-prof-name=main.cpuprofile', '--heap-prof', '--heap-prof-dir=/profiles', '--heap-prof-name=main.heapprofile', '--trace-event-categories=v8', '--trace-event-file-pattern=/profiles/main.trace.json', '--stack-trace-limit=50'],
+    workerFactory: (_url, options) => { const worker = new FakeWorker(options.workerData); workers.push(worker); optionsByWorker.push(options); return worker },
+  })
+
+  const first = pool.parse({ path: 'src/a.ts', fileId: 'a', revision: 1 })
+  const second = pool.parse({ path: 'src/b.ts', fileId: 'b', revision: 1 })
+  const third = pool.parse({ path: 'src/c.ts', fileId: 'c', revision: 1 })
+  workers[0].emit('message', { type: 'result', requestId: 1, fileId: 'a', revision: 1, parsed: { file: 'src/a.ts' } })
+  workers[1].emit('message', { type: 'result', requestId: 2, fileId: 'b', revision: 1, parsed: { file: 'src/b.ts' } })
+  workers[2].emit('message', { type: 'result', requestId: 3, fileId: 'c', revision: 1, parsed: { file: 'src/c.ts' } })
+  await Promise.all([first, second, third])
+
+  assert.deepEqual(optionsByWorker.map(({ execArgv }) => execArgv), [
+    ['--cpu-prof', '--cpu-prof-dir=/profiles', '--cpu-prof-name=main.worker-0.cpuprofile', '--heap-prof', '--heap-prof-dir=/profiles', '--heap-prof-name=main.worker-0.heapprofile', '--stack-trace-limit=50'],
+    ['--cpu-prof', '--cpu-prof-dir=/profiles', '--cpu-prof-name=main.worker-1.cpuprofile', '--heap-prof', '--heap-prof-dir=/profiles', '--heap-prof-name=main.worker-1.heapprofile', '--stack-trace-limit=50'],
+    ['--cpu-prof', '--cpu-prof-dir=/profiles', '--cpu-prof-name=main.worker-2.cpuprofile', '--heap-prof', '--heap-prof-dir=/profiles', '--heap-prof-name=main.worker-2.heapprofile', '--stack-trace-limit=50'],
+  ])
+  await pool.dispose()
+})
+
+test('error guessing: shared profiler derivation makes valid noncanonical fixed destinations unique without changing unrelated arguments', () => {
+  assert.equal(typeof parserPoolModule.deriveWorkerProfile, 'function')
+
+  const derived = parserPoolModule.deriveWorkerProfile([
+    '--cpu-prof', '--cpu-prof-dir=/profiles/cpu', '--cpu-prof-name=custom-cpu-output',
+    '--heap-prof', '--heap-prof-dir=/profiles/heap', '--heap-prof-name=heap.capture',
+    '--trace-event-categories=v8,node', '--trace-event-file-pattern=/profiles/trace/trace-output.jsonl',
+    '--stack-trace-limit=50',
+  ], 2)
+
+  assert.deepEqual(derived, {
+    execArgv: [
+      '--cpu-prof', '--cpu-prof-dir=/profiles/cpu', '--cpu-prof-name=custom-cpu-output.worker-2',
+      '--heap-prof', '--heap-prof-dir=/profiles/heap', '--heap-prof-name=heap.worker-2.capture',
+      '--stack-trace-limit=50',
+    ],
+    artifacts: {
+      cpu: '/profiles/cpu/custom-cpu-output.worker-2',
+      heap: '/profiles/heap/heap.worker-2.capture',
+    },
+  })
+})
+
+test('integration boundary: a real parser Worker starts and parses with CPU heap and parent-only trace profiler flags', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-profiled-worker-root-'))
+  const profiles = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-profiled-worker-output-'))
+  t.after(() => { fs.rmSync(root, { recursive: true, force: true }); fs.rmSync(profiles, { recursive: true, force: true }) })
+  fs.mkdirSync(path.join(root, 'src'))
+  fs.writeFileSync(path.join(root, 'src', 'value.ts'), 'export const value = 1\n')
+  const pool = new ParserApartmentPool(root, {
+    workerCount: 1,
+    timeoutMs: 0,
+    baseExecArgv: ['--cpu-prof', `--cpu-prof-dir=${profiles}`, '--cpu-prof-name=main.cpuprofile', '--heap-prof', `--heap-prof-dir=${profiles}`, '--heap-prof-name=main.heapprofile', '--trace-event-categories=v8,node', `--trace-event-file-pattern=${path.join(profiles, 'main.trace.json')}`],
+  })
+  t.after(() => pool.dispose())
+
+  const parsed = await pool.parse({ path: 'src/value.ts', fileId: 'value-file', revision: 1 })
+
+  assert.deepEqual({ file: parsed.file, symbols: parsed.symbols.map(({ name }) => name) }, { file: 'src/value.ts', symbols: ['value'] })
 })
 
 test('error guessing: disposal rejects queued and in-flight parses and terminates every worker exactly once', async () => {

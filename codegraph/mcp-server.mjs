@@ -15,6 +15,8 @@ import { GraphStore } from './store.mjs'
 import { MmapQueryCache } from './mmap-query-cache.mjs'
 import { prepareQueryViewCache } from './query-cache-schema.mjs'
 import { nativeMmapAdapter } from './native/mmap-adapter.mjs'
+import { createLanguageAnalyzers } from './language-analyzer.mjs'
+import { createTypeScriptLanguageAnalyzer } from './typescript-language-analyzer.mjs'
 
 const DEFAULT_ROOT = process.env.CODEGRAPH_ROOT ? path.resolve(process.env.CODEGRAPH_ROOT) : null
 
@@ -156,6 +158,7 @@ const call = {}
 
 const runtimes = new Map()
 const queryCaches = new Map()
+const analyzersFor = (root) => createLanguageAnalyzers(root, [createTypeScriptLanguageAnalyzer])
 const queryCacheFor = (root) => {
   let cache = queryCaches.get(root)
   if (!cache) {
@@ -220,7 +223,7 @@ async function startPollingWatcher(root, policy) {
 }
 function watchForChanges(root) {
   if (lightWatchers.has(root) || runtimes.has(root)) return
-  const policy = createSourcePolicy(root)
+  const policy = createSourcePolicy(root, analyzersFor(root))
   try {
     const watcher = fs.watch(root, { recursive: true, persistent: false }, (_event, name) => {
       if (!name) return
@@ -231,16 +234,18 @@ function watchForChanges(root) {
     watcher.on('error', () => { stopLightWatcher(root); void startPollingWatcher(root, policy) })
   } catch { void startPollingWatcher(root, policy) }
 }
-const diskMatchesGeneration = (root, policy) => {
+const diskMatchesGeneration = (root, policy, analyzers = analyzersFor(root)) => {
   try {
     const store = new GraphStore(root)
     const generation = store.readGeneration()
     const files = policy.scan()
     const indexed = Object.keys(generation.sources ?? {}).sort()
-    return generation.controlHashes && JSON.stringify(generation.controlHashes) === JSON.stringify(controlFileHashes(root)) && files.length === indexed.length && files.every((file, index) => file === indexed[index] && fileContentHash(path.join(root, file)) === generation.sources[file])
+    return analyzers.isManifestCompatible(generation, files) && generation.controlHashes && JSON.stringify(generation.controlHashes) === JSON.stringify(controlFileHashes(root, analyzers)) && files.length === indexed.length && files.every((file, index) => file === indexed[index] && fileContentHash(path.join(root, file)) === generation.sources[file])
   } catch { return false }
 }
 async function queryEngineFor(root) {
+  const analyzers = analyzersFor(root)
+  const policy = createSourcePolicy(root, analyzers)
   let engine = queryEngines.get(root)
   if (!engine) {
     engine = new DaemonQueryEngine(root, {
@@ -252,9 +257,8 @@ async function queryEngineFor(root) {
     watchForChanges(root)
   }
   if (!freshnessChecks.has(root)) {
-    const policy = createSourcePolicy(root)
     const freshness = new Promise((resolve) => setImmediate(resolve))
-      .then(async () => { if (!diskMatchesGeneration(root, policy)) await runtimeFor(root) })
+      .then(async () => { if (!diskMatchesGeneration(root, policy, analyzers)) await runtimeFor(root) })
       .catch((error) => {
         freshnessChecks.delete(root)
         process.stderr.write(`codegraph-mcp refresh: ${error.message}\n`)
@@ -276,19 +280,19 @@ const cappedRows = async (iterator, signal) => {
 }
 const loc = (graph, id) => { const symbol = graph.symbols.find((item) => item.id === id); return symbol ? `${symbol.file}:${symbol.line}` : id }
 call.codegraph_refs = async (a, { signal } = {}) => {
-  const engine = await queryEngineFor(resolveRoot(a)); const target = qualifiedQuery(required(a, 'symbol'))
+  const root = resolveRoot(a); const engine = await queryEngineFor(root); const target = qualifiedQuery(required(a, 'symbol'), analyzersFor(root))
   const pinned = await engine.pinQuery({ type: 'refs', edgeCoverage: 'complete', resolved: true, ...target }, { signal }); const rows = await cappedRows(pinned.rows, signal)
   return rows.map((edge) => `${edge.fromSymbol.file}:${edge.fromSymbol.line} -> ${edge.toSymbol.file}:${edge.toSymbol.line}${edge.call ? ' call' : ''}`).join('\n') || '(no results)'
 }
 call.codegraph_deps = async (a, { signal } = {}) => {
-  const engine = await queryEngineFor(resolveRoot(a)); const target = required(a, 'target')
-  const request = { type: 'deps', resolved: true, ...qualifiedQuery(target) }
+  const root = resolveRoot(a); const engine = await queryEngineFor(root); const target = required(a, 'target')
+  const request = { type: 'deps', resolved: true, ...qualifiedQuery(target, analyzersFor(root)) }
   const pinned = await engine.pinQuery(request, { signal }); const { metadata } = pinned; const rows = await cappedRows(pinned.rows, signal)
   return `${JSON.stringify(metadata)}\n${rows.map((edge) => `${edge.fromSymbol.file}:${edge.fromSymbol.line} -> ${edge.toSymbol.file}:${edge.toSymbol.line}${edge.call ? ' call' : ''}`).join('\n') || '(no results)'}`
 }
 call.codegraph_callers = async (a, { signal } = {}) => {
-  const engine = await queryEngineFor(resolveRoot(a)); const pinned = await engine.pinQuery({ type: 'graph', edgeCoverage: 'calls', limit: 1 }, { signal }); const graph = pinned.graph; const depth = Math.max(0, Number(a.depth ?? 3))
-  const target = qualifiedQuery(required(a, 'symbol'))
+  const root = resolveRoot(a); const engine = await queryEngineFor(root); const pinned = await engine.pinQuery({ type: 'graph', edgeCoverage: 'calls', limit: 1 }, { signal }); const graph = pinned.graph; const depth = Math.max(0, Number(a.depth ?? 3))
+  const target = qualifiedQuery(required(a, 'symbol'), analyzersFor(root))
   const roots = graph.symbols.filter((symbol) => (!target.name || symbol.name === target.name) && (!target.file || symbol.file === target.file || symbol.file.endsWith(target.file))); const reverse = new Map()
   for (const edge of graph.edges) if (edge.call) { if (!reverse.has(edge.to)) reverse.set(edge.to, new Set()); reverse.get(edge.to).add(edge.from) }
   const output = []; const seen = new Set(); let frontier = roots.map((symbol) => [symbol.id, 0])
@@ -502,7 +506,8 @@ const warmDefaultRoot = (context) => {
   if (!DEFAULT_ROOT) return
   try {
     const root = resolveRoot({ root: DEFAULT_ROOT })
-    if (!diskMatchesGeneration(root, createSourcePolicy(root))) return
+    const analyzers = analyzersFor(root)
+    if (!diskMatchesGeneration(root, createSourcePolicy(root, analyzers), analyzers)) return
     queryEngineFor(root).catch((error) => process.stderr.write(`codegraph-mcp ${context}: ${error.message}\n`))
   } catch (error) {
     process.stderr.write(`codegraph-mcp ${context}: ${error.message}\n`)
