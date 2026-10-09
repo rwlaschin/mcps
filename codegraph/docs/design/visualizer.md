@@ -1,5 +1,5 @@
 ---
-modified: 2026-09-12
+modified: 2026-10-08
 dependencies: [parsing-and-resolution.md, storage-and-query.md, mcp-and-cli.md]
 ---
 
@@ -36,13 +36,25 @@ The MCP and CLI surfaces answer targeted graph questions (callers of X, dead cod
 The views answer complementary questions over the same validated generation:
 
 - **Layered Flow** — per-symbol cards, split Frontend/Backend, banded by exact connection count, with callers/callees drawn on selection and upward calls flagged as violations.
+
+Layered Flow retains the complete graph and all symbol positions while mounting only cards intersecting the SVG viewport plus 216 world units of padding. `reconcileLayeredViewport` finds candidate rows by binary search and candidate columns arithmetically; pan and zoom do not scan the complete graph to find cards. Cards removed from the viewport are released, and remounted cards restore the current filter and selected-neighbor highlights. `scheduleTransform` reconciles cards before writing the canvas transform, avoiding a viewport dimension read immediately after that transform write. Resize schedules the same update. Complete position and adjacency maps retain offscreen caller/callee navigation, and selection and violation edges preserve their complete existing output. Selected-neighbor membership is computed once per filter update, independently of mounted DOM; full-model filter changes remain separate from viewport frame work.
+
+Root verification on the real 20,327-symbol, 31,093-edge graph retained 112 rows and mounted 66 initial cards, with 738 SVG elements instead of the prior 122,304 DOM elements. A matched 1280px viewport zoom measured layout work of 4.026ms versus the baseline 342.441ms. Browser task duration was 102.298ms versus 1,126.569ms, with tracing instrumentation enabled for the later run; these measurements establish this action's reduced work, not a universal speedup, complete page-load time or frame rate. A 300px pan mounted 60 cards; selected offscreen navigation, Most Called selection exceptions and deselection were inspected in the actual browser. Cross-view switching and return were checked, but complete Complexity population in that sequence was covered by automated tests rather than awaited in the browser. CPU profiles, traces, metrics and screenshots are retained under `profiles/layered-render-performance-2026-10-08/`.
 - **Heat Map** — one 50x50 tile per file laid out in a boustrophedon (serpentine) flow, colored by normalized incoming-call density, bordered by module color.
 - **Sunburst** — radial partition of the real directory tree (root → directories → file → symbol), arc width proportional to `1 + incoming calls`, with tail symbols collapsed into a `+N more` group arc.
 - **Chord** — module-to-module coupling matrix as perimeter arcs plus interior ribbons, violating pairs colored red.
 - **Call Tree** — a depth-bounded function call hierarchy with complexity bands and selected-function detail.
+
+Call Tree summary cards retain their 200×48 geometry. Both text rows share a 180px clipping region, preserving full tooltip and inspector content. Keyboard focus uses an accent stroke on the card rectangle. Renderer and activation checks pass; browser checks confirm contained text, full inspector content and accent rectangle focus.
 - **Complexity** — a directory/file/function treemap and histogram backed by indexed cyclomatic metrics.
 
-Three cross-cutting controls apply to all four: a substring search box, a four-way filter (`all` / `most-called` / `orphans` / `violations`), and an "Include Tests" toggle that re-fetches with `?includeTests=1`.
+Most Called and substring search apply to all six views. Most Called uses Layered Flow's distinct eligible caller/target pairs and positive in-degree threshold at `floor(positiveCount * 0.1)`, including ties. Aggregate views match containers with any ranked function. Call Tree dims cards in place; Complexity partitions its existing color paths by opacity, preserving cell coordinates and selection indices. Filters reapply after rendering. Orphans and violations retain their existing support in the original four views. Include Tests re-fetches with `?includeTests=1`.
+
+Call Tree and Complexity obtain ranking from the existing raw graph cache after their summary queries. A cold summary-only load now also loads the graph; filter clicks make no requests. Complexity keeps its metrics-only summary query. Root browser checks on a three-function fixture confirmed all six tabs, retained filters, search intersection, All restoration and selection of a dimmed Complexity cell. These checks do not establish large-repository performance.
+
+Complexity selection uses one unfilled accent rectangle over the pinned cell. The rectangle is a child of the transformed canvas and a sibling of the batched grid, with pointer events disabled and a non-scaling 2px stroke. Selection through click, keyboard or inspector navigation updates its coordinates; filtering preserves it and rendering clears it. Detail loading or failure leaves the marker visible. Root browser checks confirmed movement between cells, persistence after filtering, unchanged hit bounds and alignment after zoom. The visualizer process must restart to load changes to its embedded client code; page reload alone retains code from the running process.
+
+The selected-owner inspector requests `internals` operation `details`: one compact record containing loop count, call occurrence count and unique target IDs in encounter order. Existing summary metrics, generation, target navigation and Back remain intact. It no longer requests a combined syntax/CFG map or raises the 2,000-record limit. Partition validation and owner-filtered iterators still inspect the selected file; this does not establish owner-only CPU work. Focused regressions pass, and an independent query of the indexed `Plot.tsx` owner that previously exceeded the map limit returns exactly 44 call occurrences and 31 unique targets.
 
 Editorial semantics are deliberately codegraph-specific rather than generic graph drawing: `isTestFile` and `classifyArchitecturalTier` (`visualizer-graph.mjs:65-241`) encode this project's opinion about what a test file is and which tier a path belongs to, and `filterSymbols` (`:79-116`) drops types/interfaces/enums, destructuring artifacts, `SCREAMING_CASE` constants, and (by default) test files so the views show callable code only.
 
@@ -57,7 +69,7 @@ Two files, a clean split:
 1. *Arg parsing* (`:8-13`): `--root` / `--port` / a positional path, falling back to `CODEGRAPH_ROOT` then `process.cwd()`.
 2. *The `page` template literal* (`:15-2471`): CSS, static markup, and the entire client runtime.
 3. *`createVisualizerServer(rootPath, options)`* (`:2473-2693`): the graph cache and shared-query refcount, the fs watcher and SSE broadcast, and the request handler.
-4. *The main guard* (`:2695-2699`): listens only when run as the entry module.
+4. *The main guard*: compares the executable path with `fileURLToPath(import.meta.url)` and listens only when run as the entry module. Node's URL conversion handles Windows drive paths and decoded spaces or escaped characters; importing the module does not listen.
 
 Server-side request flow: `graphForRequest(req, res)` (`:2520-2526`) creates an `AbortController` wired to `req 'aborted'` and `res 'close'`, then calls `fetchRawGraph(false, signal)`; that returns the cached graph, or joins the single in-flight `streamQuery`, incrementing a waiter count so only the last departing waiter aborts it. The route then calls its builder, stamps `project = { name: path.basename(rootPath), root: rootPath }` onto the result, and serializes it.
 
@@ -97,7 +109,7 @@ Client architecture: module-scope state (`currentView`, one cache variable per v
 - `describeRibbon(cx, cy, r, sa0, sa1, ta0, ta1)` — two arcs joined by quadratic curves through the center.
 - `hslToHex(h, s, l)` — used only by the sunburst palette.
 - `buildLayeredGraph(rawGraph, options)` — filters, indexes ids to array slots, dedupes edges by `u * 1000000 + v`, runs the linear topological longest-path layering, computes in/out degree, derives a top-10% in-degree threshold for `isMostCalled`, and marks `isViolation` on any edge whose target layer is `<=` its source layer.
-- `buildHeatmapData(rawGraph, options)` — per-symbol degrees, aggregation into files then directory modules, alphabetical sort of modules and files with symbols sorted by line, heat normalized against the max file in-call count, `isMostCalled` at heat >= 0.4 or above a top-15% threshold, tier-violation sets, and the serpentine 50 px/5 px-gap layout (`targetCols = clamp(8, 50, ceil(sqrt(files) * 1.3))`, overridable via `options.maxCols`).
+- `buildHeatmapData(rawGraph, options)` — per-symbol degrees, aggregation into files then directory modules, alphabetical sort of modules and files with symbols sorted by line, heat normalized against the max file in-call count, `isMostCalled` when any contained symbol meets the shared Layered ranking, tier-violation sets, and the serpentine 50 px/5 px-gap layout (`targetCols = clamp(8, 50, ceil(sqrt(files) * 1.3))`, overridable via `options.maxCols`).
 - `buildSunburstData(rawGraph, options)` — builds a real recursive directory tree, computes bottom-up `value`/`calls` and max depth, sizes rings as `clamp(28, 80, (radius - 70) / maxDepth)`, assigns a top-level theme palette per branch with lightness stepping inward, and lays out arcs recursively; symbol arcs thinner than 0.0008 rad beyond index 10 collapse into one `type: "group"` arc.
 - `buildChordData(rawGraph, options)` — module-by-module `Float64Array` call matrix, per-module flow `= max(1, row + column)`, angular spans proportional to flow with padding `min(0.04, (π/4)/modCount)`, one chord per unordered pair, `isViolation` when a directional call runs from a higher tier ordinal to a lower one; violating chords are `#ef4444` and mark both endpoint modules `hasViolation`.
 
@@ -165,7 +177,7 @@ module: { name, borderColor, fileCount, symbolCount, totalInCalls, files: [file,
 ```
 node: { id, name, type: "root"|"directory"|"file"|"symbol"|"group",
         depth, r0, r1, a0, a1, d (SVG path), value, calls, color,
-        isMostCalled (calls > 5; always true for root), isOrphan (calls === 0),
+        isMostCalled (any ranked contained symbol; false with no matches), isOrphan (calls === 0),
         hasViolation: false,
         fullPath?  (directory/file),  module?, file?, line?  (file/symbol/group),
         symbolsCount? (file) }
@@ -294,6 +306,10 @@ chord:  { source, target, sourceCalls, targetCalls, calls, color, d, isViolation
 - A source extension is added to `source-policy.mjs` but not to the watcher's inline list at `visualizer.mjs:2577`: files of that type are indexed but never trigger step 2.
 
 ## Tests
+
+- `test/visualizer-layered-viewport.test.mjs` verifies viewport card mounting, partial intersections, row/column boundaries, complete model positions, selected-neighbor exceptions, remount highlighting, offscreen navigation, filter-visible edge endpoints and cross-view lifecycle. Root reran 109 focused visualizer tests with zero failures or skips.
+
+- `test/platform-startup.test.mjs` launches copied executables from paths containing spaces, `#` and `%`, fetches their actual HTTP page, and checks that importing the module does not listen. Windows-specific credential branches are exercised in isolated simulated-platform processes; this is not a real Windows execution receipt.
 
 - `test/visualizer.test.mjs` — 13 unit tests calling `visualizer-graph.mjs` directly: `colorFor` palette properties, `filterSymbols` inclusion/exclusion, `buildLayeredGraph` layering, edge dedup, tier stratification, most-called/orphan marking, and a 1000-node-with-cycles performance case; `formatLocation`; `classifyArchitecturalTier` across all six tiers; `heatColorFor`; and shape assertions for `buildHeatmapData`, `buildSunburstData`, and `buildChordData`.
 - `test/visualizer-e2e.test.mjs` — 8 server tests built on `createVisualizerServer(root, { streamQuery: mockStreamQuery })` with a simulated request helper: `/` serves the HTML and client script; `/graph` returns enriched layered JSON with `project`, correct layer ordering, orphan marking, valid non-black/non-white colors, and violation detection; `/heatmap`, `/sunburst`, and `/chord` return their shapes; `/events` opens with the `connected` status; a file change produces the debounce log and `ready` SSE event; and an unknown route returns 404.

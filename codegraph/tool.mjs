@@ -19,8 +19,16 @@ const profile = profileAt >= 0 ? path.resolve(args[profileAt + 1]) : undefined
 const command = args[0]
 let engine = null
 if (command !== 'daemon') {
-  const { CodeGraphEngine } = await import('./tool-engine.mjs')
-  engine = new CodeGraphEngine(root, { profile })
+  const { connectQueryDaemon } = await import('./query-daemon.mjs')
+  const client = await connectQueryDaemon(root)
+  engine = {
+    build: () => client.request('build', { root, profile }),
+    incremental: events => client.request('incremental', { root, profile, events }),
+    reconcile: () => client.request('reconcile', { root, profile }),
+    query: (query, options) => client.query(query, options),
+    queryBatch: (query, options) => client.queryBatch(query, options),
+    dispose: () => client.close(),
+  }
 }
 let writeTail = Promise.resolve()
 const write = (record) => {
@@ -53,6 +61,7 @@ if (command === 'build') {
   const close = async () => { await daemon.close(); process.exit() }
   process.once('SIGINT', close); process.once('SIGTERM', close)
   await daemon.start()
+  daemon.onClose = error => process.exit(error ? 1 : 0)
   await new Promise(() => {})
 } else if (command === 'serve') {
   const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity })
@@ -78,6 +87,7 @@ if (command === 'build') {
   }
   for (const controller of active.values()) controller.abort()
   await Promise.allSettled([...active.keys()].map(async (id) => { while (active.has(id)) await new Promise((resolve) => setImmediate(resolve)) }))
+  await engine.dispose()
 } else {
   process.stderr.write('usage: tool.mjs build|incremental <events>|reconcile|query <request>|serve|daemon [--root path]\n'); process.exitCode = 1
 }

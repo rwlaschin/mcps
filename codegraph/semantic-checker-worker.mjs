@@ -23,6 +23,17 @@ let semanticStructuralWindow = 1
 const structuralPending = new Map()
 
 async function* structuralPartitions(context, sources, diagnostics) {
+  if (semanticStructuralWindow === 0) {
+    const { buildInternalGraph } = await import('./internal-graph.mjs')
+    context.deferStructuralGraph = true
+    context.preparedStructuralGraphs = new Map()
+    for (const [file, source] of sources) {
+      context.preparedStructuralGraphs.set(path.resolve(context.root, file), buildInternalGraph({ file, source, compilerOptions: context.project.getCompilerOptions() }))
+      diagnostics.structuralJobsDispatched += 1
+      yield [file, source]
+    }
+    return
+  }
   const iterator = sources.entries()
   const pending = new Map()
   const workers = new Set()
@@ -495,15 +506,16 @@ function advanceGeneration({ expectedGeneration, generation }) {
 
 let nextSemanticProfileId = 1
 export class SemanticCheckerWorker {
-  constructor() { this.worker = null; this.parserPool = null; this.profileId = nextSemanticProfileId++; this.nextId = 1; this.pending = new Map(); this.requestTail = Promise.resolve(); this.closed = false }
+  constructor(options = {}) { this.structuralCount = options.structuralCount; this.worker = null; this.parserPool = null; this.profileId = nextSemanticProfileId++; this.nextId = 1; this.pending = new Map(); this.requestTail = Promise.resolve(); this.closed = false }
   async #prepareParserPool(root) {
+    if (this.structuralCount === 0) return
     const { ParserApartmentPool } = await import('./parser-apartment-pool.mjs')
     if (this.closed) throw this.failure ?? new Error('semantic checker worker is disposed')
     if (this.parserPool && this.parserPool.root !== path.resolve(root)) { await this.parserPool.dispose(); this.parserPool = null }
     if (this.closed) throw this.failure ?? new Error('semantic checker worker is disposed')
     if (!this.parserPool) {
       const profileArgv = process.execArgv.filter((argument) => /^--(?:cpu|heap)-prof(?:$|-(?:dir|name)=)/.test(argument))
-      this.parserPool = new ParserApartmentPool(root, { baseExecArgv: deriveWorkerProfile(profileArgv, `structural-${this.profileId}`).execArgv, timeoutMs: profileArgv.length ? 0 : undefined })
+      this.parserPool = new ParserApartmentPool(root, { workerCount: this.structuralCount, baseExecArgv: deriveWorkerProfile(profileArgv, `structural-${this.profileId}`).execArgv, timeoutMs: profileArgv.length ? 0 : undefined })
       this.parserPool.workerCount = Math.max(1, this.parserPool.workerCount)
     }
   }
@@ -550,7 +562,7 @@ export class SemanticCheckerWorker {
       worker.ref()
       return new Promise((resolve, reject) => {
         this.pending.set(id, { resolve, reject, onProgress, pool: payload?.partitionPool, settled: false })
-        worker.postMessage({ id, type, payload, structuralWindow: this.parserPool?.workerCount ?? 1 })
+        worker.postMessage({ id, type, payload, structuralWindow: this.structuralCount === 0 ? 0 : this.parserPool?.workerCount ?? 1 })
       })
     }
     const result = this.requestTail.then(run, run)

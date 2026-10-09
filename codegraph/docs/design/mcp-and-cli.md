@@ -1,5 +1,5 @@
 ---
-modified: 2026-09-12
+modified: 2026-10-08
 dependencies:
   - parsing-and-resolution.md
   - storage-and-query.md
@@ -129,6 +129,12 @@ untrustworthy was the least likely to be seen (`cli.mjs:23-25`).
 entry point for the query daemon and the line-oriented `serve` protocol.
 
 ## Architecture
+
+### Daemon startup
+
+`query-daemon.mjs` uses the same authenticated loopback TCP endpoint (`127.0.0.1:37193`) on every platform. Startup diagnostics redirect the detached child's stderr to an exclusive temporary regular file; the parent closes its descriptor after spawning. Readiness failures include at most 8192 tail bytes and child exit/signal details in their message and cause. Authentication success or terminal failure removes the temporary pathname and diagnostic listeners; the child's inherited stderr descriptor stays valid until it exits. This limits captured error text and parent handles, not the child's total stderr disk writes.
+
+Token file/directory and symlink checks apply everywhere. POSIX systems additionally enforce UID and owner/group/other permission bits. Windows relies on the inherited ACL of the existing per-user temporary directory; the implementation does not inspect Windows ACLs.
 
 ```
 MCP client ──stdio JSON-RPC──> mcp.mjs
@@ -688,6 +694,8 @@ args }`, with `<field>Before/After/Delta` for `rss heapUsed heapTotal external a
   present and non-stale by the mtime test; no watcher and no persistent process remain.
 
 ## Tests
+
+- `test/platform-startup.test.mjs` covers displayed startup causes, spawn errors, child exit codes and signals, bounded error tails, parent descriptor and temporary-file cleanup, authenticated startup, singleton-loser success, and simulated Windows/POSIX credential handling. `test/query-daemon.test.mjs` preserves existing undefined-returning startup callbacks and daemon request behavior.
 
 Node's built-in runner (`npm test` → `node --test`). Performance tests run separately with
 `npm run performance`. Tests for this subsystem

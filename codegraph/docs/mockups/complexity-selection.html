@@ -1,0 +1,29 @@
+<!--
+---
+modified: 2026-10-08
+dependencies:
+  - ../design/visualizer.md
+---
+-->
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Complexity selected cell</title>
+<style>
+/* Tokens copied from visualizer.mjs :root (24–32). */
+:root { --bg:#0f172a; --text:#f8fafc; --muted:#94a3b8; --accent:#38bdf8; }
+body { background:var(--bg); color:var(--text); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; margin:24px; }
+section { margin-bottom:24px; } h1 { font-size:18px; } h2 { font-size:14px; } p { font-size:12px; color:var(--muted); }
+svg { width:240px; height:96px; overflow:visible; }
+.selection { fill:none; stroke:var(--accent); stroke-width:2; vector-effect:non-scaling-stroke; pointer-events:none; }
+</style>
+<h1>Complexity selected cell</h1>
+<section><h2>Unselected</h2><svg viewBox="0 0 120 48" aria-label="Unselected complexity cells"><path d="M0 0h40v48h-40Z M40 0h40v48h-40Z M80 0h40v48h-40Z" fill="var(--muted)" stroke="var(--bg)" stroke-width=".5"/></svg><p>Hover or click a cell to inspect its function.</p></section>
+<section><h2>Selected</h2><svg viewBox="0 0 120 48" aria-label="Middle complexity cell selected"><path d="M0 0h40v48h-40Z M40 0h40v48h-40Z M80 0h40v48h-40Z" fill="var(--muted)" stroke="var(--bg)" stroke-width=".5"/><rect class="selection" x="40" y="0" width="40" height="48"/></svg><p>The border identifies the function shown in the existing inspector.</p></section>
+<section><h2>Selected while filtered</h2><svg viewBox="0 0 120 48" aria-label="Filtered cells with selection retained"><path d="M0 0h40v48h-40Z M40 0h40v48h-40Z M80 0h40v48h-40Z" fill="var(--muted)" opacity=".06" stroke="var(--bg)" stroke-width=".5"/><rect class="selection" x="40" y="0" width="40" height="48"/></svg><p>The selected border remains visible; filtering does not change geometry.</p></section>
+<section><h2>Detail loading</h2><p>Loading internal control flow...</p><p>The selected border stays visible while the inspector loads.</p></section>
+<section><h2>Detail error</h2><p>Internal map unavailable: Failed to fetch</p><p>The selected border stays visible because selection succeeded.</p></section>
+<section><h2>Empty or refreshed data</h2><p>No selected border until a represented function is selected.</p></section>
+<p>Spec only: cell fills above use the existing muted token to isolate selection; production complexity colors remain unchanged. No shared shell or new control is introduced. Pan and zoom transform the border with its cell; the stroke stays 2 screen pixels.</p>
+</html>

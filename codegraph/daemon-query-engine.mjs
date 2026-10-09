@@ -133,6 +133,7 @@ export class DaemonQueryEngine {
     if (acquired) {
       try {
         const method = request.type === 'internal-summaries' ? 'summaries' : request.operation
+        if (method === 'details' && typeof acquired.value[method] !== 'function') throw new Error('unsupported internals operation: details')
         const rows = acquired.value[method]?.(request, options) ?? []
         return { metadata: { revision: null, freshness: 'validated', coverage: 'calls', internalCoverage: 'syntax-and-cfg', validatedGeneration: generation }, graph: null, rows }
       } finally { acquired.release() }
@@ -157,6 +158,24 @@ export class DaemonQueryEngine {
     const id = manifest.internalPartitions?.[request.file]
     if (!id) throw new Error(`no internal partition for ${request.file}; rebuild the index`)
     const view = openInternalPartition(store.readInternalPartition(id))
+    if (request.operation === 'details') {
+      if (!request.owner) throw new Error('details requires an owner selector')
+      const owners = request.owner.id !== undefined ? [view.ownerAt(request.owner.id)].filter(Boolean) : [...view.owners()]
+      const owner = resolveOwner(owners, request.owner)
+      let forLoops = 0
+      let functionCalls = 0
+      const targets = new Set()
+      for (const node of view.nodes(owner.id)) {
+        if (options.signal?.aborted) throw options.signal.reason ?? new Error('internal query aborted')
+        if (node.flags & 1) forLoops++
+      }
+      for (const relation of view.relations(owner.id)) {
+        if (options.signal?.aborted) throw options.signal.reason ?? new Error('internal query aborted')
+        if (relation.kind === 'call') { functionCalls++; targets.add(relation.targetSymbolId) }
+      }
+      const rows = [{ record: 'details', ownerId: owner.id, forLoops, functionCalls, targetSymbolIds: [...targets] }]
+      return { metadata: { revision: null, freshness: 'validated', coverage: manifest.edgeCoverage ?? 'calls', internalCoverage: 'syntax-and-cfg', validatedGeneration: generation }, graph: null, rows }
+    }
     const cap = Math.min(request.limit ?? 2000, 2000)
     const collect = (rows, label, countTowardsLimit = true) => {
       const result = []

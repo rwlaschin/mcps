@@ -247,6 +247,39 @@ export const TIER_LAYER_OFFSET = {
   db: 5,
 }
 
+const rankedSymbolIds = (symbols, degrees) => {
+  const inDegreeValues = []
+  for (let i = 0; i < symbols.length; i++) {
+    if (degrees[i] > 0) inDegreeValues.push(degrees[i])
+  }
+  inDegreeValues.sort((a, b) => b - a)
+  const top10Threshold = inDegreeValues.length > 0 ? inDegreeValues[Math.max(0, Math.floor(inDegreeValues.length * 0.1))] : 2
+
+  const ids = new Set()
+  for (let i = 0; i < symbols.length; i++) {
+    if (degrees[i] > 0 && degrees[i] >= top10Threshold) ids.add(symbols[i].id)
+  }
+  return ids
+}
+
+export const mostCalledSymbolIds = (rawGraph, options = {}) => {
+  const symbols = filterSymbols(rawGraph?.symbols, options)
+  const idToIdx = new Map()
+  for (let i = 0; i < symbols.length; i++) idToIdx.set(symbols[i].id, i)
+  const degrees = new Int32Array(symbols.length)
+  const edgeSet = new Set()
+  for (const edge of rawGraph?.edges || []) {
+    if (!edge || !idToIdx.has(edge.from) || !idToIdx.has(edge.to)) continue
+    const u = idToIdx.get(edge.from)
+    const v = idToIdx.get(edge.to)
+    const edgeKey = u * 1000000 + v
+    if (edgeSet.has(edgeKey)) continue
+    edgeSet.add(edgeKey)
+    degrees[v]++
+  }
+  return rankedSymbolIds(symbols, degrees)
+}
+
 export const buildLayeredGraph = (rawGraph, options = {}) => {
   const rawSymbols = Array.isArray(rawGraph?.symbols) ? rawGraph.symbols : []
   const rawEdges = Array.isArray(rawGraph?.edges) ? rawGraph.edges : []
@@ -334,12 +367,7 @@ export const buildLayeredGraph = (rawGraph, options = {}) => {
     }
   }
 
-  const inDegreeValues = []
-  for (let i = 0; i < count; i++) {
-    if (inDegArr[i] > 0) inDegreeValues.push(inDegArr[i])
-  }
-  inDegreeValues.sort((a, b) => b - a)
-  const top10Threshold = inDegreeValues.length > 0 ? inDegreeValues[Math.max(0, Math.floor(inDegreeValues.length * 0.1))] : 2
+  const mostCalledIds = rankedSymbolIds(validSymbols, inDegArr)
 
   const nodes = new Array(count)
   for (let i = 0; i < count; i++) {
@@ -355,7 +383,7 @@ export const buildLayeredGraph = (rawGraph, options = {}) => {
       outDegree: outDeg,
       connections: inDeg + outDeg,
       isOrphan: inDeg === 0 && outDeg === 0,
-      isMostCalled: inDeg > 0 && inDeg >= top10Threshold,
+      isMostCalled: mostCalledIds.has(sym.id),
       color: COLOR_PALETTE[((i * 47) % 360 + 360) % 360],
     }
   }
@@ -386,6 +414,7 @@ export const buildHeatmapData = (rawGraph, options = {}) => {
   const rawEdges = Array.isArray(rawGraph?.edges) ? rawGraph.edges : []
 
   const validSymbols = filterSymbols(rawSymbols, options)
+  const mostCalledIds = mostCalledSymbolIds(rawGraph, options)
   const validIds = new Set(validSymbols.map((s) => s.id))
   const validEdges = rawEdges.filter((e) => e && validIds.has(e.from) && validIds.has(e.to))
 
@@ -511,15 +540,12 @@ export const buildHeatmapData = (rawGraph, options = {}) => {
     }
   }
 
-  const allCalls = fileList.map(f => f.totalInCalls).filter(c => c > 0).sort((a, b) => b - a)
-  const top15Threshold = allCalls.length > 0 ? allCalls[Math.max(0, Math.floor(allCalls.length * 0.15))] : 2
-
   for (let i = 0; i < fileList.length; i++) {
     const f = fileList[i]
     const heat = maxFileCalls > 0 ? (f.totalInCalls / maxFileCalls) : 0
     f.heat = heat
     f.color = heatColorFor(heat)
-    f.isMostCalled = heat >= 0.4 || (f.totalInCalls >= top15Threshold && f.totalInCalls > 0)
+    f.isMostCalled = f.symbols.some(symbol => mostCalledIds.has(symbol.id))
     f.isOrphan = f.totalInCalls === 0
     f.hasViolation = violationFiles.has(f.file)
   }
@@ -678,6 +704,7 @@ export const buildSunburstData = (rawGraph, options = {}) => {
   const rawSymbols = Array.isArray(rawGraph?.symbols) ? rawGraph.symbols : []
   const rawEdges = Array.isArray(rawGraph?.edges) ? rawGraph.edges : []
   const symbols = filterSymbols(rawSymbols, options)
+  const mostCalledIds = mostCalledSymbolIds(rawGraph, options)
 
   if (symbols.length === 0) {
     return { nodes: [], root: null, maxDepth: 0 }
@@ -755,6 +782,7 @@ export const buildSunburstData = (rawGraph, options = {}) => {
     const symObj = {
       ...s,
       calls,
+      isMostCalled: mostCalledIds.has(s.id),
       value: 1 + calls,
     }
 
@@ -800,6 +828,7 @@ export const buildSunburstData = (rawGraph, options = {}) => {
   function computeTotalsAndDepth(node, currentDepth = 0) {
     let val = 0
     let calls = 0
+    let isMostCalled = false
     let maxD = currentDepth
 
     for (const file of node.files.values()) {
@@ -810,7 +839,9 @@ export const buildSunburstData = (rawGraph, options = {}) => {
         fCalls += sym.calls
       }
       file.value = fVal
+      file.isMostCalled = file.symbols.some(sym => sym.isMostCalled)
       file.calls = fCalls
+      if (file.isMostCalled) isMostCalled = true
       val += fVal
       calls += fCalls
       maxD = Math.max(maxD, currentDepth + 2) // +1 for file ring, +1 for symbol ring
@@ -820,9 +851,11 @@ export const buildSunburstData = (rawGraph, options = {}) => {
       const childD = computeTotalsAndDepth(child, currentDepth + 1)
       val += child.value
       calls += child.calls
+      if (child.isMostCalled) isMostCalled = true
       maxD = Math.max(maxD, childD)
     }
 
+    node.isMostCalled = isMostCalled
     node.value = val
     node.calls = calls
     return maxD
@@ -864,7 +897,7 @@ export const buildSunburstData = (rawGraph, options = {}) => {
     value: rootValue,
     color: "#0f172a",
     calls: rootNode.calls,
-    isMostCalled: true,
+    isMostCalled: rootNode.isMostCalled,
     isOrphan: false,
     hasViolation: false,
     d: describeArc(cx, cy, 0, centerRadius, 0, 2 * Math.PI),
@@ -907,7 +940,7 @@ export const buildSunburstData = (rawGraph, options = {}) => {
         value: child.value,
         calls: child.calls,
         color: childColor,
-        isMostCalled: child.calls > 5,
+        isMostCalled: child.isMostCalled,
         isOrphan: child.calls === 0,
         hasViolation: false,
         d: describeArc(cx, cy, r0, r1, ca0, ca1),
@@ -948,7 +981,7 @@ export const buildSunburstData = (rawGraph, options = {}) => {
         calls: file.calls,
         color: fileColor,
         symbolsCount: file.symbols.length,
-        isMostCalled: file.calls > 5,
+        isMostCalled: file.isMostCalled,
         isOrphan: file.calls === 0,
         hasViolation: false,
         d: describeArc(cx, cy, r0, r1, fa0, fa1),
@@ -984,7 +1017,7 @@ export const buildSunburstData = (rawGraph, options = {}) => {
             value: remVal,
             calls: remCalls,
             color: remColor,
-            isMostCalled: remCalls > 5,
+            isMostCalled: remaining.some(sym => sym.isMostCalled),
             isOrphan: remCalls === 0,
             hasViolation: false,
             d: describeArc(cx, cy, symR0, symR1, symCurrentAngle, fa1),
@@ -1014,7 +1047,7 @@ export const buildSunburstData = (rawGraph, options = {}) => {
           calls: sym.calls,
           value: sym.value,
           color: symColor,
-          isMostCalled: sym.calls > 5,
+          isMostCalled: sym.isMostCalled,
           isOrphan: sym.calls === 0,
           hasViolation: false,
           d: describeArc(cx, cy, symR0, symR1, sa0, sa1),
@@ -1037,12 +1070,15 @@ export const buildChordData = (rawGraph, options = {}) => {
   const rawSymbols = Array.isArray(rawGraph?.symbols) ? rawGraph.symbols : []
   const rawEdges = Array.isArray(rawGraph?.edges) ? rawGraph.edges : []
   const symbols = filterSymbols(rawSymbols, options)
+  const mostCalledIds = mostCalledSymbolIds(rawGraph, options)
+  const mostCalledModules = new Set()
 
   const symToModule = new Map()
   const moduleSet = new Set()
   for (let i = 0; i < symbols.length; i++) {
     const s = symbols[i]
     const mod = moduleOf(s.file)
+    if (mostCalledIds.has(s.id)) mostCalledModules.add(mod)
     symToModule.set(s.id, mod)
     moduleSet.add(mod)
   }
@@ -1086,7 +1122,6 @@ export const buildChordData = (rawGraph, options = {}) => {
 
   const TIER_ORDER_VAL = { ui: 0, hook: 1, request: 2, api: 3, service: 4, db: 5, util: 6 }
   const modTiers = moduleNames.map(m => TIER_ORDER_VAL[classifyArchitecturalTier(m)] ?? 3)
-  const avgFlow = totalCalls > 0 ? (totalCalls / modCount) : 0
 
   const modules = []
   const modAngles = new Array(modCount)
@@ -1105,7 +1140,7 @@ export const buildChordData = (rawGraph, options = {}) => {
     let rawSum = 0
     for (let j = 0; j < modCount; j++) rawSum += matrix[i][j] + matrix[j][i]
     const isOrphan = rawSum === 0
-    const isMostCalled = modFlow[i] >= avgFlow && rawSum > 0
+    const isMostCalled = mostCalledModules.has(modName)
 
     modules.push({
       id: "mod:" + modName,
@@ -1224,6 +1259,7 @@ export const buildCallTreeData = (summary = {}, options = {}) => {
     ...owner,
     id: owner.symbolId,
     depth: distances.get(owner.symbolId),
+    isMostCalled: options.mostCalledIds?.has(owner.symbolId) ?? false,
     area: 1 + (owner.incomingCallCount ?? 0) + (owner.outgoingCallCount ?? 0),
     color: complexityColorFor(owner.cyclomatic ?? owner.complexity ?? 1),
   }))
@@ -1269,6 +1305,7 @@ export const buildComplexityData = (owners = [], options = {}) => {
     allFunctions.push({
         ownerId: owner.ownerId ?? owner.id,
         symbolId: owner.symbolId,
+        isMostCalled: options.mostCalledIds?.has(owner.symbolId) ?? false,
         id: owner.symbolId ?? `${owner.file}:${owner.ownerId ?? owner.id ?? owner.start ?? 0}`,
         name: owner.name,
         file: owner.file,

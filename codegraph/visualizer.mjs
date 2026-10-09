@@ -1,10 +1,11 @@
 #!/usr/bin/env node
+import { EventEmitter } from 'node:events'
 import fs from 'node:fs'
 import http from 'node:http'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { streamQuery } from './query-client.mjs'
-import { QUERY_VIEW_CACHE_FILE } from './query-cache-schema.mjs'
-import { buildLayeredGraph, buildHeatmapData, buildSunburstData, buildChordData, buildCallTreeData, buildComplexityData, layoutCallTree } from './visualizer-graph.mjs'
+import { buildLayeredGraph, buildHeatmapData, buildSunburstData, buildChordData, buildCallTreeData, buildComplexityData, mostCalledSymbolIds, layoutCallTree } from './visualizer-graph.mjs'
 
 const args = process.argv.slice(2)
 const rootAt = args.indexOf('--root')
@@ -357,6 +358,9 @@ const page = `<!doctype html>
     }
     .node-card { cursor: pointer; }
     .node-card rect { rx: 5; stroke-width: 1.2; }
+    g[data-summary-index] { outline: none; }
+    g[data-summary-index]:focus-visible > rect { stroke: var(--accent); stroke-width: 2; }
+    #canvas > g[role="grid"] { outline: none; }
     .edge-path { opacity: 0; pointer-events: none; fill: none; stroke: var(--accent); stroke-width: 1.5; marker-end: url(#arrow); cursor: pointer; }
     .edge-path.highlighted { opacity: 1 !important; pointer-events: auto !important; stroke: var(--accent) !important; stroke-width: 1.5 !important; }
     .edge-path.violation { stroke: #f43f5e !important; stroke-dasharray: 4, 3; stroke-width: 1.5 !important; marker-end: url(#arrow-danger); }
@@ -702,6 +706,17 @@ const page = `<!doctype html>
     const progress = document.getElementById("progress");
 
     function selectSummaryItem(item, mode, pushHistory = true) {
+      if (mode === "complexity") {
+        if (summaryItems[pinnedComplexityIndex] !== item) pinnedComplexityIndex = summaryItems.indexOf(item);
+        const marker = canvas.querySelector("#complexity-selection");
+        if (marker) {
+          marker.style.display = pinnedComplexityIndex >= 0 ? "" : "none";
+          if (pinnedComplexityIndex >= 0) {
+            marker.setAttribute("x", item.x); marker.setAttribute("y", item.y);
+            marker.setAttribute("width", item.width); marker.setAttribute("height", item.height);
+          }
+        }
+      }
       const details = document.getElementById("selection-details");
       details.textContent = "Loading internal control flow...";
       if (pushHistory && selectionHistory.at(-1)?.item !== item) selectionHistory.push({ item, mode });
@@ -712,9 +727,8 @@ const page = `<!doctype html>
         .then(data => {
           if (requestVersion !== selectionVersion) return;
           const records = data.records || [];
-          const nodes = records.filter(record => record.record === "node").map(record => record.node);
-          const forLoops = records.filter(record => record.record === "node" && record.node.flags & 1).length;
-          const calls = records.filter(record => record.record === "relation" && record.relation.kind === "call").map(record => record.relation);
+          const selectedDetails = records.find(record => record.record === "details");
+          const { forLoops, functionCalls, targetSymbolIds } = selectedDetails;
           const field = value => { const wrapper = document.createElement("div"); wrapper.className = "node-detail-field"; const label = document.createElement("div"); label.className = "node-detail-label"; const content = document.createElement("div"); content.className = "node-detail-val"; content.textContent = value; wrapper.append(label, content); return wrapper; };
           const filename = field(item.file || "unknown"); filename.firstChild.textContent = "Filename";
           const functionName = field((item.name || "anonymous") + ":" + (item.line ?? "?")); functionName.firstChild.textContent = "Function name:line";
@@ -725,22 +739,19 @@ const page = `<!doctype html>
           const contents = document.createElement("div"); contents.className = "node-detail-field";
           const contentsLabel = document.createElement("div"); contentsLabel.className = "node-detail-label"; contentsLabel.textContent = "What's in there";
           const loopCount = field(forLoops); loopCount.firstChild.textContent = "For loops";
-          const callCount = field(calls.length); callCount.firstChild.textContent = "Function calls";
+          const callCount = field(functionCalls); callCount.firstChild.textContent = "Function calls";
           const contentsGrid = document.createElement("div"); contentsGrid.className = "complexity-contents-grid"; contentsGrid.append(loopCount, callCount);
           contents.append(contentsLabel, contentsGrid);
           const navigation = document.createElement("div"); navigation.className = "node-detail-field";
           if (selectionHistory.length > 1) { const previous = selectionHistory.at(-2).item; const back = document.createElement("button"); back.className = "sidebar-item-link"; back.textContent = "← Back to " + (previous.name || "anonymous") + ":" + (previous.line ?? "?"); back.onclick = () => { selectionHistory.pop(); const previous = selectionHistory.at(-1); if (previous) selectSummaryItem(previous.item, previous.mode, false); }; navigation.appendChild(back); }
           const calledHeading = document.createElement("div"); calledHeading.className = "node-detail-label"; navigation.appendChild(calledHeading);
-          const seenTargets = new Set();
-          for (const call of calls) {
-            if (seenTargets.has(call.targetSymbolId)) continue;
-            seenTargets.add(call.targetSymbolId);
-            const target = summaryTargetMap.get(String(call.targetSymbolId));
-            if (target) { const button = document.createElement("button"); button.className = "sidebar-item-link complexity-call-link"; const name = document.createElement("span"); name.textContent = (target.name || call.targetSymbolId) + ":" + (target.line ?? "?"); button.appendChild(name); if (target.file) { const file = document.createElement("span"); file.className = "node-detail-label"; file.textContent = target.file; button.appendChild(file); } button.title = target.symbolId || call.targetSymbolId; button.onclick = () => selectSummaryItem(target, mode); navigation.appendChild(button); }
-            else { const unavailable = document.createElement("span"); unavailable.className = "unavailable-target muted"; unavailable.textContent = call.targetSymbolId + " (unavailable)"; unavailable.title = call.targetSymbolId; navigation.appendChild(unavailable); }
+          for (const targetSymbolId of targetSymbolIds) {
+            const target = summaryTargetMap.get(String(targetSymbolId));
+            if (target) { const button = document.createElement("button"); button.className = "sidebar-item-link complexity-call-link"; const name = document.createElement("span"); name.textContent = (target.name || targetSymbolId) + ":" + (target.line ?? "?"); button.appendChild(name); if (target.file) { const file = document.createElement("span"); file.className = "node-detail-label"; file.textContent = target.file; button.appendChild(file); } button.title = target.symbolId || targetSymbolId; button.onclick = () => selectSummaryItem(target, mode); navigation.appendChild(button); }
+            else { const unavailable = document.createElement("span"); unavailable.className = "unavailable-target muted"; unavailable.textContent = targetSymbolId + " (unavailable)"; unavailable.title = targetSymbolId; navigation.appendChild(unavailable); }
           }
-          calledHeading.dataset.totalCalls = calls.length; calledHeading.textContent = "Called functions (" + seenTargets.size + ")";
-          if (!seenTargets.size) { const empty = document.createElement("span"); empty.className = "node-detail-val"; empty.textContent = "No internal function calls"; navigation.appendChild(empty); }
+          calledHeading.dataset.totalCalls = functionCalls; calledHeading.textContent = "Called functions (" + targetSymbolIds.length + ")";
+          if (!targetSymbolIds.length) { const empty = document.createElement("span"); empty.className = "node-detail-val"; empty.textContent = "No internal function calls"; navigation.appendChild(empty); }
           details.replaceChildren(filename, functionName, metrics, contents, navigation);
         })
         .catch(err => { if (requestVersion === selectionVersion) details.textContent = "Internal map unavailable: " + err.message; });
@@ -784,11 +795,108 @@ const page = `<!doctype html>
     const NODE_HEIGHT = 44;
     const NODE_SPACING_X = 216;
     const PADDING_X = 120;
+    let layeredRows = [];
+    let layeredNodeGroup = null;
+    let layeredDecorations = null;
+    let layeredHeaders = [];
+    let layeredVisibleNodeIds = new Set();
+    let layeredSelectedIds = new Set();
+
+    function reconcileLayeredViewport() {
+      if (currentView !== "layered" || !layeredNodeGroup || layeredNodeGroup.parentNode !== canvas) return;
+      const left = -transform.x / transform.k - NODE_SPACING_X;
+      const right = (svg.clientWidth - transform.x) / transform.k + NODE_SPACING_X;
+      const top = -transform.y / transform.k - NODE_SPACING_X;
+      const bottom = (svg.clientHeight - transform.y) / transform.k + NODE_SPACING_X;
+      let lo = 0, hi = layeredRows.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >>> 1;
+        if (layeredRows[mid].band.y + layeredRows[mid].band.height < top) lo = mid + 1;
+        else hi = mid;
+      }
+      const firstColumn = Math.max(0, Math.ceil((left - PADDING_X - NODE_WIDTH) / NODE_SPACING_X));
+      const lastColumn = Math.floor((right - PADDING_X) / NODE_SPACING_X);
+      const wanted = new Set();
+      for (let rowIndex = lo; rowIndex < layeredRows.length && layeredRows[rowIndex].band.y <= bottom; rowIndex++) {
+        const row = layeredRows[rowIndex];
+        const band = row.band;
+        const x1 = band.x + band.width, y1 = band.y + band.height;
+        const clippedLeft = Math.max(left, band.x), clippedRight = Math.min(right, x1);
+        const clippedTop = Math.max(top, band.y), clippedBottom = Math.min(bottom, y1);
+        if (clippedLeft <= clippedRight && clippedTop <= clippedBottom) {
+          if (!band.group) {
+            band.group = document.createElementNS("http://www.w3.org/2000/svg", "g");
+            band.group.setAttribute("class", "layer-decoration"); band.group.setAttribute("pointer-events", "none");
+            band.group.dataset.rowIndex = rowIndex;
+            const fill = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+            fill.setAttribute("class", "layer-band"); fill.setAttribute("stroke", "none"); fill.style.stroke = "none";
+            band.group.appendChild(fill);
+            for (let edge = 0; edge < 4; edge++) {
+              const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+              path.setAttribute("class", "layer-band"); path.setAttribute("fill", "none"); path.style.fill = "none";
+              band.group.appendChild(path);
+            }
+            layeredDecorations.appendChild(band.group);
+          }
+          const fill = band.group.children[0];
+          fill.setAttribute("x", clippedLeft); fill.setAttribute("y", clippedTop);
+          fill.setAttribute("width", clippedRight - clippedLeft); fill.setAttribute("height", clippedBottom - clippedTop);
+          const topEdge = band.group.children[1], rightEdge = band.group.children[2], bottomEdge = band.group.children[3], leftEdge = band.group.children[4];
+          topEdge.style.display = band.y >= top && band.y <= bottom ? "" : "none";
+          topEdge.setAttribute("d", "M" + clippedLeft + "," + band.y + "L" + clippedRight + "," + band.y);
+          topEdge.setAttribute("stroke-dashoffset", (clippedLeft - band.x) % 4);
+          rightEdge.style.display = x1 >= left && x1 <= right ? "" : "none";
+          rightEdge.setAttribute("d", "M" + x1 + "," + clippedTop + "L" + x1 + "," + clippedBottom);
+          rightEdge.setAttribute("stroke-dashoffset", (band.width + clippedTop - band.y) % 4);
+          bottomEdge.style.display = y1 >= top && y1 <= bottom ? "" : "none";
+          bottomEdge.setAttribute("d", "M" + clippedRight + "," + y1 + "L" + clippedLeft + "," + y1);
+          bottomEdge.setAttribute("stroke-dashoffset", (band.width + band.height + x1 - clippedRight) % 4);
+          leftEdge.style.display = band.x >= left && band.x <= right ? "" : "none";
+          leftEdge.setAttribute("d", "M" + band.x + "," + clippedBottom + "L" + band.x + "," + clippedTop);
+          leftEdge.setAttribute("stroke-dashoffset", (2 * band.width + band.height + y1 - clippedBottom) % 4);
+        }
+        if (row.y + NODE_HEIGHT < top || row.y > bottom) continue;
+        const end = Math.min(row.nodes.length - 1, lastColumn);
+        for (let column = firstColumn; column <= end; column++) {
+          const node = row.nodes[column];
+          wanted.add(node.id);
+          let card = nodeElements.get(node.id);
+          if (!card) {
+            card = createLayeredCard(node);
+            nodeElements.set(node.id, card);
+            layeredNodeGroup.appendChild(card);
+          }
+          card.style.display = layeredVisibleNodeIds.has(node.id) ? "block" : "none";
+          if (layeredSelectedIds.has(node.id)) card.classList.add("highlighted");
+          else card.classList.remove("highlighted");
+        }
+      }
+      for (let index = layeredDecorations.children.length - 1; index >= 0; index--) {
+        const group = layeredDecorations.children[index];
+        const band = layeredRows[Number(group.dataset.rowIndex)].band;
+        if (band.y + band.height < top || band.y > bottom || band.x + band.width < left || band.x > right) {
+          group.remove(); band.group = null;
+        }
+      }
+      for (const header of layeredHeaders) {
+        const clippedLeft = Math.max(left, header.x1), clippedRight = Math.min(right, header.x2);
+        header.line.style.display = header.y >= top && header.y <= bottom && clippedLeft <= clippedRight ? "" : "none";
+        header.line.setAttribute("x1", clippedLeft); header.line.setAttribute("x2", clippedRight);
+      }
+      for (const [id, card] of nodeElements) {
+        if (!wanted.has(id)) { card.remove(); nodeElements.delete(id); }
+      }
+    }
+
+    window.addEventListener("resize", () => {
+      if (currentView === "layered") scheduleTransform();
+    });
 
     function scheduleTransform() {
       if (!rafPending) {
         rafPending = true;
         requestAnimationFrame(() => {
+          reconcileLayeredViewport();
           canvas.setAttribute("transform", "translate(" + transform.x + ", " + transform.y + ") scale(" + transform.k + ")");
           rafPending = false;
         });
@@ -1063,6 +1171,16 @@ const page = `<!doctype html>
       const isChord = currentView === "chord";
       const isCalltree = currentView === "calltree";
       const isComplexity = currentView === "complexity";
+      const filterButtons = document.querySelectorAll(".filter-btn");
+      filterButtons.forEach(button => {
+        const hidden = ((isCalltree || isComplexity) && (button.dataset.filter === "orphans" || button.dataset.filter === "violations")) || (isSunburst && button.dataset.filter === "violations");
+        button.style.display = hidden ? "none" : "";
+        if (hidden && currentFilter === button.dataset.filter) currentFilter = "all";
+      });
+      filterButtons.forEach(button => {
+        if (button.dataset.filter === currentFilter) button.classList.add("active");
+        else button.classList.remove("active");
+      });
 
       document.getElementById("stats-layered").style.display = isLayered ? "flex" : "none";
       document.getElementById("stats-heatmap").style.display = isHeatmap ? "flex" : "none";
@@ -1190,6 +1308,7 @@ const page = `<!doctype html>
     }
 
     function renderSummaryCards(items, mode) {
+      if (layeredNodeGroup) { layeredNodeGroup = null; layeredRows = []; layeredDecorations = null; layeredHeaders = []; nodeElements.clear(); activeHighlighted = []; }
       canvas.innerHTML = "";
       canvas.onmouseover = null; canvas.onmouseout = null; canvas.onpointermove = null; canvas.onpointerleave = null; canvas.onclick = null;
       summaryItems = items;
@@ -1203,6 +1322,12 @@ const page = `<!doctype html>
       }
       const calltreeLayout = mode === "calltree" ? layoutCallTree(items, calltreeData?.edges || []) : null;
       const positionFor = (item, index) => calltreeLayout?.positions.get(item.id) || ({ x: (index % 5) * 220 + 30, y: Math.floor(index / 5) * 72 + 90 });
+      const defs = document.createElementNS("http://www.w3.org/2000/svg", "defs");
+      const clip = document.createElementNS("http://www.w3.org/2000/svg", "clipPath");
+      clip.setAttribute("id", "summary-text-clip"); clip.setAttribute("clipPathUnits", "userSpaceOnUse");
+      const clipRect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+      clipRect.setAttribute("x", "0"); clipRect.setAttribute("y", "0"); clipRect.setAttribute("width", "180"); clipRect.setAttribute("height", "48");
+      clip.appendChild(clipRect); defs.appendChild(clip); canvas.appendChild(defs);
       if (mode === "calltree") {
         const edgeLayer = document.createElementNS("http://www.w3.org/2000/svg", "g");
         edgeLayer.setAttribute("fill", "none"); edgeLayer.setAttribute("stroke", "#64748b"); edgeLayer.setAttribute("stroke-width", "2");
@@ -1222,32 +1347,41 @@ const page = `<!doctype html>
         rect.setAttribute("fill", item.color); rect.setAttribute("opacity", ".82");
         const label = document.createElementNS("http://www.w3.org/2000/svg", "text");
         const fullName = item.name || "anonymous"; const fullMetric = "Complexity " + (item.cyclomatic ?? item.complexity ?? 1) + " · " + (item.file || "");
-        label.setAttribute("x", x + 10); label.setAttribute("y", y + 21); label.setAttribute("fill", "#f8fafc"); label.textContent = fullName.length > 28 ? fullName.slice(0, 27) + "…" : fullName;
+        label.setAttribute("x", "0"); label.setAttribute("y", "21"); label.setAttribute("fill", "#f8fafc"); label.textContent = fullName.length > 28 ? fullName.slice(0, 27) + "…" : fullName;
         const metric = document.createElementNS("http://www.w3.org/2000/svg", "text");
-        metric.setAttribute("x", x + 10); metric.setAttribute("y", y + 38); metric.setAttribute("fill", "#e2e8f0"); metric.setAttribute("font-size", "10");
+        metric.setAttribute("x", "0"); metric.setAttribute("y", "38"); metric.setAttribute("fill", "#e2e8f0"); metric.setAttribute("font-size", "10");
         metric.textContent = fullMetric.length > 46 ? fullMetric.slice(0, 45) + "…" : fullMetric;
         const title = document.createElementNS("http://www.w3.org/2000/svg", "title"); title.textContent = fullName + " — " + fullMetric;
         group.appendChild(title);
-        group.append(rect, label, metric); canvas.appendChild(group);
+        const textRows = document.createElementNS("http://www.w3.org/2000/svg", "g");
+        textRows.setAttribute("transform", "translate(" + (x + 10) + "," + y + ")");
+        textRows.setAttribute("clip-path", "url(#summary-text-clip)");
+        textRows.append(label, metric);
+        group.append(rect, textRows); canvas.appendChild(group);
       });
+      applyFilter();
       centerView();
     }
 
     function renderCalltree() { renderSummaryCards(calltreeData?.nodes || [], "calltree"); }
     function renderComplexity() {
+      if (layeredNodeGroup) { layeredNodeGroup = null; layeredRows = []; layeredDecorations = null; layeredHeaders = []; nodeElements.clear(); activeHighlighted = []; }
       canvas.innerHTML = ""; summaryItems = complexityData?.functions || []; summaryMode = "complexity"; pinnedComplexityIndex = -1; hoveredComplexityIndex = -1;
       summaryTargetMap = new Map(summaryItems.filter(item => item.symbolId != null).map(item => [String(item.symbolId), item]));
       const cells = document.createElementNS("http://www.w3.org/2000/svg", "g");
       cells.setAttribute("tabindex", "0"); cells.setAttribute("role", "grid"); cells.setAttribute("aria-label", "Function complexity heatmap");
-      const paths = new Map();
-      for (const item of summaryItems) paths.set(item.color, (paths.get(item.color) || "") + "M" + item.x + "," + item.y + "h" + item.width + "v" + item.height + "h-" + item.width + "Z");
-      for (const [color, d] of paths) { const path = document.createElementNS("http://www.w3.org/2000/svg", "path"); path.setAttribute("d", d); path.setAttribute("fill", color); path.setAttribute("stroke", "#0f172a"); path.setAttribute("stroke-width", ".5"); cells.appendChild(path); }
       canvas.appendChild(cells);
+      const marker = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+      marker.setAttribute("id", "complexity-selection"); marker.setAttribute("fill", "none");
+      marker.setAttribute("stroke", "var(--accent)"); marker.setAttribute("stroke-width", "2");
+      marker.setAttribute("vector-effect", "non-scaling-stroke"); marker.setAttribute("pointer-events", "none");
+      marker.style.display = "none"; canvas.appendChild(marker);
       const preview = item => { const details = document.getElementById("selection-details"); const heading = document.createElement("strong"); heading.textContent = item.name || "anonymous"; const summary = document.createElement("div"); summary.className = "node-detail-val"; summary.textContent = "Cyclomatic " + item.complexity + " · Branches " + (item.branchCount ?? 0) + " · Nesting " + (item.nestingDepth ?? 0) + " · " + item.file; details.replaceChildren(heading, summary); };
       const cellAt = event => { if (!summaryItems.length) return -1; const bounds = cells.getBoundingClientRect(); const columns = complexityData?.columns || 1; const rows = complexityData?.rows || 1; const column = Math.floor((event.clientX - bounds.left) / bounds.width * columns); const row = Math.floor((event.clientY - bounds.top) / bounds.height * rows); const index = row * columns + column; return column < 0 || column >= columns || row < 0 || row >= rows || index >= summaryItems.length ? -1 : index; };
       canvas.onpointermove = event => { if (pinnedComplexityIndex >= 0) return; hoveredComplexityIndex = cellAt(event); if (hoveredComplexityIndex >= 0) preview(summaryItems[hoveredComplexityIndex]); };
       canvas.onpointerleave = () => { hoveredComplexityIndex = -1; if (pinnedComplexityIndex < 0) document.getElementById("selection-details").textContent = "Hover or click a cell to inspect its function."; };
       canvas.onclick = event => { const index = cellAt(event); if (index < 0) return; pinnedComplexityIndex = index; selectionHistory.length = 0; selectSummaryItem(summaryItems[index], "complexity"); };
+      applyFilter();
       centerView("complexity");
     }
 
@@ -1406,10 +1540,72 @@ const page = `<!doctype html>
       return base + ":" + line;
     }
 
+    function createLayeredCard(n) {
+      const pos = posMap.get(n.id);
+      const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
+      g.setAttribute("class", "node-card");
+      g.setAttribute("transform", "translate(" + pos.x + ", " + pos.y + ")");
+      g.dataset.id = n.id;
+
+      const rect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+      rect.setAttribute("width", NODE_WIDTH);
+      rect.setAttribute("height", NODE_HEIGHT);
+      rect.setAttribute("fill", "#1e293b");
+      rect.setAttribute("stroke", n.color);
+
+      const title = document.createElementNS("http://www.w3.org/2000/svg", "text");
+      title.setAttribute("x", 10);
+      title.setAttribute("y", 18);
+      title.setAttribute("fill", "#f8fafc");
+      title.setAttribute("font-size", "11px");
+      title.setAttribute("font-weight", "600");
+      const titleText = n.name.length > 17 ? n.name.slice(0, 15) + "…" : n.name;
+      title.textContent = titleText;
+
+      const subtitle = document.createElementNS("http://www.w3.org/2000/svg", "text");
+      subtitle.setAttribute("x", 10);
+      subtitle.setAttribute("y", 33);
+      subtitle.setAttribute("fill", "#94a3b8");
+      subtitle.setAttribute("font-size", "9.5px");
+      const locStr = formatLoc(n.file, n.line);
+      subtitle.textContent = locStr.length > 20 ? "…" + locStr.slice(-18) : locStr;
+
+      // Incoming and Outgoing Connection Counts Badge on top right
+      const countBadge = document.createElementNS("http://www.w3.org/2000/svg", "text");
+      countBadge.setAttribute("x", NODE_WIDTH - 8);
+      countBadge.setAttribute("y", 18);
+      countBadge.setAttribute("text-anchor", "end");
+      countBadge.setAttribute("fill", (n.inDegree > 0 || n.outDegree > 0) ? "#38bdf8" : "#64748b");
+      countBadge.setAttribute("font-size", "9px");
+      countBadge.setAttribute("font-weight", "600");
+      countBadge.setAttribute("font-family", "ui-monospace, monospace");
+      countBadge.textContent = "↓" + (n.inDegree || 0) + " ↑" + (n.outDegree || 0);
+
+      g.appendChild(rect);
+      g.appendChild(title);
+      g.appendChild(subtitle);
+      g.appendChild(countBadge);
+
+      const tooltip = document.createElementNS("http://www.w3.org/2000/svg", "title");
+      tooltip.textContent = n.name + " (" + n.file + ":" + n.line + ")";
+      g.appendChild(tooltip);
+
+      g.onclick = (e) => {
+        e.stopPropagation();
+        selectNode(n);
+      };
+
+      return g;
+    }
+
     function renderGraph() {
       if (!graphData) return;
       canvas.innerHTML = "";
       nodeElements.clear();
+      layeredRows = [];
+      layeredHeaders = [];
+      layeredDecorations = document.createElementNS("http://www.w3.org/2000/svg", "g");
+      canvas.appendChild(layeredDecorations);
       nodeMap.clear();
       edgeElements.clear();
       incomingEdgeMap.clear();
@@ -1511,6 +1707,7 @@ const page = `<!doctype html>
         headerLine.setAttribute("stroke-width", "1.2");
         headerLine.setAttribute("stroke-opacity", "0.35");
         canvas.appendChild(headerLine);
+        layeredHeaders.push({ line: headerLine, x1: 18, x2: graphWidth, y: headerY + 24 });
 
         currentY += 38;
 
@@ -1526,14 +1723,6 @@ const page = `<!doctype html>
 
           const rowHeight = NODE_HEIGHT + 18;
           const rowWidth = PADDING_X + (rowNodes.length * NODE_SPACING_X) + 60;
-
-          const band = document.createElementNS("http://www.w3.org/2000/svg", "rect");
-          band.setAttribute("x", 12);
-          band.setAttribute("y", currentY);
-          band.setAttribute("width", Math.max(graphWidth, rowWidth));
-          band.setAttribute("height", rowHeight);
-          band.setAttribute("class", "layer-band");
-          canvas.appendChild(band);
 
           // Connection Count Pill Badge on Left
           const badgeWidth = 82;
@@ -1563,6 +1752,8 @@ const page = `<!doctype html>
           badgeLabel.textContent = connCount === 1 ? "1 CONN" : (connCount + " CONNS");
           canvas.appendChild(badgeLabel);
 
+          layeredRows.push({ y: currentY + 9, nodes: rowNodes, band: { x: 12, y: currentY, width: Math.max(graphWidth, rowWidth), height: rowHeight, group: null } });
+
           // Explicitly compute (x, y) for each node in this row
           rowNodes.forEach((n, idx) => {
             const x = PADDING_X + idx * NODE_SPACING_X;
@@ -1576,69 +1767,9 @@ const page = `<!doctype html>
         currentY += 32; // Visual separation gap between Frontend and Backend sections
       }
 
-      // Draw Nodes
-      const nodeGroup = document.createElementNS("http://www.w3.org/2000/svg", "g");
-      for (const n of nodes) {
-        const pos = posMap.get(n.id);
-        if (!pos) continue;
-
-        const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
-        g.setAttribute("class", "node-card");
-        g.setAttribute("transform", "translate(" + pos.x + ", " + pos.y + ")");
-        g.dataset.id = n.id;
-
-        const rect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
-        rect.setAttribute("width", NODE_WIDTH);
-        rect.setAttribute("height", NODE_HEIGHT);
-        rect.setAttribute("fill", "#1e293b");
-        rect.setAttribute("stroke", n.color);
-
-        const title = document.createElementNS("http://www.w3.org/2000/svg", "text");
-        title.setAttribute("x", 10);
-        title.setAttribute("y", 18);
-        title.setAttribute("fill", "#f8fafc");
-        title.setAttribute("font-size", "11px");
-        title.setAttribute("font-weight", "600");
-        const titleText = n.name.length > 17 ? n.name.slice(0, 15) + "…" : n.name;
-        title.textContent = titleText;
-
-        const subtitle = document.createElementNS("http://www.w3.org/2000/svg", "text");
-        subtitle.setAttribute("x", 10);
-        subtitle.setAttribute("y", 33);
-        subtitle.setAttribute("fill", "#94a3b8");
-        subtitle.setAttribute("font-size", "9.5px");
-        const locStr = formatLoc(n.file, n.line);
-        subtitle.textContent = locStr.length > 20 ? "…" + locStr.slice(-18) : locStr;
-
-        // Incoming and Outgoing Connection Counts Badge on top right
-        const countBadge = document.createElementNS("http://www.w3.org/2000/svg", "text");
-        countBadge.setAttribute("x", NODE_WIDTH - 8);
-        countBadge.setAttribute("y", 18);
-        countBadge.setAttribute("text-anchor", "end");
-        countBadge.setAttribute("fill", (n.inDegree > 0 || n.outDegree > 0) ? "#38bdf8" : "#64748b");
-        countBadge.setAttribute("font-size", "9px");
-        countBadge.setAttribute("font-weight", "600");
-        countBadge.setAttribute("font-family", "ui-monospace, monospace");
-        countBadge.textContent = "↓" + (n.inDegree || 0) + " ↑" + (n.outDegree || 0);
-
-        g.appendChild(rect);
-        g.appendChild(title);
-        g.appendChild(subtitle);
-        g.appendChild(countBadge);
-
-        const tooltip = document.createElementNS("http://www.w3.org/2000/svg", "title");
-        tooltip.textContent = n.name + " (" + n.file + ":" + n.line + ")";
-        g.appendChild(tooltip);
-
-        g.onclick = (e) => {
-          e.stopPropagation();
-          selectNode(n);
-        };
-
-        nodeElements.set(n.id, g);
-        nodeGroup.appendChild(g);
-      }
-      canvas.appendChild(nodeGroup);
+      // Draw only viewport cards; complete positions remain indexed.
+      layeredNodeGroup = document.createElementNS("http://www.w3.org/2000/svg", "g");
+      canvas.appendChild(layeredNodeGroup);
 
       // Edge layer container — placed AFTER nodeGroup so lines & arrows render on top
       const edgeGroup = document.createElementNS("http://www.w3.org/2000/svg", "g");
@@ -1723,34 +1854,6 @@ const page = `<!doctype html>
       const callers = incomingEdgeMap.get(node.id) || [];
       const callees = outgoingEdgeMap.get(node.id) || [];
 
-      // Highlight and unhide selected node
-      const selfEl = nodeElements.get(node.id);
-      if (selfEl) {
-        selfEl.style.display = "block";
-        selfEl.classList.add("highlighted");
-        activeHighlighted.push(selfEl);
-      }
-
-      // Highlight and unhide caller nodes
-      for (let i = 0; i < callers.length; i++) {
-        const fromEl = nodeElements.get(callers[i].from);
-        if (fromEl) {
-          fromEl.style.display = "block";
-          fromEl.classList.add("highlighted");
-          activeHighlighted.push(fromEl);
-        }
-      }
-
-      // Highlight and unhide callee nodes
-      for (let i = 0; i < callees.length; i++) {
-        const toEl = nodeElements.get(callees[i].to);
-        if (toEl) {
-          toEl.style.display = "block";
-          toEl.classList.add("highlighted");
-          activeHighlighted.push(toEl);
-        }
-      }
-
       // Render active edges dynamically
       if (edgeGroup) {
         for (let i = 0; i < callers.length; i++) {
@@ -1806,6 +1909,7 @@ const page = `<!doctype html>
           if (target) focusNode(target);
         }
       };
+      applyFilter();
     }
 
     window.selectNode = selectNode;
@@ -1825,6 +1929,7 @@ const page = `<!doctype html>
 
     function renderHeatmap() {
       if (!heatmapData) return;
+      if (layeredNodeGroup) { layeredNodeGroup = null; layeredRows = []; layeredDecorations = null; layeredHeaders = []; nodeElements.clear(); activeHighlighted = []; }
       canvas.innerHTML = "";
       nodeElements.clear();
       svg.classList.remove("has-selection");
@@ -2005,6 +2110,7 @@ const page = `<!doctype html>
 
     function renderSunburst() {
       if (!sunburstData) return;
+      if (layeredNodeGroup) { layeredNodeGroup = null; layeredRows = []; layeredDecorations = null; layeredHeaders = []; nodeElements.clear(); activeHighlighted = []; }
       canvas.innerHTML = "";
       nodeElements.clear();
       svg.classList.remove("has-selection");
@@ -2266,6 +2372,7 @@ const page = `<!doctype html>
 
     function renderChord() {
       if (!chordData) return;
+      if (layeredNodeGroup) { layeredNodeGroup = null; layeredRows = []; layeredDecorations = null; layeredHeaders = []; nodeElements.clear(); activeHighlighted = []; }
       canvas.innerHTML = "";
       nodeElements.clear();
       svg.classList.remove("has-selection");
@@ -2465,6 +2572,33 @@ const page = `<!doctype html>
     function applyFilter() {
       const query = document.getElementById("search-input").value.trim().toLowerCase();
 
+      if (currentView === "calltree" || currentView === "complexity") {
+        const matches = item => (currentFilter !== "most-called" || !!item.isMostCalled) && (!query || (item.name || "").toLowerCase().includes(query) || (item.file || "").toLowerCase().includes(query));
+        if (currentView === "calltree") {
+          canvas.querySelectorAll("g[data-summary-index]").forEach(card => {
+            const visible = matches(summaryItems[Number(card.dataset.summaryIndex)]);
+            card.style.opacity = currentFilter !== "all" || query ? (visible ? "1" : "0.06") : "";
+          });
+        } else {
+          const cells = canvas.querySelector('g[role="grid"]');
+          if (!cells) return;
+          const paths = new Map();
+          for (const item of summaryItems) {
+            const opacity = currentFilter !== "all" || query ? (matches(item) ? "1" : "0.06") : "1";
+            const key = item.color + ":" + opacity;
+            if (!paths.has(key)) paths.set(key, { color: item.color, opacity, d: "" });
+            paths.get(key).d += "M" + item.x + "," + item.y + "h" + item.width + "v" + item.height + "h-" + item.width + "Z";
+          }
+          cells.replaceChildren();
+          for (const { color, opacity, d } of paths.values()) {
+            const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+            path.setAttribute("d", d); path.setAttribute("fill", color); path.setAttribute("stroke", "#0f172a"); path.setAttribute("stroke-width", ".5"); path.style.opacity = opacity;
+            cells.appendChild(path);
+          }
+        }
+        return;
+      }
+
       if (currentView === "sunburst") {
         if (!sunburstData) return;
         const nodes = sunburstData.nodes || [];
@@ -2498,6 +2632,7 @@ const page = `<!doctype html>
         if (!chordData) return;
         const modules = chordData.modules || [];
         const chords = chordData.chords || [];
+        const mostCalledModules = currentFilter === "most-called" ? new Map(modules.map(module => [module.name, module])) : null;
         const ribbons = document.querySelectorAll(".chord-ribbon");
         const labels = document.querySelectorAll(".chord-label");
 
@@ -2521,8 +2656,8 @@ const page = `<!doctype html>
           const t = r.dataset.target;
           let match = true;
           if (currentFilter === "most-called") {
-            const sm = modules.find(m => m.name === s);
-            const tm = modules.find(m => m.name === t);
+            const sm = mostCalledModules.get(s);
+            const tm = mostCalledModules.get(t);
             match = !!(sm?.isMostCalled || tm?.isMostCalled);
           } else if (currentFilter === "orphans") {
             match = false;
@@ -2540,10 +2675,10 @@ const page = `<!doctype html>
 
         if (currentFilter !== "all" || query) {
           labels.forEach(l => {
-            const m = modules.find(mod => mod.name === l.textContent);
+            const m = currentFilter === "most-called" ? mostCalledModules.get(l.textContent) : modules.find(mod => mod.name === l.textContent);
             let match = false;
             if (m) {
-              if (currentFilter === "most-called") match = !!m.isMostCalled;
+              if (currentFilter === "most-called") match = !!m.isMostCalled && (!query || m.name.toLowerCase().includes(query));
               else if (currentFilter === "orphans") match = !!m.isOrphan;
               else if (currentFilter === "violations") match = !!m.hasViolation;
               else if (query) match = m.name.toLowerCase().includes(query);
@@ -2584,11 +2719,15 @@ const page = `<!doctype html>
       const nodes = graphData.nodes || [];
       const edges = graphData.edges || [];
       const visibleNodeIds = new Set();
+      const selectedNeighborIds = new Set();
+      if (activeSelectedId) {
+        selectedNeighborIds.add(activeSelectedId);
+        for (const edge of incomingEdgeMap.get(activeSelectedId) || []) selectedNeighborIds.add(edge.from);
+        for (const edge of outgoingEdgeMap.get(activeSelectedId) || []) selectedNeighborIds.add(edge.to);
+      }
 
       for (let i = 0; i < nodes.length; i++) {
         const node = nodes[i];
-        const el = nodeElements.get(node.id);
-        if (!el) continue;
 
         let visible = true;
         if (currentFilter === "most-called") visible = !!node.isMostCalled;
@@ -2599,20 +2738,16 @@ const page = `<!doctype html>
           visible = node.nameLower.includes(query) || node.fileLower.includes(query);
         }
 
-        if (activeSelectedId) {
-          const isSelected = (node.id === activeSelectedId);
-          const isConnected = (incomingEdgeMap.get(activeSelectedId) || []).some(e => e.from === node.id) ||
-                            (outgoingEdgeMap.get(activeSelectedId) || []).some(e => e.to === node.id);
-          if (isSelected || isConnected) {
-            visible = true;
-          }
-        }
+        if (selectedNeighborIds.has(node.id)) visible = true;
 
-        el.style.display = visible ? "block" : "none";
         if (visible) {
           visibleNodeIds.add(node.id);
         }
       }
+
+      layeredVisibleNodeIds = visibleNodeIds;
+      layeredSelectedIds = selectedNeighborIds;
+      reconcileLayeredViewport();
 
       const edgeGroup = document.getElementById("edge-layer");
       if (edgeGroup && !activeSelectedId) {
@@ -2711,7 +2846,6 @@ export function createVisualizerServer(rootPath = root, options = {}) {
   const resolvedRoot = (() => {
     try { return fs.realpathSync(rootPath) } catch { return path.resolve(rootPath) }
   })()
-  const codegraphDir = path.join(resolvedRoot, '.codegraph')
   const debounceMs = options.debounceMs ?? 1500
   const sourcePolicy = options.sourcePolicy ?? options.policy
   const ssePingMs = options.ssePingMs ?? 25000
@@ -2741,33 +2875,23 @@ export function createVisualizerServer(rootPath = root, options = {}) {
     }, debounceMs)
   }
 
-  const isIgnoredWatchPath = (candidate) => {
-    const p = candidate.split(path.sep).join('/')
-    if (p.includes('/node_modules/') || p.includes('/.git/') || p.includes('/dist/') || p.includes('/build/') || p.includes('/coverage/')) return true
-    if (p.endsWith('/node_modules') || p.endsWith('/.git') || p.endsWith('/dist') || p.endsWith('/build') || p.endsWith('/coverage')) return true
-    if (p.includes('/.codegraph/generations') || p.includes('/.codegraph/partitions') || p.includes('/.codegraph/overlays')) return true
-    if (p.endsWith('.tmp') || p.includes('.tmp.') || p.includes(QUERY_VIEW_CACHE_FILE) || p.includes('query-view-cache-v2.bin')) return true
-    return false
-  }
-
   let watcher = null
-  try {
-    // ONE recursive watch on the root — it already contains .codegraph/CURRENT, so the three
-    // former watch paths collapse into a single handle instead of an fd per watched file.
-    watcher = watchFn(resolvedRoot, { recursive: true, persistent: true }, (evt, name) => {
+  if (options.watch) {
+    watcher = watchFn(resolvedRoot, { recursive: true, persistent: true }, (event, name) => {
       if (!name) return
-      const file = path.join(resolvedRoot, name)
-      if (isIgnoredWatchPath(file)) return
-      const isCurrent = path.basename(file) === 'CURRENT'
-      const isSource = sourcePolicy?.acceptWatchPath(file) === true
-      if (isCurrent || isSource) handleFileChange(evt, file)
+      const file = path.join(resolvedRoot, String(name))
+      if (path.basename(file) === 'CURRENT' || sourcePolicy?.acceptWatchPath(file)) handleFileChange(event, file)
     })
-    // fs.watch has no 'ready' event of its own, but the watch is live once the call returns, and
-    // callers wait on one before making a change they expect to be seen.
     queueMicrotask(() => watcher?.emit('ready'))
-    console.log(`[CodeGraph Server] Watching for code & index changes in: ${resolvedRoot}`)
-  } catch (err) {
-    console.warn(`[CodeGraph Server] Could not attach watcher to ${resolvedRoot}:`, err.message)
+  } else {
+    let unsubscribe = null, closed = false
+    watcher = new EventEmitter()
+    watcher.close = () => { closed = true; void unsubscribe?.() }
+    import('./query-client.mjs').then(({ subscribeChanges }) => subscribeChanges(resolvedRoot, event => {
+      if (event.status === 'ready') cachedRawGraph = null
+      broadcast(event)
+    })).then(release => { unsubscribe = release; if (closed) void release(); else watcher.emit('ready') }).catch(error => watcher.emit('error', error))
+    watcher.on('error', error => console.warn(`[CodeGraph Server] subscription: ${error.message}`))
   }
 
   const server = http.createServer(async (req, res) => {
@@ -2877,7 +3001,8 @@ export function createVisualizerServer(rootPath = root, options = {}) {
         const includeTests = parsedUrl.searchParams.get('includeTests') === '1'
         const generation = parsedUrl.searchParams.get('generation') || undefined
         const summary = summaryFromRows(await queryRows({ type: 'internal-summaries', root: rootSymbolId, depth, includeTests, generation }))
-        const calltree = buildCallTreeData(summary, { depth })
+        const mostCalledIds = mostCalledSymbolIds(await graphForRequest(req, res), { includeTests })
+        const calltree = buildCallTreeData(summary, { depth, mostCalledIds })
         calltree.project = { name: path.basename(rootPath), root: rootPath }
         res.setHeader('content-type', 'application/json')
         return res.end(JSON.stringify(calltree))
@@ -2898,7 +3023,8 @@ export function createVisualizerServer(rootPath = root, options = {}) {
           return res.end(JSON.stringify({ error: 'width and height must be positive integers no greater than 4096' }))
         }
         const summary = summaryFromRows(await queryRows({ type: 'internal-summaries', metricsOnly: true, includeTests, generation }))
-        const complexity = buildComplexityData(summary.owners, { includeTests, generation: summary.generation, ...(hasDimensions ? { width: Number(widthParam), height: Number(heightParam) } : {}) })
+        const mostCalledIds = mostCalledSymbolIds(await graphForRequest(req, res), { includeTests })
+        const complexity = buildComplexityData(summary.owners, { mostCalledIds, includeTests, generation: summary.generation, ...(hasDimensions ? { width: Number(widthParam), height: Number(heightParam) } : {}) })
         complexity.project = { name: path.basename(rootPath), root: rootPath }
         res.setHeader('content-type', 'application/json')
         return res.end(JSON.stringify(complexity))
@@ -2921,7 +3047,7 @@ export function createVisualizerServer(rootPath = root, options = {}) {
         return res.end(JSON.stringify({ error: 'ownerId must be an unsigned integer' }))
       }
       try {
-        const records = await queryRows({ type: 'internals', operation: 'map', file, owner: { id: Number(ownerId) }, generation, view: 'combined', limit: 2000 })
+        const records = await queryRows({ type: 'internals', operation: 'details', file, owner: { id: Number(ownerId) }, generation, limit: 2000 })
         res.setHeader('content-type', 'application/json')
         return res.end(JSON.stringify({ generation, records }))
       } catch (error) {
@@ -2932,7 +3058,13 @@ export function createVisualizerServer(rootPath = root, options = {}) {
     res.statusCode = 404
     res.end('not found')
   })
+  if (watcher) {
+    const closeWatcher = watcher.close.bind(watcher)
+    let watchClosed = false
+    watcher.close = () => { if (!watchClosed) { watchClosed = true; return closeWatcher() } }
+  }
   server.watcher = watcher
+  server.once('close', () => { clearTimeout(debounceTimer); watcher?.close() })
   return server
 }
 
@@ -2944,4 +3076,4 @@ export function startVisualizer(rootPath = root, listenPort = port, options = {}
   })
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(import.meta.url).pathname)) startVisualizer()
+if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))) startVisualizer()

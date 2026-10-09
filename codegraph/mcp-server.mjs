@@ -6,19 +6,29 @@
 // serves any checkout. CODEGRAPH_ROOT is only a fallback default.
 import fs from 'node:fs'
 import path from 'node:path'
-import { parentPort } from 'node:worker_threads'
-import { DaemonQueryEngine } from './daemon-query-engine.mjs'
-import { isFrameworkExport } from './framework-exports.mjs'
-import { qualifiedQuery } from './query-target.mjs'
-import { controlFileHashes, createSourcePolicy, fileContentHash } from './source-policy.mjs'
-import { GraphStore } from './store.mjs'
-import { MmapQueryCache } from './mmap-query-cache.mjs'
-import { prepareQueryViewCache } from './query-cache-schema.mjs'
-import { nativeMmapAdapter } from './native/mmap-adapter.mjs'
-import { createLanguageAnalyzers } from './language-analyzer.mjs'
-import { createTypeScriptLanguageAnalyzer } from './typescript-language-analyzer.mjs'
+import { fileURLToPath } from 'node:url'
+import { isDeepStrictEqual } from 'node:util'
+import { availableParallelism } from 'node:os'
 
-const DEFAULT_ROOT = process.env.CODEGRAPH_ROOT ? path.resolve(process.env.CODEGRAPH_ROOT) : null
+
+const direct = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)
+let CodeGraphEngine, SemanticCheckerWorker, McpProjectRuntime, DaemonQueryEngine, isFrameworkExport, qualifiedQuery, controlFileHashes, createSourcePolicy, fileContentHash, GraphStore, MmapQueryCache, prepareQueryViewCache, nativeMmapAdapter, createLanguageAnalyzers, createTypeScriptLanguageAnalyzer
+if (direct) await import('./mcp.mjs')
+else {
+  ;({ CodeGraphEngine } = await import('./tool-engine.mjs'))
+  ;({ SemanticCheckerWorker } = await import('./semantic-checker-worker.mjs'))
+  ;({ McpProjectRuntime } = await import('./mcp-runtime.mjs'))
+  ;({ DaemonQueryEngine } = await import('./daemon-query-engine.mjs'))
+  ;({ isFrameworkExport } = await import('./framework-exports.mjs'))
+  ;({ qualifiedQuery } = await import('./query-target.mjs'))
+  ;({ controlFileHashes, createSourcePolicy, fileContentHash } = await import('./source-policy.mjs'))
+  ;({ GraphStore } = await import('./store.mjs'))
+  ;({ MmapQueryCache } = await import('./mmap-query-cache.mjs'))
+  ;({ prepareQueryViewCache } = await import('./query-cache-schema.mjs'))
+  ;({ nativeMmapAdapter } = await import('./native/mmap-adapter.mjs'))
+  ;({ createLanguageAnalyzers } = await import('./language-analyzer.mjs'))
+  ;({ createTypeScriptLanguageAnalyzer } = await import('./typescript-language-analyzer.mjs'))
+}
 
 // Deliberately names no repository: hardcoding one made every description claim to be about
 // that project even when the agent was working somewhere else.
@@ -139,135 +149,214 @@ const required = (a, key) => {
   return v.trim()
 }
 
+export function createService(options = {}) {
+const configured = options.workerCount ?? Number(process.env.CODEGRAPH_PARSER_WORKERS)
+const workerBudget = Number.isInteger(configured) && configured >= 0 ? Math.max(1, configured) : Math.max(1, availableParallelism() - 1)
+const rss = options.rss ?? (() => process.memoryUsage().rss)
+const retentionHighWaterBytes = 1024 ** 3
+const roots = new Map()
+let heavy = null, closingHeavy = null, retiringHeavy = null, running = null, closed = false, lastRoot = null
 const resolveRoot = (a) => {
-  const raw = (typeof a?.root === 'string' && a.root.trim()) || DEFAULT_ROOT
-  if (!raw) {
-    throw new Error('missing required argument "root": absolute path of the repository to analyze.')
-  }
+  const raw = typeof a?.root === 'string' && a.root.trim()
+  if (!raw) throw new Error('missing required argument "root": absolute path of the repository to analyze.')
   const root = path.resolve(raw)
-  if (!fs.existsSync(root) || !fs.statSync(root).isDirectory()) {
-    throw new Error(`"${root}" is not a valid directory — pass the repository root you are working in.`)
-  }
-  // Symlinks alias one tree under several paths (/tmp vs /private/tmp on macOS). runtimes,
-  // queryEngines, lightWatchers and freshnessChecks all key off this, so resolving here is what
-  // stops one repository from getting two engines and two parser pools.
+  if (!fs.existsSync(root) || !fs.statSync(root).isDirectory()) throw new Error(`"${root}" is not a valid directory — pass the repository root you are working in.`)
   return fs.realpathSync(root)
 }
-
-const call = {}
-
-const runtimes = new Map()
-const queryCaches = new Map()
 const analyzersFor = (root) => createLanguageAnalyzers(root, [createTypeScriptLanguageAnalyzer])
-const queryCacheFor = (root) => {
-  let cache = queryCaches.get(root)
-  if (!cache) {
-    cache = new MmapQueryCache({ filePath: prepareQueryViewCache(path.join(root, '.codegraph')), root, adapter: nativeMmapAdapter })
-    queryCaches.set(root, cache)
-  }
-  return cache
-}
-async function runtimeFor(root, initialize = (runtime) => runtime.start()) {
-  let pending = runtimes.get(root)
-  if (!pending) {
-    stopLightWatcher(root)
-    pending = import('./mcp-runtime.mjs').then(({ McpProjectRuntime }) => initialize(new McpProjectRuntime(root, { queryCache: queryCacheFor(root) })))
-    runtimes.set(root, pending)
-    try { await pending } catch (error) { runtimes.delete(root); throw error }
-  }
-  return pending
-}
-async function indexRuntime(root) {
-  const active = runtimes.has(root)
-  let result
-  const runtime = await runtimeFor(root, async (created) => {
-    result = await created.index()
-    return created
-  })
-  return active ? runtime.index() : result
-}
-
-const queryEngines = new Map()
-const lightWatchers = new Map()
-const freshnessChecks = new Map()
-const stopLightWatcher = (root) => { lightWatchers.get(root)?.close(); lightWatchers.delete(root) }
-const promoteRuntime = (root) => { stopLightWatcher(root); runtimeFor(root).catch((error) => process.stderr.write(`codegraph-mcp: ${error.message}\n`)) }
-const isWatchedChange = (policy, file) => {
-  const relative = policy.normalize(file)
-  return policy.acceptWatchPath(file) || (!fs.existsSync(file) && policy.isSourceRelative(relative))
-}
-async function startPollingWatcher(root, policy) {
-  if (runtimes.has(root)) return
-  try {
-    // Native watch exhaustion must not load the parser just to remain fresh. Poll only accepted
-    // sources here; the first real change promotes this lightweight guard to the full runtime.
-    const { watch } = await import('chokidar')
-    const watcher = watch(root, {
-      persistent: false,
-      ignoreInitial: true,
-      followSymlinks: false,
-      usePolling: true,
-      ignored: (candidate, stats) => {
-        const relative = policy.normalize(candidate)
-        if (relative === '') return false
-        if (policy.isIgnoredRelative(relative)) return true
-        if (stats?.isDirectory()) return false
-        if (stats?.isFile()) return !policy.acceptWatchPath(candidate)
-        return false
+const call = {}
+function descriptor(root, owner) {
+  if (closed) throw new Error('CodeGraph service is closed')
+  root = resolveRoot({ root })
+  let item = roots.get(root)
+  if (!item) {
+    const policy = createSourcePolicy(root, analyzersFor(root))
+    item = { root, policy, owners: new Set(), listeners: new Set(), jobs: [], reads: 0, query: null, cache: null, watchRuntime: null }
+    roots.set(root, item)
+    const facade = {
+      policy, reconcile: async () => {}, dispose: async () => {},
+      registeredFiles: () => {
+        const files = new Set()
+        try { for (const file of Object.keys(new GraphStore(root).readGeneration().sources ?? {})) files.add(file) } catch {}
+        for (const [file, hash] of Object.entries(controlFileHashes(root, analyzersFor(root)))) if (hash) files.add(file)
+        return files
       },
-    })
-    lightWatchers.set(root, watcher)
-    watcher.on('all', (_event, file) => { if (isWatchedChange(policy, file)) promoteRuntime(root) })
-    watcher.on('error', () => promoteRuntime(root))
-  } catch { promoteRuntime(root) }
+      incremental: async (events) => {
+        await enqueue(item, 'incremental', { events }, { watcher: true })
+        setImmediate(() => void cleanup())
+      },
+    }
+    item.facade = facade
+    startWatch(item)
+  }
+  if (owner) item.owners.add(owner)
+  return item
 }
-function watchForChanges(root) {
-  if (lightWatchers.has(root) || runtimes.has(root)) return
-  const policy = createSourcePolicy(root, analyzersFor(root))
-  try {
-    const watcher = fs.watch(root, { recursive: true, persistent: false }, (_event, name) => {
-      if (!name) return
-      const file = path.join(root, String(name))
-      if (isWatchedChange(policy, file)) promoteRuntime(root)
-    })
-    lightWatchers.set(root, watcher)
-    watcher.on('error', () => { stopLightWatcher(root); void startPollingWatcher(root, policy) })
-  } catch { void startPollingWatcher(root, policy) }
+function startWatch(item) {
+  item.watchRuntime = new McpProjectRuntime(item.root, { engine: item.facade, nativeWatch: options.watchFactory, onError: error => process.stderr.write(`codegraph watcher: ${error.message}\n`) })
+  item.watchReady = item.watchRuntime.start()
 }
-const diskMatchesGeneration = (root, policy, analyzers = analyzersFor(root)) => {
+const idle = item => !item.admissionPending && !item.owners.size && !item.listeners.size && !item.jobs.length && !item.reads && running?.item !== item && !item.watchRuntime.queue?.pending.size && !item.watchRuntime.queue?.running
+function queryCacheFor(root) {
+  const item = descriptor(root)
+  return item.cache ??= new MmapQueryCache({ filePath: prepareQueryViewCache(path.join(root, '.codegraph')), root, adapter: nativeMmapAdapter })
+}
+async function deactivate() {
+  const previous = heavy; heavy = null
+  if (!previous) { await closingHeavy; return }
+  retiringHeavy = previous
+  const closing = Promise.resolve(closingHeavy).then(() => previous.runtime.close())
+  closingHeavy = closing
+  try { await closing } finally { if (closingHeavy === closing) { closingHeavy = null; retiringHeavy = null } }
+}
+async function activate(item, args = {}) {
+  await item.retiring
+  if (heavy?.item === item && heavy.profile === args.profile) return heavy.runtime
+  await deactivate()
+  const engine = options.engineFactory ? await options.engineFactory(item.root, args) : new CodeGraphEngine(item.root, {
+    queryCache: queryCacheFor(item.root), profile: args.profile,
+    validationWorkerFactory: () => new SemanticCheckerWorker({ structuralCount: workerBudget - 1 }),
+  })
+  const runtime = new McpProjectRuntime(item.root, { engine, sharedWatcher: true })
+  runtime.initialized = item.freshnessDone === true && !!engine.validatedGeneration
+  heavy = { item, runtime, profile: args.profile }
+  return runtime
+}
+async function releaseQuery(item) {
+  const query = item.query, cache = item.cache
+  item.query = null; item.cache = null
+  await query?.dispose(); cache?.dispose()
+}
+async function cleanup() {
+  for (const item of roots.values()) if (item.clearCache && !item.reads && !item.cache?.leases.some(Boolean) && heavy?.item !== item && retiringHeavy?.item !== item && running?.item !== item) {
+    item.clearCache = false
+    await releaseQuery(item)
+  }
+  if (rss() > retentionHighWaterBytes) {
+    for (const item of roots.values()) if (!item.reads && item.cache && !item.cache.leases.some(Boolean) && heavy?.item !== item && retiringHeavy?.item !== item && running?.item !== item) {
+      await releaseQuery(item)
+    }
+    if (!running && heavy && !heavy.item.reads) {
+      const item = heavy.item
+      await deactivate()
+      if (rss() > retentionHighWaterBytes && !item.reads && item.cache && !item.cache.leases.some(Boolean) && heavy?.item !== item && retiringHeavy?.item !== item && running?.item !== item) await releaseQuery(item)
+    }
+  }
+  for (const [root, item] of roots) if (idle(item) && !item.retiring) {
+    item.retiring = (async () => {
+      await item.watchReady
+      if (!idle(item)) return
+      await item.watchRuntime.close()
+      if (!idle(item)) { startWatch(item); return }
+      if (heavy?.item === item) await deactivate()
+      if (!idle(item)) { startWatch(item); return }
+      await releaseQuery(item)
+      if (!idle(item)) { startWatch(item); return }
+      roots.delete(root)
+    })()
+    try { await item.retiring } finally { item.retiring = null }
+  }
+}
+function enqueue(item, op, args = {}, context = {}) {
+  if (['build', 'reconcile', 'pinQuery', 'snapshotComplete'].includes(op)) item.admitted = true
+  if (closed) return Promise.reject(new Error('CodeGraph service is closed'))
+  let job = op === 'build' ? item.jobs.find(job => job.op === op && isDeepStrictEqual(job.args, args)) : null
+  if (!job && op === 'build' && running?.item === item && running.op === op && isDeepStrictEqual(running.args, args)) job = running
+  if (!job) { job = { item, op, args, watcher: context.watcher === true, waiters: new Set() }; item.jobs.push(job) }
+  const promise = new Promise((resolve, reject) => {
+    const waiter = { resolve, reject, signal: context.signal }
+    waiter.abort = () => {
+      job.waiters.delete(waiter); reject(new Error('request cancelled'))
+      if (!job.waiters.size && running === job) void deactivate().catch(error => process.stderr.write(`codegraph cancellation: ${error.message}\n`))
+    }
+    job.waiters.add(waiter)
+    if (context.signal?.aborted) waiter.abort()
+    else context.signal?.addEventListener('abort', waiter.abort, { once: true })
+  })
+  void drain()
+  return promise
+}
+async function drain() {
+  if (running || closed) return
+  const ring = [...roots.values()]
+  const index = ring.findIndex(item => item.root === lastRoot)
+  let item = null
+  for (let step = 1; step <= ring.length; step += 1) {
+    const candidate = ring[(index + step) % ring.length]
+    if (candidate.jobs.length) { item = candidate; break }
+  }
+  if (!item) { await cleanup(); return }
+  const job = item.jobs.shift(); running = job; lastRoot = item.root
+  let value, failure
+  const publication = ['build', 'incremental', 'reconcile'].includes(job.op)
+  if (publication) for (const listener of item.listeners) listener({ status: 'indexing' })
   try {
-    const store = new GraphStore(root)
-    const generation = store.readGeneration()
-    const files = policy.scan()
-    const indexed = Object.keys(generation.sources ?? {}).sort()
-    return analyzers.isManifestCompatible(generation, files) && generation.controlHashes && JSON.stringify(generation.controlHashes) === JSON.stringify(controlFileHashes(root, analyzers)) && files.length === indexed.length && files.every((file, index) => file === indexed[index] && fileContentHash(path.join(root, file)) === generation.sources[file])
-  } catch { return false }
+    await cleanup()
+    if (!job.waiters.size) throw new Error('request cancelled')
+    const runtime = await activate(item, job.args)
+    if (job.op === 'refresh') {
+      await deactivate()
+      item.clearCache = true
+      value = {}
+    }
+    else if (job.op === 'pinQuery' || job.op === 'snapshotComplete') {
+      if (!runtime.initialized) {
+        const reconciled = await runtime.engine.reconcile()
+        if (reconciled?.validation) await reconciled.validation
+        runtime.initialized = true; item.freshnessDone = true
+        item.watchRuntime.registered = new Set(runtime.engine.registeredFiles?.() ?? [])
+      }
+      value = job.op === 'pinQuery'
+        ? await runtime.engine.pinQuery(job.args.query, job.args.options)
+        : await runtime.engine.snapshotComplete(job.args.generation, job.args.options)
+      if (job.op === 'snapshotComplete' && value?.mapped) value = value.graph
+      if (job.op === 'pinQuery' && value?.graph?.mapped) value.graph = value.graph.graph
+      if (job.op === 'pinQuery' && value?.rows && !Array.isArray(value.rows)) {
+        const rows = []
+        for await (const row of value.rows) rows.push(row)
+        value.rows = rows
+      }
+    }
+    else value = await runtime.engine[job.op](...(job.op === 'incremental' ? [job.args.events] : []))
+    if (value?.validation) await value.validation
+    if (job.op === 'incremental' && !job.watcher) for (const event of job.args.events ?? []) {
+      const file = item.policy.normalize(path.resolve(item.root, event.path))
+      if (item.policy.isIgnoredRelative(file) || !item.policy.isSourceRelative(file) && !item.policy.isControlRelative(file)) continue
+      if (event.type === 'unlink') item.watchRuntime.registered.delete(file)
+      else item.watchRuntime.registered.add(file)
+    }
+    runtime.initialized = true
+    if (job.op === 'build' || job.op === 'reconcile') {
+      item.freshnessDone = true
+      item.watchRuntime.registered = new Set(runtime.engine.registeredFiles?.() ?? [])
+    }
+  } catch (error) { failure = error; item.admitted = false; try { await deactivate() } catch {} }
+  if (publication) for (const listener of item.listeners) listener({ status: 'ready' })
+  for (const waiter of job.waiters) {
+    waiter.signal?.removeEventListener('abort', waiter.abort)
+    failure ? waiter.reject(failure) : waiter.resolve(value)
+  }
+  running = null
+  await cleanup(); void drain()
 }
 async function queryEngineFor(root) {
-  const analyzers = analyzersFor(root)
-  const policy = createSourcePolicy(root, analyzers)
-  let engine = queryEngines.get(root)
-  if (!engine) {
-    engine = new DaemonQueryEngine(root, {
-      cache: queryCacheFor(root),
-      engineFactory: async () => (await runtimeFor(root)).engine,
-      disposeFallback: false,
-    })
-    queryEngines.set(root, engine)
-    watchForChanges(root)
+  const item = descriptor(root)
+  if (!item.query) item.query = new DaemonQueryEngine(root, {
+    cache: queryCacheFor(root), disposeFallback: false,
+    engineFactory: async () => ({
+      pinQuery: (query, options) => enqueue(item, 'pinQuery', { query, options }, options),
+      snapshotComplete: (generation, options) => enqueue(item, 'snapshotComplete', { generation, options }, options),
+    }),
+  })
+  if (!item.admitted && !item.admission) {
+    item.admissionPending = true
+    item.admission = new Promise(resolve => setImmediate(resolve)).then(async () => {
+      if (!closed && !item.admitted && fs.existsSync(path.join(root, '.codegraph', 'CURRENT'))) await enqueue(item, 'reconcile')
+    }).catch(error => { item.admission = null; process.stderr.write(`codegraph freshness: ${error.message}\n`) }).finally(() => { item.admissionPending = false; void cleanup() })
   }
-  if (!freshnessChecks.has(root)) {
-    const freshness = new Promise((resolve) => setImmediate(resolve))
-      .then(async () => { if (!diskMatchesGeneration(root, policy, analyzers)) await runtimeFor(root) })
-      .catch((error) => {
-        freshnessChecks.delete(root)
-        process.stderr.write(`codegraph-mcp refresh: ${error.message}\n`)
-      })
-    freshnessChecks.set(root, freshness)
-  }
-  return engine
+  return item.query
 }
-
+const indexRuntime = (root, args, context) => enqueue(descriptor(root), 'build', args, context)
 const MAX_MCP_RESULTS = 2_000
 const cappedRows = async (iterator, signal) => {
   const rows = []
@@ -324,12 +413,12 @@ call.codegraph_dead = async (a, { signal } = {}) => {
   notes.push('Do NOT delete anything from this list without explicit human approval.')
   return [...notes, ...rows.map((symbol) => `${symbol.file}:${symbol.line}  ${symbol.name}`)].join('\n')
 }
-call.codegraph_index = async (a) => JSON.stringify(await indexRuntime(resolveRoot(a)))
-
-call.codegraph_refresh = async (a) => {
-  const runtime = await runtimeFor(resolveRoot(a))
-  return JSON.stringify(await runtime.engine.reconcile())
+call.codegraph_index = async (a, context) => {
+  const { root, ...args } = a
+  return JSON.stringify(await indexRuntime(resolveRoot(a), args, context))
 }
+
+call.codegraph_refresh = async (a, context) => JSON.stringify(await enqueue(descriptor(resolveRoot(a)), 'reconcile', {}, context))
 call.codegraph_internals = async (a, { signal } = {}) => {
   const operations = new Set(['map', 'search', 'paths', 'metrics'])
   if (!operations.has(a?.operation)) throw new Error('operation must be map, search, paths, or metrics')
@@ -390,138 +479,66 @@ call.codegraph_query = async (a, { signal } = {}) => {
   return [JSON.stringify(metadata), ...rows.map((row) => JSON.stringify(row))].join('\n')
 }
 
-// Under the shim, replies go back as messages rather than down this thread's stdout: worker stdout
-// is forwarded to the host asynchronously with no way to await the handoff, so terminating the
-// thread on reload or shutdown silently truncates whatever it had just written.
-const send = (msg) => {
-  const line = JSON.stringify(msg) + '\n'
-  parentPort ? parentPort.postMessage({ out: line }) : process.stdout.write(line)
-}
-const reply = (id, result) => send({ jsonrpc: '2.0', id, result })
-const replyError = (id, code, message) => send({ jsonrpc: '2.0', id, error: { code, message } })
 
-async function handle(req) {
+async function handle(req, context = {}) {
   const { id, method, params } = req
-
-  if (method === 'notifications/cancelled') {
-    activeRequests.get(params?.requestId)?.abort()
-    return
-  }
-
-  if (method === 'initialize') {
-    return reply(id, {
-      protocolVersion: params?.protocolVersion ?? '2024-11-05',
-      capabilities: { tools: {} },
-      serverInfo: { name: 'codegraph', version: '1.0.0' },
-    })
-  }
-  if (method === 'tools/list') return reply(id, { tools: TOOLS })
+  const reply = result => ({ jsonrpc: '2.0', id, result })
+  const error = (code, message) => ({ jsonrpc: '2.0', id, error: { code, message } })
+  if (method === 'initialize') return reply({ protocolVersion: params?.protocolVersion ?? '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'codegraph', version: '1.0.0' } })
+  if (method === 'tools/list') return reply({ tools: TOOLS })
+  if (method === 'ping') return reply({})
   if (method === 'tools/call') {
     const fn = call[params?.name]
-    if (!fn) return replyError(id, -32602, `unknown tool: ${params?.name}`)
-    const controller = new AbortController(); activeRequests.set(id, controller)
+    if (!fn) return error(-32602, `unknown tool: ${params?.name}`)
+    let item
     try {
-      const args = params.arguments ?? {}
-      const text = await fn(args, { signal: controller.signal })
-      const root = resolveRoot(args)
-      if (queryEngines.has(root)) promoteRuntime(root)
-      return reply(id, { content: [{ type: 'text', text }] })
-    } catch (err) {
-      return reply(id, { content: [{ type: 'text', text: `error: ${err.message}` }], isError: true })
-    } finally { activeRequests.delete(id) }
+      const args = { ...params.arguments, root: params.arguments?.root ?? context.root }
+      item = descriptor(resolveRoot(args), context.owner); item.reads += 1
+      const text = await fn(args, context)
+      return reply({ content: [{ type: 'text', text }] })
+    } catch (err) { return reply({ content: [{ type: 'text', text: `error: ${err.message}` }], isError: true }) }
+    finally { if (item) { item.reads -= 1; await cleanup() } }
   }
-  if (method === 'ping') return reply(id, {})
-  // Notifications carry no id and expect no response.
-  if (id === undefined) return
-  replyError(id, -32601, `method not found: ${method}`)
+  if (id !== undefined) return error(-32601, `method not found: ${method}`)
 }
-
-const activeRequests = new Map()
-// Requests still being answered. A client that writes one request and closes its pipe ends stdin
-// while the query is in flight, so shutdown has to drain these before disposing any engine.
-const inFlight = new Set()
-
-let buffer = ''
-const feed = (chunk) => {
-  buffer += chunk
-  for (let nl = buffer.indexOf('\n'); nl !== -1; nl = buffer.indexOf('\n')) {
-    const line = buffer.slice(0, nl).trim()
-    buffer = buffer.slice(nl + 1)
-    if (!line) continue
-    try {
-      const answering = handle(JSON.parse(line)).catch((error) => process.stderr.write(`codegraph-mcp: ${error.message}\n`))
-      inFlight.add(answering)
-      answering.finally(() => inFlight.delete(answering))
-    } catch {
-      process.stderr.write(`codegraph-mcp: bad JSON-RPC line\n`)
+return {
+  handle,
+  async *query(root, request, context = {}) {
+    const item = descriptor(root, context.owner); item.reads += 1
+    try { yield* (await queryEngineFor(item.root)).query(request, context) }
+    finally { item.reads -= 1; await cleanup() }
+  },
+  async queryBatch(root, request, context = {}) {
+    const item = descriptor(root, context.owner); item.reads += 1
+    try { return await (await queryEngineFor(item.root)).queryBatch(request, context) }
+    finally { item.reads -= 1; await cleanup() }
+  },
+  mutate(root, op, args = {}, context = {}) { return enqueue(descriptor(root, context.owner), op, args, context) },
+  subscribe(root, listener, context = {}) {
+    const item = descriptor(root, context.owner); item.listeners.add(listener)
+    return () => { item.listeners.delete(listener); void cleanup() }
+  },
+  release(root, owner) { const item = roots.get(root); item?.owners.delete(owner); return cleanup() },
+  status() {
+    const checker = (heavy ?? retiringHeavy)?.runtime.engine.validationWorker
+    let observedWorkerCount = checker?.worker && checker.worker.threadId !== -1 ? 1 : 0
+    for (const apartment of checker?.parserPool?.workers ?? []) if (apartment.worker && apartment.worker.threadId !== -1) observedWorkerCount += 1
+    return { servicePid: process.pid, workerBudget, observedWorkerCount, heavyRoot: heavy?.item.root ?? null, cacheOwners: [...roots.values()].filter(item => item.cache).length, roots: [...roots.values()].map(item => ({ root: item.root, watchers: item.watchRuntime?.watcher ? 1 : 0, activeQueries: item.reads, pendingHeavy: item.jobs.length, runtime: heavy?.item === item })), rssBytes: rss(), retentionHighWaterBytes, activeWork: !!running || !!closingHeavy }
+  },
+  async close() {
+    closed = true
+    let failure
+    try { await deactivate() } catch (error) { failure = error }
+    for (const item of roots.values()) {
+      for (const job of item.jobs) for (const waiter of job.waiters) waiter.reject(new Error('CodeGraph service is closed'))
+      item.jobs.length = 0
+      const released = await Promise.allSettled([item.watchReady.then(() => item.watchRuntime.close()), item.query?.dispose()])
+      for (const result of released) if (result.status === 'rejected') failure ??= result.reason
+      try { item.cache?.dispose() } catch (error) { failure ??= error }
     }
-  }
+    roots.clear()
+    if (failure) throw failure
+
+  },
 }
-
-const releaseRoots = async () => {
-  for (const controller of activeRequests.values()) controller.abort()
-  while (inFlight.size) await Promise.allSettled([...inFlight])
-  for (const root of lightWatchers.keys()) stopLightWatcher(root)
-  const closing = [...runtimes.values()].map(async (runtime) => (await runtime).close())
-  const disposing = [...queryEngines.values()].map((engine) => engine.dispose())
-  runtimes.clear()
-  queryEngines.clear()
-  freshnessChecks.clear()
-  await Promise.allSettled([...closing, ...disposing])
-  for (const cache of queryCaches.values()) cache.dispose()
-  queryCaches.clear()
 }
-
-// Run as a worker when the shim hosts one, so a code reload can terminate this thread and free its
-// whole module graph. The shim owns stdin and forwards lines; worker stdout already reaches the
-// client. Input arrives as a string; any other message is a control frame asking for the drain, and
-// its reply is what tells the shim it is safe to terminate. Run directly off stdin otherwise, so
-// `node mcp-server.mjs` still works on its own.
-if (parentPort) {
-  parentPort.on('message', (message) => {
-    if (typeof message === 'string') return feed(message)
-    const confirm = () => parentPort.postMessage({ released: true })
-    releaseRoots().then(confirm, confirm)
-  })
-  parentPort.postMessage({ ready: true })
-} else {
-  process.stdin.on('data', feed)
-  process.stdin.on('end', () => releaseRoots())
-}
-
-// SIGINT refreshes rather than exits: the stdio transport is the client's, so terminating would
-// drop the connection instead of reloading. Dropping the cached runtimes, engines and mmap pages
-// makes the next request re-read the index from disk. This refreshes STATE, not code — new source
-// still needs a new process.
-// SIGTERM exits, but through the same release path as stdin end. Node's default would terminate
-// immediately, leaving the socket and mmap page behind for the next process to clean up.
-process.on('SIGTERM', () => {
-  releaseRoots()
-    .catch((error) => process.stderr.write(`codegraph-mcp shutdown: ${error.message}\n`))
-    .finally(() => process.exit(0))
-})
-
-let refreshing = null
-const warmDefaultRoot = (context) => {
-  if (!DEFAULT_ROOT) return
-  try {
-    const root = resolveRoot({ root: DEFAULT_ROOT })
-    const analyzers = analyzersFor(root)
-    if (!diskMatchesGeneration(root, createSourcePolicy(root, analyzers), analyzers)) return
-    queryEngineFor(root).catch((error) => process.stderr.write(`codegraph-mcp ${context}: ${error.message}\n`))
-  } catch (error) {
-    process.stderr.write(`codegraph-mcp ${context}: ${error.message}\n`)
-  }
-}
-process.on('SIGINT', () => {
-  if (refreshing) return
-  refreshing = releaseRoots()
-    .then(() => process.stderr.write('codegraph-mcp: refreshed — cached engines released\n'))
-    .catch((error) => process.stderr.write(`codegraph-mcp refresh: ${error.message}\n`))
-    .finally(() => {
-      refreshing = null
-      warmDefaultRoot('refresh')
-    })
-})
-
-warmDefaultRoot('startup')

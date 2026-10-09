@@ -409,7 +409,7 @@ test('error guessing: complexity output excludes internal partition bookkeeping 
   }], { width: 40, height: 40 })
 
   assert.deepEqual(Object.keys(result.functions[0]).sort(), [
-    'branchCount', 'color', 'column', 'complexity', 'file', 'height', 'id', 'line', 'name', 'nestingDepth',
+    'branchCount', 'color', 'column', 'complexity', 'file', 'height', 'id', 'isMostCalled', 'line', 'name', 'nestingDepth',
     'ownerId', 'start', 'symbolId', 'width', 'x', 'y',
   ])
 })

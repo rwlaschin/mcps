@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { QueryDaemonClient } from '../query-daemon.mjs'
 import { spawn, spawnSync } from 'node:child_process'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
@@ -154,6 +155,8 @@ export const startMcp = ({ root, profile, diagnosticLog, spawnChild = spawn, pla
     if (profile.heap) args.push('--heap-prof', `--heap-prof-dir=${path.dirname(path.resolve(profile.heap))}`, `--heap-prof-name=${path.basename(profile.heap)}`)
     if (profile.trace) args.push('--trace-event-categories=v8,node,node.async_hooks', `--trace-event-file-pattern=${path.resolve(profile.trace)}`)
   }
+  const serviceArgs = [...args, path.join(PROJECT, 'tool.mjs'), 'daemon', '--root', root ?? process.cwd()]
+  args.length = 0
   args.push(resolveMcpPath())
   const diagnosticFd = diagnosticPath ? fs.openSync(diagnosticPath, 'w') : null
   let diagnosticClosed = false
@@ -165,16 +168,33 @@ export const startMcp = ({ root, profile, diagnosticLog, spawnChild = spawn, pla
   const environment = root || diagnosticPath
     ? { ...process.env, ...(root && { CODEGRAPH_ROOT: root }), ...(diagnosticPath && { CODEGRAPH_DEBUG_POOL: '1' }) }
     : process.env
+  const service = profile ? spawnChild(process.execPath, serviceArgs, { cwd: PROJECT, env: environment, stdio: ['ignore', 'ignore', 'pipe'] }) : null
+  const serviceClient = profile ? new QueryDaemonClient(root ?? process.cwd()) : null
+  const serviceReady = profile ? (async () => {
+    while (true) {
+      if (service.exitCode !== null && service.exitCode !== undefined) throw new Error('profile service failed to bind; refusing to profile another owner')
+      try {
+        await serviceClient.connect()
+        const status = await serviceClient.request('status')
+        if (status.servicePid !== service.pid) throw new Error('profile endpoint belongs to another service; refusing to stop it')
+        return
+      } catch (error) {
+        if (/another service/.test(error.message)) throw error
+        await new Promise(resolve => setTimeout(resolve, 20))
+      }
+    }
+  })() : Promise.resolve()
+  serviceReady.catch(() => {})
   let child
   try { child = spawnChild(process.execPath, args, { cwd: PROJECT, env: environment, stdio: ['pipe', 'pipe', 'pipe'], detached: platform !== 'win32' }) }
-  catch (error) { closeDiagnostic(); throw error }
+  catch (error) { service?.kill('SIGTERM'); void serviceClient?.close(); closeDiagnostic(); throw error }
   const signalChild = (signal) => platform === 'win32' ? child.kill(signal) : killProcess(-child.pid, signal)
   let lifecycleActive = true
   const controllerSignals = ['SIGINT', 'SIGTERM', 'SIGHUP']
-  const onControllerExit = () => { try { if (child.exitCode === null && child.signalCode === null) signalChild('SIGTERM') } catch {} }
+  const onControllerExit = () => { try { if (service?.exitCode === null) service.kill('SIGTERM'); if (child.exitCode === null && child.signalCode === null) signalChild('SIGTERM') } catch {} }
   const signalHandlers = new Map(controllerSignals.map((signal) => [signal, () => {
     unregisterLifecycle()
-    try { if (child.exitCode === null && child.signalCode === null) signalChild('SIGTERM') } finally {
+    try { if (service?.exitCode === null) service.kill('SIGTERM'); if (child.exitCode === null && child.signalCode === null) signalChild('SIGTERM') } finally {
       if (typeof controller.kill === 'function' && Number.isInteger(controller.pid)) controller.kill(controller.pid, signal)
     }
   }]))
@@ -189,12 +209,14 @@ export const startMcp = ({ root, profile, diagnosticLog, spawnChild = spawn, pla
   let output = ''; let errors = Buffer.alloc(0); let id = 0
   const waiting = new Map()
   const errorText = () => errors.toString('utf8').trim()
-  child.stderr.on('data', (chunk) => {
+  const collectErrors = (chunk) => {
     const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
-    if (diagnosticFd !== null) fs.writeSync(diagnosticFd, bytes)
+    if (diagnosticFd !== null && !diagnosticClosed) fs.writeSync(diagnosticFd, bytes)
     errors = errors.length ? Buffer.concat([errors, bytes]) : bytes
     if (errors.length > STDERR_TAIL_BYTES) errors = errors.subarray(errors.length - STDERR_TAIL_BYTES)
-  })
+  }
+  child.stderr.on('data', collectErrors)
+  service?.stderr.on('data', collectErrors)
   child.stdout.on('data', (chunk) => {
     output += chunk
     for (let newline = output.indexOf('\n'); newline >= 0; newline = output.indexOf('\n')) {
@@ -211,36 +233,55 @@ export const startMcp = ({ root, profile, diagnosticLog, spawnChild = spawn, pla
     for (const pending of waiting.values()) pending.reject(new Error(`MCP exited (${code ?? signal}): ${errorText()}`))
     waiting.clear()
   })
-  const request = (method, params) => withTimeout(new Promise((resolve, reject) => {
+  const request = (method, params) => withTimeout(serviceReady.then(() => new Promise((resolve, reject) => {
     const requestId = ++id
     waiting.set(requestId, { resolve, reject })
     child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: requestId, method, params })}\n`)
-  }), requestTimeoutMs, 'MCP request')
+  })), requestTimeoutMs, 'MCP request')
   const timed = async (method, params, label = 'MCP request') => { const started = performance.now(); const message = await withTimeout(request(method, params), requestTimeoutMs, label); return { message, ms: performance.now() - started } }
   const profileReceipt = profile ? {
     main: { ...(profile.cpu && { cpu: cpuDestination }), ...(profile.heap && { heap: path.resolve(profile.heap) }), ...(profile.trace && { trace: path.resolve(profile.trace) }) },
     workers: [
-      { label: 'semantic', ...deriveWorkerProfile(deriveWorkerProfile(args, 'server').execArgv, 'semantic').artifacts },
-      { label: 'server', ...deriveWorkerProfile(args, 'server').artifacts },
+      { label: 'semantic', ...deriveWorkerProfile(serviceArgs, 'semantic').artifacts },
     ],
   } : undefined
-  const stop = () => new Promise((resolve, reject) => {
+  const stopProxy = () => new Promise((resolve, reject) => {
     unregisterLifecycle()
     if (child.exitCode !== null || child.signalCode !== null) {
-      closeDiagnostic()
+      if (!service) closeDiagnostic()
       return child.exitCode === 0 || child.signalCode === 'SIGTERM' ? resolve(profileReceipt) : reject(new Error(`MCP shutdown failed (${child.exitCode ?? child.signalCode})`))
     }
     const shutdownAfter = shutdownTimeoutMs ?? (profile ? 0 : 10_000)
     const timer = shutdownAfter === 0 ? null : setTimeout(() => {
-      try { signalChild('SIGKILL') } catch (error) { closeDiagnostic(); reject(error); return }
-      closeDiagnostic()
+      try { signalChild('SIGKILL') } catch (error) { if (!service) closeDiagnostic(); reject(error); return }
+      if (!service) closeDiagnostic()
       reject(new Error('MCP shutdown timed out'))
     }, shutdownAfter)
-    child.once('exit', (code, signal) => { if (timer) clearTimeout(timer); closeDiagnostic(); code === 0 || signal === 'SIGTERM' ? resolve(profileReceipt) : reject(new Error(`MCP shutdown failed (${code ?? signal}): ${errorText()}`)) })
+    child.once('exit', (code, signal) => { if (timer) clearTimeout(timer); if (!service) closeDiagnostic(); code === 0 || signal === 'SIGTERM' ? resolve(profileReceipt) : reject(new Error(`MCP shutdown failed (${code ?? signal}): ${errorText()}`)) })
     child.stdin.end()
     if (platform === 'win32') child.kill('SIGTERM')
     else signalChild('SIGTERM')
   })
+  const stop = async () => {
+    try {
+      const receipt = await stopProxy()
+      if (service) {
+        await serviceReady
+        const status = await serviceClient.request('status')
+        if (status.servicePid !== service.pid) throw new Error('profile service ownership changed; refusing shutdown')
+        const exited = new Promise((resolve, reject) => { service.once('error', reject); service.once('exit', code => code === 0 ? resolve() : reject(new Error(`profile service exited ${code}`))) })
+        await serviceClient.request('shutdown'); await serviceClient.close(); await exited
+      }
+      return receipt
+    } catch (error) {
+      if (service?.exitCode === null) {
+        const exited = new Promise(resolve => service.once('exit', resolve))
+        service.kill('SIGTERM'); await exited
+      }
+      await serviceClient?.close()
+      throw error
+    } finally { closeDiagnostic() }
+  }
   return { timed, stop }
 }
 
@@ -426,7 +467,7 @@ const parsedArtifact = (file, kind) => {
 
 const semanticLifecycleArtifacts = (profile, diagnosticLog, stopped = {}) => {
   const artifacts = {}
-  const serverProfile = profile ? deriveWorkerProfile(process.execArgv, 'server') : null
+  const serverProfile = profile ? { execArgv: process.execArgv } : null
   const workerPaths = serverProfile ? deriveWorkerProfile(serverProfile.execArgv, 'semantic').artifacts : {}
   if (profile?.cpu) {
     const mainCpu = stopped.main?.cpu ?? profile.cpu
@@ -441,13 +482,11 @@ const semanticLifecycleArtifacts = (profile, diagnosticLog, stopped = {}) => {
     const cpu = worker.cpu ?? workerPaths.cpu
     const heap = worker.heap ?? workerPaths.heap
     artifacts.workers = [{ label: 'semantic', ...(profile.cpu && { cpu: parsedArtifact(cpu, 'cpu') }), ...(profile.heap && { heap: parsedArtifact(heap, 'heap') }) }]
-    const server = stopped.workers?.find(({ label }) => label === 'server') ?? serverProfile.artifacts
-    artifacts.workers.push({ label: 'server', ...(profile.cpu && { cpu: parsedArtifact(server.cpu, 'cpu') }), ...(profile.heap && { heap: parsedArtifact(server.heap, 'heap') }) })
     for (const kind of ['cpu', 'heap']) {
       if (!profile[kind]) continue
       const destination = path.resolve(profile[kind])
       const extension = path.extname(destination)
-      const prefix = `${path.basename(destination, extension)}.worker-server`
+      const prefix = `${path.basename(destination, extension)}.worker-`
       for (const name of fs.readdirSync(path.dirname(destination)).sort()) {
         if (!name.startsWith(prefix) || !name.endsWith(extension)) continue
         const file = path.join(path.dirname(destination), name)

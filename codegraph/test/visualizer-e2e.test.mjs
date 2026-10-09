@@ -65,7 +65,7 @@ test("E2E: generated visualizer HTML defines the spin keyframes used by the load
 test('E2E: complexity heatmap batches equal cells into color paths and resolves hover plus pinned click by grid coordinates', async () => {
   const server = createVisualizerServer('/test/root')
   const res = await simulateRequest(server, '/')
-  const renderer = res.body.slice(res.body.indexOf('function renderComplexity()'), res.body.indexOf('function loadSunburst'))
+  const renderer = res.body.slice(res.body.indexOf('function renderComplexity()'), res.body.indexOf('function loadSunburst')) + res.body.slice(res.body.indexOf('function applyFilter()'), res.body.indexOf('document.getElementById("search-input").addEventListener'))
 
   assert.deepEqual({
     createsBatchedPaths: /createElementNS\([^\n]+"path"\)/.test(renderer) && /(?:new Map|Map\()/.test(renderer),
@@ -371,11 +371,12 @@ test('E2E: visualizer server serves complexity summaries without requesting CFG 
   const queries = []
   const mockStreamQuery = async function* (_root, query) {
     queries.push(query)
+    if (query.type === 'graph') { yield { symbols: [{ id: 'a', name: 'run', kind: 'function', file: 'src/a.ts' }], edges: [] }; return }
     yield { generation: 'generation-a', owners: [{ ownerId: 1, symbolId: 'a', name: 'run', file: 'src/a.ts', cyclomatic: 6, nodeCount: 9 }], edges: [] }
   }
   const server = createVisualizerServer('/test/root', { streamQuery: mockStreamQuery })
   const res = await simulateRequest(server, '/complexity')
-  assert.deepEqual({ statusCode: res.statusCode, hasHistogram: Object.hasOwn(JSON.parse(res.body), 'histogram'), functionCount: JSON.parse(res.body).functions.length, queries }, { statusCode: 200, hasHistogram: false, functionCount: 1, queries: [{ type: 'internal-summaries', metricsOnly: true, includeTests: false, generation: undefined }] })
+  assert.deepEqual({ statusCode: res.statusCode, hasHistogram: Object.hasOwn(JSON.parse(res.body), 'histogram'), functionCount: JSON.parse(res.body).functions.length, queries }, { statusCode: 200, hasHistogram: false, functionCount: 1, queries: [{ type: 'internal-summaries', metricsOnly: true, includeTests: false, generation: undefined }, { type: 'graph' }] })
 })
 
 test('E2E: complexity endpoint passes requested viewport dimensions into the responsive grid', async () => {
@@ -393,7 +394,7 @@ test('E2E: visualizer server scopes internal detail to one file and owner', asyn
   const mockStreamQuery = async function* (_root, query) { queries.push(query); yield { record: 'owner', owner: { id: 2 } } }
   const server = createVisualizerServer('/test/root', { streamQuery: mockStreamQuery })
   const res = await simulateRequest(server, '/internals?file=src/a.ts&ownerId=2&generation=g1')
-  assert.deepEqual({ statusCode: res.statusCode, records: JSON.parse(res.body).records.length, query: queries[0] }, { statusCode: 200, records: 1, query: { type: 'internals', operation: 'map', file: 'src/a.ts', owner: { id: 2 }, generation: 'g1', view: 'combined', limit: 2000 } })
+  assert.deepEqual({ statusCode: res.statusCode, records: JSON.parse(res.body).records.length, query: queries[0] }, { statusCode: 200, records: 1, query: { type: 'internals', operation: 'details', file: 'src/a.ts', owner: { id: 2 }, generation: 'g1', limit: 2000 } })
 })
 
 test("E2E: complexity inspector presents the requested fields in drill-down reading order", async () => {

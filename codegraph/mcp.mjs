@@ -1,97 +1,84 @@
 #!/usr/bin/env node
-// Entry shim. It owns the client's stdio connection and nothing else; mcp-server.mjs runs in a
-// worker so a code reload can terminate that thread and free its whole module graph. Re-importing
-// with a fresh URL cannot do that — ESM never releases a loaded specifier, so every reload would
-// leak the previous graph (measured over 12 reloads of ts-morph: query-string +115 MB and still
-// climbing, terminated worker flat at +2 MB).
-//
-// Enabling the compile cache here is the other reason this file exists: ESM evaluates static
-// imports before any body code, so the server cannot turn it on for itself. NODE_COMPILE_CACHE is
-// set as well, so the worker and its own parser threads inherit it.
 import module from 'node:module'
 import os from 'node:os'
 import path from 'node:path'
-import { Worker } from 'node:worker_threads'
-import { ensureNativeMmap } from './native/build-optional.mjs'
-import { deriveWorkerProfile } from './worker-profile.mjs'
+import readline from 'node:readline'
+import { connectQueryDaemon } from './query-daemon.mjs'
 
 const dir = process.env.NODE_COMPILE_CACHE || path.join(os.tmpdir(), 'codegraph-compile-cache')
 process.env.NODE_COMPILE_CACHE = dir
 module.enableCompileCache?.(dir)
-
-// Control frame asking the body to drain. An object, not a sentinel string: forwarded input is
-// always a string, so the two can never be confused. Not imported from the body — importing would
-// load the very module graph the reload exists to throw away.
-const RELEASE = { release: true }
-
-const body = new URL('./mcp-server.mjs', import.meta.url)
-let server = null
-let serverReady = Promise.resolve()
-let held = ''
-let serverProfileId = 0
-
-const spawn = () => {
-  const profileLabel = ++serverProfileId === 1 ? 'server' : `server-${serverProfileId}`
-  server = new Worker(body, { execArgv: deriveWorkerProfile(process.execArgv, profileLabel).execArgv })
-  const worker = server
-  serverReady = new Promise((resolve) => {
-    const ready = (message) => { if (message?.ready) { worker.off('message', ready); resolve() } }
-    worker.on('message', ready)
-    worker.once('exit', resolve)
+const root = process.env.CODEGRAPH_ROOT ? path.resolve(process.env.CODEGRAPH_ROOT) : null
+let client = null, reconnecting = null, paused = false, ended = false, finishing = false, reloadReady = null, resumeReload = null
+const held = [], active = new Map(), inFlight = new Set()
+function connect() {
+  if (client?.socket && !client.socket.destroyed) return Promise.resolve(client)
+  return reconnecting ??= connectQueryDaemon(root ?? process.cwd(), { onControl: control => {
+    if (control === 'reload') { paused = true; client = null; reloadReady = new Promise(resolve => { resumeReload = resolve }) }
+  } }).then(connected => {
+    client = connected
+    connected.socket.once('close', () => {
+      if (!paused || ended) return
+      void connect().then(() => { paused = false; for (const request of held.splice(0)) feed(request); resumeReload?.(); reloadReady = null })
+    })
+    return connected
+  }).finally(() => { reconnecting = null })
+}
+function feed(request) {
+  if (request.method === 'notifications/cancelled') {
+    const id = request.params?.requestId
+    active.get(id)?.abort()
+    let retained = 0, cancelled = false
+    for (let index = 0; index < held.length; index += 1) {
+      if (id !== undefined && held[index].id === id) cancelled = true
+      else held[retained++] = held[index]
+    }
+    held.length = retained
+    if (cancelled) process.stdout.write(`${JSON.stringify({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'error: request cancelled' }], isError: true } })}\n`)
+    return
+  }
+  if (request.id !== undefined) {
+    let duplicate = active.has(request.id)
+    for (let index = 0; !duplicate && index < held.length; index += 1) duplicate = held[index].id === request.id
+    if (duplicate) {
+      process.stdout.write(`${JSON.stringify({ jsonrpc: '2.0', id: request.id, error: { code: -32600, message: 'duplicate outstanding request id' } })}\n`)
+      return
+    }
+  }
+  if (paused) { held.push(request); return }
+  const controller = new AbortController()
+  if (request.id !== undefined) active.set(request.id, controller)
+  const work = connect().then(connected => connected.mcp(request, { signal: controller.signal, root })).then(reply => {
+    if (reply !== undefined) process.stdout.write(`${JSON.stringify(reply)}\n`)
+  }).catch(error => {
+    if (paused && !controller.signal.aborted && /reload|connection closed/.test(error.message)) held.push(request)
+    else if (controller.signal.aborted && request.id !== undefined) process.stdout.write(`${JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { content: [{ type: 'text', text: 'error: request cancelled' }], isError: true } })}\n`)
+    else if (request.id !== undefined) process.stdout.write(`${JSON.stringify({ jsonrpc: '2.0', id: request.id, error: { code: -32603, message: error.message } })}\n`)
+    else process.stderr.write(`codegraph-mcp: ${error.message}\n`)
+  }).finally(() => {
+    if (active.get(request.id) === controller) active.delete(request.id)
+    inFlight.delete(work)
   })
-  // Replies come back as messages and this process writes them, so nothing is in flight on the
-  // worker's own stdout when it is terminated.
-  server.on('message', (message) => { if (message?.out) process.stdout.write(message.out) })
-  server.on('error', (error) => process.stderr.write(`codegraph-mcp: ${error.message}\n`))
-  if (held) { server.postMessage(held); held = '' }
-  return server
+  inFlight.add(work)
 }
-
-// Drain the body's in-flight requests, then terminate it — the reply is what makes terminating
-// safe, and terminating is what actually frees the module graph.
-const stop = async () => {
-  const worker = server
-  if (!worker) return
-  server = null
-  await Promise.race([serverReady, new Promise((resolve) => setTimeout(resolve, 5_000).unref())])
-  await Promise.race([
-    new Promise((resolve) => {
-      const onMessage = (message) => { if (message?.released) { worker.off('message', onMessage); resolve() } }
-      worker.on('message', onMessage)
-      worker.once('exit', resolve)
-      worker.postMessage(RELEASE)
-    }),
-    new Promise((resolve) => setTimeout(resolve, 1_000).unref()),
-  ])
-  await worker.terminate()
-}
-
-await ensureNativeMmap()
-spawn()
-
-// Input arriving mid-reload is held rather than dropped, so a request is never lost to a restart.
-process.stdin.on('data', (chunk) => { server ? server.postMessage(String(chunk)) : (held += chunk) })
-// Worker stdout is forwarded to this process asynchronously, so exiting the moment the worker dies
-// truncates the reply it just wrote. Flush first, then exit.
-const finish = async () => {
-  await stop()
+const lines = readline.createInterface({ input: process.stdin, crlfDelay: Infinity })
+lines.on('line', line => {
+  if (!line.trim()) return
+  try { feed(JSON.parse(line)) } catch { process.stderr.write('codegraph-mcp: bad JSON-RPC line\n') }
+})
+async function finish() {
+  if (finishing) return
+  finishing = true
+  if (paused) await reloadReady
+  while (inFlight.size || held.length) {
+    await Promise.allSettled([...inFlight])
+    if (paused) await reloadReady
+  }
+  ended = true
+  await client?.close()
   process.stdout.write('', () => process.exit(0))
 }
-
-process.stdin.on('end', finish)
-
-// SIGHUP reloads the code. The client never sees a disconnect: this process holds the pipe, and the
-// replacement worker reads the current source from disk.
-let reloading = null
-process.on('SIGHUP', () => {
-  if (reloading) return
-  reloading = stop()
-    .then(() => { spawn(); process.stderr.write('codegraph-mcp: reloaded\n') })
-    .catch((error) => process.stderr.write(`codegraph-mcp reload: ${error.message}\n`))
-    .finally(() => { reloading = null })
-})
-
-// SIGINT refreshes state only: the worker keeps running, having dropped its cached engines.
-process.on('SIGINT', () => { server?.postMessage(RELEASE) })
-
-process.on('SIGTERM', finish)
+lines.on('close', finish)
+process.on('SIGTERM', () => { for (const controller of active.values()) controller.abort(); void finish() })
+process.on('SIGINT', () => void connect().then(connected => connected.request('refresh')))
+process.on('SIGHUP', () => void connect().then(connected => connected.request('reload')))

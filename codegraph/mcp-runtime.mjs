@@ -29,16 +29,16 @@ export class DebouncedBuildQueue {
 }
 
 export class McpProjectRuntime {
-  constructor(root, options = {}) { this.root = path.resolve(root); this.engine = options.engine ?? new CodeGraphEngine(this.root, { ...(options.queryCache ? { queryCache: options.queryCache } : {}) }); this.debounceMs = options.debounceMs ?? 150; this.onError = options.onError; this.nativeWatch = options.nativeWatch ?? fs.watch; this.fallbackWatch = options.fallbackWatch ?? chokidarWatch; this.watcher = null; this.queue = null; this.registered = new Set(); this.fallbackStarted = false }
+  constructor(root, options = {}) { this.sharedWatcher = options.sharedWatcher === true; this.root = path.resolve(root); this.engine = options.engine ?? new CodeGraphEngine(this.root, { ...(options.queryCache ? { queryCache: options.queryCache } : {}) }); this.debounceMs = options.debounceMs ?? 150; this.onError = options.onError; this.nativeWatch = options.nativeWatch ?? fs.watch; this.fallbackWatch = options.fallbackWatch ?? chokidarWatch; this.watcher = null; this.queue = null; this.registered = new Set(); this.fallbackStarted = false }
   async start() {
     await this.engine.reconcile()
-    this.#startWatcher()
+    if (!this.sharedWatcher) this.#startWatcher()
     return this
   }
   async index() {
     const result = await this.engine.build()
     if (this.queue) this.registered = new Set(this.engine.registeredFiles?.() ?? [])
-    else this.#startWatcher()
+    else if (!this.sharedWatcher) this.#startWatcher()
     return result
   }
   #startWatcher() {

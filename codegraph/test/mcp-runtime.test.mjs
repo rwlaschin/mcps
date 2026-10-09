@@ -139,32 +139,19 @@ test('domain analysis: an unindexed default root remains unbuilt until its first
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-mcp-default-unindexed-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   fs.writeFileSync(path.join(root, 'tsconfig.json'), '{}')
-  const loader = path.join(root, 'runtime-loader.mjs')
   const driver = path.join(root, 'driver.mjs')
-  fs.writeFileSync(loader, `
-export async function load(url, context, nextLoad) {
-  if (url.endsWith('/mcp-runtime.mjs')) return { format: 'module', shortCircuit: true, source: \`
-    let builds = 0
-    export class McpProjectRuntime {
-      async start() { builds += 1; process.stderr.write('semantic-build:' + builds + '\\\\n'); return this }
-      async index() { builds += 1; process.stderr.write('semantic-build:' + builds + '\\\\n'); return { generation: 'generation-' + builds, parsedFiles: ['one.ts'], validatedFiles: ['one.ts'] } }
-      async close() {}
-    }
-  \` }
-  return nextLoad(url, context)
-}
-`)
   fs.writeFileSync(driver, `
-import { spawn } from 'node:child_process'
-import { once } from 'node:events'
-const child = spawn(process.execPath, ['--no-warnings', '--experimental-loader', ${JSON.stringify(loader)}, ${JSON.stringify(path.resolve(import.meta.dirname, '..', 'mcp-server.mjs'))}], { env: { ...process.env, CODEGRAPH_ROOT: ${JSON.stringify(root)} }, stdio: ['pipe', 'pipe', 'pipe'] })
-let stdout = ''; let stderr = ''
-child.stdout.on('data', (chunk) => { stdout += chunk })
-child.stderr.on('data', (chunk) => { stderr += chunk })
-await new Promise((resolve) => setTimeout(resolve, 100))
-child.stdin.end(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'codegraph_index', arguments: { root: ${JSON.stringify(root)} } } }) + '\\n')
-await once(child, 'exit')
-process.stdout.write(JSON.stringify({ stdout, stderr }))
+import { EventEmitter } from 'node:events'
+import { createService } from ${JSON.stringify(path.resolve(import.meta.dirname, '..', 'mcp-server.mjs'))}
+let builds = 0; let stderr = ''
+const service = createService({ workerCount: 1, rss: () => 0,
+  engineFactory: () => ({ build: async () => { builds += 1; stderr += 'semantic-build:' + builds + '\\n'; return { generation: 'generation-' + builds, parsedFiles: ['one.ts'], validatedFiles: ['one.ts'] } }, reconcile: async () => {}, incremental: async () => {}, registeredFiles: () => new Set(), dispose: async () => {} }),
+  watchFactory: () => Object.assign(new EventEmitter(), { close() {} }),
+})
+await service.handle({ jsonrpc: '2.0', id: 0, method: 'initialize' }, { root: ${JSON.stringify(root)}, owner: 'default-client' })
+const response = await service.handle({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'codegraph_index', arguments: {} } }, { root: ${JSON.stringify(root)}, owner: 'default-client' })
+await service.close()
+process.stdout.write(JSON.stringify({ stdout: JSON.stringify(response), stderr }))
 `)
 
   const execution = spawnSync(process.execPath, [driver], { encoding: 'utf8', timeout: 5_000 })
