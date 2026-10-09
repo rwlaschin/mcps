@@ -1002,6 +1002,10 @@ const page = `<!doctype html>
       if (n) focusNode(n);
     };
 
+    svg.addEventListener("click", (e) => {
+      if (hasDragged) { e.preventDefault(); e.stopImmediatePropagation(); }
+    }, true);
+
     svg.addEventListener("mousedown", (e) => {
       isMouseDown = true;
       hasDragged = false;
@@ -1171,6 +1175,11 @@ const page = `<!doctype html>
       const isChord = currentView === "chord";
       const isCalltree = currentView === "calltree";
       const isComplexity = currentView === "complexity";
+      if (!isCalltree && !isComplexity && summaryMode) {
+        canvas.onmouseover = null; canvas.onmouseout = null; canvas.onpointermove = null; canvas.onpointerleave = null; canvas.onclick = null;
+        summaryMode = ""; summaryItems = []; pinnedComplexityIndex = -1; hoveredComplexityIndex = -1;
+        selectionVersion++;
+      }
       const filterButtons = document.querySelectorAll(".filter-btn");
       filterButtons.forEach(button => {
         const hidden = ((isCalltree || isComplexity) && (button.dataset.filter === "orphans" || button.dataset.filter === "violations")) || (isSunburst && button.dataset.filter === "violations");
@@ -2195,7 +2204,7 @@ const page = `<!doctype html>
           hoveredArcElements.push(el);
         }
 
-        renderSunburstDetails(node);
+        if (!selected) renderSunburstDetails(node);
       }
 
       function renderSunburstDetails(node) {
