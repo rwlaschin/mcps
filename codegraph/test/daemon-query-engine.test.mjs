@@ -8,7 +8,7 @@ import { once } from 'node:events'
 import { performance } from 'node:perf_hooks'
 import { spawn, spawnSync } from 'node:child_process'
 import { DaemonQueryEngine } from '../daemon-query-engine.mjs'
-import { QueryDaemon, daemonSocketPath } from '../query-daemon.mjs'
+import { QueryDaemon, QueryDaemonClient } from '../query-daemon.mjs'
 
 const temporaryRoots = new Set()
 const openEngines = new Set()
@@ -22,6 +22,32 @@ test.afterEach(async () => {
   for (const root of temporaryRoots) fs.rmSync(root, { recursive: true, force: true })
   temporaryRoots.clear()
 })
+
+const serviceDriverSource = `
+import readline from 'node:readline'
+import { createService } from ${JSON.stringify(path.resolve(import.meta.dirname, '..', 'mcp-server.mjs'))}
+const service = createService()
+const owner = {}
+const pending = new Set()
+const lines = readline.createInterface({ input: process.stdin })
+lines.on('line', line => {
+  if (!line.trim()) return
+  const work = service.handle(JSON.parse(line), { owner, root: process.env.CODEGRAPH_ROOT }).then(reply => {
+    if (reply !== undefined) process.stdout.write(JSON.stringify(reply) + '\\n')
+  }).finally(() => pending.delete(work))
+  pending.add(work)
+})
+lines.on('close', async () => {
+  await Promise.all([...pending])
+  await new Promise(resolve => setImmediate(resolve))
+  await service.close()
+})
+`
+const serviceDriver = (directory) => {
+  const file = path.join(directory, 'owned-service-driver.mjs')
+  fs.writeFileSync(file, serviceDriverSource)
+  return file
+}
 
 test('MCP root shares one mmap cache between query and semantic engines and disposes it once', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-mcp-shared-cache-'))
@@ -43,7 +69,6 @@ export async function load(url, context, nextLoad) {
     export const fileContentHash = () => ''
     export const createSourcePolicy = () => ({ scan: () => [], normalize: () => '', acceptWatchPath: () => false, isSourceRelative: () => false })
   \` }
-  if (url.endsWith('/store.mjs')) return { format: 'module', shortCircuit: true, source: \`export class GraphStore { readGeneration() { return { sources: {}, controlHashes: {} } } }\` }
   if (url.endsWith('/daemon-query-engine.mjs')) return { format: 'module', shortCircuit: true, source: \`
     export class DaemonQueryEngine {
       constructor(root, options) { this.cache = options.cache; this.engineFactory = options.engineFactory; process.stderr.write('QUERY_CACHE ' + this.cache.id + '\\\\n') }
@@ -51,9 +76,16 @@ export async function load(url, context, nextLoad) {
       async dispose() {}
     }
   \` }
+  if (url.endsWith('/tool-engine.mjs')) return { format: 'module', shortCircuit: true, source: \`
+    export class CodeGraphEngine {
+      constructor(root, options) { this.mmapQueryCache = options.queryCache; process.stderr.write('ENGINE_CACHE ' + options.queryCache.id + '\\\\n') }
+      async build() { return { generation: 'g', parsedFiles: [], reusedFiles: [] } }
+      async dispose() {}
+    }
+  \` }
   if (url.endsWith('/mcp-runtime.mjs')) return { format: 'module', shortCircuit: true, source: \`
     export class McpProjectRuntime {
-      constructor(root, options) { process.stderr.write('ENGINE_CACHE ' + options.queryCache.id + '\\\\n'); this.engine = { mmapQueryCache: options.queryCache, dispose: async () => {} } }
+      constructor(root, options) { this.engine = options.engine }
       async start() {}
       async index() { return { generation: 'g', parsedFiles: [], reusedFiles: [] } }
       async close() { await this.engine.dispose() }
@@ -63,7 +95,7 @@ export async function load(url, context, nextLoad) {
 }
 `)
   const request = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'codegraph_query', arguments: { root, query: { type: 'symbols' } } } }) + '\n' + JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'codegraph_index', arguments: { root } } }) + '\n'
-  const result = spawnSync(process.execPath, ['--no-warnings', '--experimental-loader', loaderPath, 'mcp-server.mjs'], { cwd: path.resolve(import.meta.dirname, '..'), encoding: 'utf8', input: request, timeout: 10_000 })
+  const result = spawnSync(process.execPath, ['--no-warnings', '--experimental-loader', loaderPath, serviceDriver(loaderRoot)], { cwd: path.resolve(import.meta.dirname, '..'), encoding: 'utf8', input: request, timeout: 10_000 })
 
   assert.deepEqual(result.stderr.trim().split('\n'), ['CACHE_CREATED', 'QUERY_CACHE root-cache', 'ENGINE_CACHE root-cache', 'CACHE_DISPOSED'])
 })
@@ -354,12 +386,12 @@ test('architecture boundary: an explicit-root primed MCP reply is unchanged befo
   const entryPath = path.join(loaderRoot, 'ordered-mcp.mjs')
   fs.writeFileSync(loaderPath, `
 export async function load(url, context, nextLoad) {
-  if (!url.endsWith('/mcp-runtime.mjs')) return nextLoad(url, context)
+  if (!url.endsWith('/tool-engine.mjs')) return nextLoad(url, context)
   return { format: 'module', shortCircuit: true, source: \`
-    export class McpProjectRuntime {
-      constructor() { this.engine = {} }
-      async start() { process.stderr.write('HYDRATION_AFTER_REPLY ' + Boolean(globalThis.__mappedReplyWritten) + '\\\\n'); return this }
-      async close() {}
+    export class CodeGraphEngine {
+      constructor() {}
+      async reconcile() { process.stderr.write('HYDRATION_AFTER_REPLY ' + Boolean(globalThis.__mappedReplyWritten) + '\\\\n'); return this }
+      async dispose() {}
     }
   \` }
 }
@@ -370,7 +402,7 @@ process.stdout.write = (chunk, ...args) => {
   if (String(chunk).includes('"id":1')) globalThis.__mappedReplyWritten = true
   return write(chunk, ...args)
 }
-await import(${JSON.stringify(path.resolve(import.meta.dirname, '..', 'mcp-server.mjs'))})
+${serviceDriverSource}
 `)
   const request = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'codegraph_deps', arguments: { root, target: 'caller' } } }) + '\n'
 
@@ -398,12 +430,12 @@ test('architecture boundary: a CODEGRAPH_ROOT primed MCP reply is unchanged befo
   const entryPath = path.join(loaderRoot, 'ordered-mcp.mjs')
   fs.writeFileSync(loaderPath, `
 export async function load(url, context, nextLoad) {
-  if (!url.endsWith('/mcp-runtime.mjs')) return nextLoad(url, context)
+  if (!url.endsWith('/tool-engine.mjs')) return nextLoad(url, context)
   return { format: 'module', shortCircuit: true, source: \`
-    export class McpProjectRuntime {
-      constructor() { this.engine = {} }
-      async start() { process.stderr.write('HYDRATION_AFTER_REPLY ' + Boolean(globalThis.__mappedReplyWritten) + '\\\\n'); return this }
-      async close() {}
+    export class CodeGraphEngine {
+      constructor() {}
+      async reconcile() { process.stderr.write('HYDRATION_AFTER_REPLY ' + Boolean(globalThis.__mappedReplyWritten) + '\\\\n'); return this }
+      async dispose() {}
     }
   \` }
 }
@@ -414,7 +446,7 @@ process.stdout.write = (chunk, ...args) => {
   if (String(chunk).includes('"id":1')) globalThis.__mappedReplyWritten = true
   return write(chunk, ...args)
 }
-await import(${JSON.stringify(path.resolve(import.meta.dirname, '..', 'mcp-server.mjs'))})
+${serviceDriverSource}
 `)
   const request = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'codegraph_deps', arguments: { target: 'caller' } } }) + '\n'
 
@@ -441,9 +473,6 @@ export async function load(url, context, nextLoad) {
     export const fileContentHash = () => ''
     export const createSourcePolicy = () => ({ scan: () => [], normalize: () => '', acceptWatchPath: () => false, isSourceRelative: () => false })
   \` }
-  if (url.endsWith('/store.mjs')) return { format: 'module', shortCircuit: true, source: \`
-    export class GraphStore { readGeneration() { return { sources: {}, controlHashes: {} } } }
-  \` }
   if (url.endsWith('/daemon-query-engine.mjs')) return { format: 'module', shortCircuit: true, source: \`
     export class DaemonQueryEngine {
       constructor() {}
@@ -462,7 +491,7 @@ export async function load(url, context, nextLoad) {
 `)
   const request = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'codegraph_query', arguments: { root, query: { type: 'symbols', name: 'value', diagnostics: true } } } }) + '\n'
 
-  const result = spawnSync(process.execPath, ['--no-warnings', '--experimental-loader', loaderPath, 'mcp-server.mjs'], { cwd: path.resolve(import.meta.dirname, '..'), encoding: 'utf8', input: request, timeout: 10_000 })
+  const result = spawnSync(process.execPath, ['--no-warnings', '--experimental-loader', loaderPath, serviceDriver(loaderRoot)], { cwd: path.resolve(import.meta.dirname, '..'), encoding: 'utf8', input: request, timeout: 10_000 })
   const response = JSON.parse(result.stdout.trim())
   const [metadataLine, row] = response.result?.content?.[0]?.text.split('\n') ?? []
   const metadata = JSON.parse(metadataLine)
@@ -486,9 +515,6 @@ export async function load(url, context, nextLoad) {
     export const fileContentHash = () => ''
     export const createSourcePolicy = () => ({ scan: () => [], normalize: () => '', acceptWatchPath: () => false, isSourceRelative: () => false })
   \` }
-  if (url.endsWith('/store.mjs')) return { format: 'module', shortCircuit: true, source: \`
-    export class GraphStore { readGeneration() { return { sources: {}, controlHashes: {} } } }
-  \` }
   if (url.endsWith('/daemon-query-engine.mjs')) return { format: 'module', shortCircuit: true, source: \`
     export class DaemonQueryEngine {
       constructor() {}
@@ -506,7 +532,7 @@ export async function load(url, context, nextLoad) {
 `)
   const request = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'codegraph_query', arguments: { root, query: { type: 'symbols', name: 'value' } } } }) + '\n'
 
-  const result = spawnSync(process.execPath, ['--no-warnings', '--experimental-loader', loaderPath, 'mcp-server.mjs'], { cwd: path.resolve(import.meta.dirname, '..'), encoding: 'utf8', input: request, timeout: 10_000 })
+  const result = spawnSync(process.execPath, ['--no-warnings', '--experimental-loader', loaderPath, serviceDriver(loaderRoot)], { cwd: path.resolve(import.meta.dirname, '..'), encoding: 'utf8', input: request, timeout: 10_000 })
   const response = JSON.parse(result.stdout.trim())
   const text = response.result?.content?.[0]?.text
   const expectedText = '{"freshness":"validated","coverage":"calls","revision":null,"validatedGeneration":"generation-1"}\n{"name":"value"}'
@@ -554,17 +580,17 @@ test('error guessing: a stale primed MCP query returns the validated cache while
   const loaderPath = path.join(loaderRoot, 'stall-runtime-loader.mjs')
   fs.writeFileSync(loaderPath, `
 export async function load(url, context, nextLoad) {
-  if (!url.endsWith('/mcp-runtime.mjs')) return nextLoad(url, context)
+  if (!url.endsWith('/tool-engine.mjs')) return nextLoad(url, context)
   return { format: 'module', shortCircuit: true, source: \`
-    export class McpProjectRuntime {
-      constructor() { this.engine = {} }
-      async start() { process.stderr.write('PROMOTION_STARTED\\\\n'); await new Promise(() => {}) }
-      async close() {}
+    export class CodeGraphEngine {
+      constructor() {}
+      async reconcile() { process.stderr.write('PROMOTION_STARTED\\\\n'); await new Promise(() => {}) }
+      async dispose() {}
     }
   \` }
 }
 `)
-  const child = spawn(process.execPath, ['--no-warnings', '--experimental-loader', loaderPath, 'mcp-server.mjs'], {
+  const child = spawn(process.execPath, ['--no-warnings', '--experimental-loader', loaderPath, serviceDriver(loaderRoot)], {
     cwd: path.resolve(import.meta.dirname, '..'),
     env: { ...process.env, CODEGRAPH_ROOT: root },
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -612,17 +638,17 @@ test('combinatorial concurrency: mapped MCP queries return unchanged while one s
   const loaderPath = path.join(loaderRoot, 'stall-runtime-loader.mjs')
   fs.writeFileSync(loaderPath, `
 export async function load(url, context, nextLoad) {
-  if (!url.endsWith('/mcp-runtime.mjs')) return nextLoad(url, context)
+  if (!url.endsWith('/tool-engine.mjs')) return nextLoad(url, context)
   return { format: 'module', shortCircuit: true, source: \`
-    export class McpProjectRuntime {
-      constructor() { process.stderr.write('RUNTIME_CREATED\\\\n'); this.engine = {} }
-      async start() { process.stderr.write('HYDRATION_STARTED\\\\n'); await new Promise(() => {}) }
-      async close() {}
+    export class CodeGraphEngine {
+      constructor() { process.stderr.write('RUNTIME_CREATED\\\\n'); }
+      async reconcile() { process.stderr.write('HYDRATION_STARTED\\\\n'); await new Promise(() => {}) }
+      async dispose() {}
     }
   \` }
 }
 `)
-  const child = spawn(process.execPath, ['--no-warnings', '--experimental-loader', loaderPath, 'mcp-server.mjs'], {
+  const child = spawn(process.execPath, ['--no-warnings', '--experimental-loader', loaderPath, serviceDriver(loaderRoot)], {
     cwd: path.resolve(import.meta.dirname, '..'),
     stdio: ['pipe', 'pipe', 'pipe'],
   })
@@ -697,34 +723,43 @@ test('internal query contract: validated metrics are read directly without const
   assert.deepEqual({ fallbackCreations, rows }, { fallbackCreations: 0, rows: [{ record: 'metrics', metrics: { cyclomatic: 1, branchCount: 0, nestingDepth: 0 } }] })
 })
 
-test('domain analysis: daemon does not accept a socket connection until its async query engine is ready', async () => {
+test('domain analysis: daemon accepts transport before its async query engine is ready but gates queries', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-light-ready-before-listen-'))
   temporaryRoots.add(root)
-  let releaseEngine = () => {}
-  const engineGate = new Promise((resolve) => { releaseEngine = resolve })
-  const daemon = new QueryDaemon(root, { engineFactory: async () => { await engineGate; return { queryBatch: async () => [{ ready: true }], dispose: async () => {} } } })
-  openDaemons.add(daemon)
-
-  const starting = daemon.start()
-  await new Promise((resolve) => setImmediate(resolve))
-  const beforeReady = await new Promise((resolve) => {
-    const socket = net.createConnection(daemonSocketPath(root))
-    socket.once('connect', () => { socket.destroy(); resolve('connected') })
-    socket.once('error', () => resolve('refused'))
+  let releaseEngine, factoryEntered
+  const engineGate = new Promise(resolve => { releaseEngine = resolve })
+  const entered = new Promise(resolve => { factoryEntered = resolve })
+  let queryCalls = 0
+  const daemon = new QueryDaemon(root, {
+    endpoint: { host: '127.0.0.1', port: 0 }, tokenPath: path.join(root, 'token'),
+    engineFactory: async () => { factoryEntered(); await engineGate; return { queryBatch: async () => { queryCalls += 1; return [{ ready: true }] }, dispose: async () => {} } },
   })
+  openDaemons.add(daemon)
+  const starting = daemon.start()
+  t.after(() => releaseEngine())
+  await entered
+  const client = new QueryDaemonClient(root, { endpoint: daemon.endpoint, tokenPath: daemon.tokenPath })
+  t.after(() => client.close())
+  const transport = net.createConnection(daemon.endpoint)
+  t.after(() => transport.destroy())
+  await once(transport, 'connect')
+  const connecting = client.connect()
+  assert.equal(queryCalls, 0)
+  let received = false
+  const querying = client.request('queryBatch', { query: { type: 'symbols' } }).then(rows => { received = true; return rows })
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(received, false)
   releaseEngine()
   await starting
-  const socket = net.createConnection(daemonSocketPath(root))
-  await once(socket, 'connect')
-  socket.destroy()
-
-  assert.equal(beforeReady, 'refused')
+  await connecting
+  assert.deepEqual(await querying, [{ ready: true }])
+  assert.equal(queryCalls, 1)
 })
 
 test('hotpath gate: a fresh ready daemon starts within 500 milliseconds with a 100 millisecond stretch diagnostic', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-light-start-perf-'))
   temporaryRoots.add(root)
-  const daemon = new QueryDaemon(root, { engineFactory: async () => ({ queryBatch: async () => [], dispose: async () => {} }) })
+  const daemon = new QueryDaemon(root, { endpoint: { host: '127.0.0.1', port: 0 }, tokenPath: path.join(root, 'token'), engineFactory: async () => ({ queryBatch: async () => [], dispose: async () => {} }) })
   openDaemons.add(daemon)
 
   const started = performance.now()

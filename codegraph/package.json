@@ -1,6 +1,6 @@
 {
   "name": "@mcps/codegraph",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Ultra-fast, zero-overhead type-resolved symbol and call graph engine for TypeScript/JavaScript codebases. Model Context Protocol (MCP) server & CLI with memory-mapped query views and incremental kernel watching.",
   "type": "module",
   "main": "query-client.mjs",

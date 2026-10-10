@@ -294,13 +294,26 @@ export class CodeGraphEngine {
     const read = prefetched?.sources ?? await this.#readSources(needRead, null)
     const changes = accepted.map((event) => event.type === 'unlink' ? event : { ...event, source: event.source ?? read.get(event.path) })
     const refreshed = this.#publishWorkerChanges(changes)
-    const result = { generation: this.validatedGeneration, edgeCoverage: coverageName(manifestCoverage(previous)), parsedFiles: changes.filter((event) => event.type !== 'unlink').map((event) => event.path).sort(), reusedFiles: Object.keys(previous.partitions).filter((file) => !changes.some((event) => event.path === file)).sort(), ...(this.profiler ? { profile: { path: this.profilePath, format: 'chrome-trace-event' } } : {}) }
+    const validation = this.#scheduleValidation(refreshed.revision)
+    const changedPaths = new Set()
+    for (const change of changes) changedPaths.add(change.path)
+    const result = {
+      generation: this.validatedGeneration, edgeCoverage: coverageName(manifestCoverage(previous)), parsedFiles: changes.filter((event) => event.type !== 'unlink').map((event) => event.path).sort(),
+      get reusedFiles() {
+        const files = []
+        for (const file in previous.partitions) if (Object.hasOwn(previous.partitions, file) && !changedPaths.has(file)) files.push(file)
+        files.sort()
+        Object.defineProperty(result, 'reusedFiles', { value: files, enumerable: true, configurable: true, writable: true })
+        return files
+      },
+      ...(this.profiler ? { profile: { path: this.profilePath, format: 'chrome-trace-event' } } : {}),
+    }
     const applyValidation = (validated) => {
       result.validationMode = validated?.validationMode; result.validatedFiles = validated?.validatedFiles; result.generation = validated?.generation ?? result.generation
       result.internalBuildCount = validated?.internalBuildCount; result.internalRebuiltFiles = validated?.internalRebuiltFiles; result.internalReusedFiles = validated?.internalReusedFiles
       return validated
     }
-    result.validation = refreshed.validation.then(applyValidation)
+    result.validation = validation.then(applyValidation)
     return this.#profileResult(result, null)
     }
   }
@@ -371,14 +384,16 @@ export class CodeGraphEngine {
   }
   applyChanges(changes, options = {}) {
     if (this.disposed) throw new Error('codegraph engine is disposed')
-    return this.#publishWorkerChanges(this.#validatePublicChanges(changes, false), options)
+    const metadata = this.#publishWorkerChanges(this.#validatePublicChanges(changes, false), options)
+    return { ...this.provisionalSnapshot(), ...metadata, validation: this.#scheduleValidation(metadata.revision) }
   }
   async applyFileChanges(changes, options = {}) {
     if (this.disposed) throw new Error('codegraph engine is disposed')
     const normalized = this.#validatePublicChanges(changes, true)
     const needRead = normalized.filter((change) => change.type !== 'unlink' && change.source === undefined).map((change) => change.path)
     const sources = await this.#readSources(needRead, null)
-    return this.#publishWorkerChanges(normalized.map((change) => change.type === 'unlink' ? change : { ...change, source: change.source ?? sources.get(change.path) }), options)
+    const metadata = this.#publishWorkerChanges(normalized.map((change) => change.type === 'unlink' ? change : { ...change, source: change.source ?? sources.get(change.path) }), options)
+    return { ...this.provisionalSnapshot(), ...metadata, validation: this.#scheduleValidation(metadata.revision) }
   }
   #validatePublicChanges(changes, diskBacked) {
     if (!Array.isArray(changes)) throw new TypeError('changes must be an array')
@@ -401,8 +416,7 @@ export class CodeGraphEngine {
       this.validationChanges.set(normalized.path, normalized)
     }
     const revision = ++this.validationRevision
-    const snapshot = this.provisionalSnapshot()
-    return { ...snapshot, revision, validatedGeneration: this.validatedGeneration, validation: this.#scheduleValidation(revision) }
+    return { revision, validatedGeneration: this.validatedGeneration }
   }
   registeredFiles() {
     const files = new Set(Object.keys(this.store.readGeneration().partitions))
@@ -421,10 +435,13 @@ export class CodeGraphEngine {
     await this.operationTail.catch(() => {})
     await Promise.allSettled([...this.overlayBuilds.values()])
     this.overlayBuilds.clear()
-    for (const entry of this.validatedQueryViews.values()) for (const coverage of [EDGE_COVERAGE.CALLS, EDGE_COVERAGE.COMPLETE]) entry[coverage]?.release?.()
-    this.validatedQueryViews.clear()
-    if (this.ownsMmapQueryCache) this.mmapQueryCache.dispose()
-    this.provisionalQueryView = null
+    try {
+      for (const entry of this.validatedQueryViews.values()) for (const coverage of [EDGE_COVERAGE.CALLS, EDGE_COVERAGE.COMPLETE]) { entry[coverage]?.detach?.(); entry[coverage]?.release?.() }
+    } finally {
+      this.validatedQueryViews.clear()
+      if (this.ownsMmapQueryCache) this.mmapQueryCache.dispose()
+      this.provisionalQueryView = null
+    }
   }
   snapshot(generation) {
     return this.#validatedQueryView(generation, EDGE_COVERAGE.CALLS).graph
@@ -477,7 +494,7 @@ export class CodeGraphEngine {
       return { metadata: { revision: null, freshness: 'validated', coverage: graph.edgeCoverage, validatedGeneration: graph.generation }, graph, rows: this.query(request, { ...options, queryViewPin: view }) }
     }
     const baseView = this.#validatedQueryView(request.generation, EDGE_COVERAGE.CALLS)
-    const view = request.type === 'refs' || request.type === 'graph' ? (this.#cachedValidatedQueryView(baseView.graph.generation, EDGE_COVERAGE.COMPLETE) ?? baseView) : baseView
+    const view = request.type === 'refs' || request.type === 'graph' ? (this.#cachedValidatedQueryView(baseView.mapped ? baseView.generation : baseView.graph.generation, EDGE_COVERAGE.COMPLETE) ?? baseView) : baseView
     const graph = view.graph
     return { metadata: { revision: null, freshness: 'validated', coverage: graph.edgeCoverage, validatedGeneration: graph.generation }, graph, rows: this.query({ ...request, generation: graph.generation }, { ...options, queryViewPin: view }) }
   }
@@ -487,7 +504,7 @@ export class CodeGraphEngine {
     const semanticTiming = DEBUG_POOL && request.type === 'refs' ? { cache: this.validatedQueryViews.get(request.generation ?? this.validatedGeneration)?.[EDGE_COVERAGE.COMPLETE] ? 'warm' : 'cold', completeEdgeMaterializationMs: 0, refsLookupMs: 0 } : null
     const latest = !request.generation && request.consistency === 'latest'
     let view = options.queryViewPin
-    if (view && (request.type === 'refs' || request.type === 'graph') && coverageCode(view.graph.edgeCoverage) !== EDGE_COVERAGE.COMPLETE) view = null
+    if (view && (request.type === 'refs' || request.type === 'graph') && coverageCode(view.mapped ? view.edgeCoverage : view.graph.edgeCoverage) !== EDGE_COVERAGE.COMPLETE) view = null
     if (!view) {
       if (latest) view = this.#provisionalQueryView()
       else if (request.type === 'refs' || request.type === 'graph') {
@@ -498,7 +515,7 @@ export class CodeGraphEngine {
     }
     if (!view || signal?.aborted) return []
     const lookupStarted = semanticTiming && performance.now()
-    const graph = view.graph
+    const graph = view.mapped ? view : view.graph
     const metadata = latest ? { revision: null, freshness: 'validated', coverage: graph.edgeCoverage, validatedGeneration: graph.generation } : null
     if (view.mapped) {
       const rows = this.#queryMapped(view, request, signal)
@@ -578,27 +595,28 @@ export class CodeGraphEngine {
     if (!lease) return null
     const mapped = lease.value.mappedView
     const mappedEntry = this.validatedQueryViews.get(generation) ?? { manifest: null }
+    mappedEntry[coverage]?.detach?.()
     mappedEntry[coverage]?.release?.()
     mappedEntry[coverage] = mapped
     this.validatedQueryViews.delete(generation); this.validatedQueryViews.set(generation, mappedEntry)
     while (this.validatedQueryViews.size > 2) {
       const oldest = this.validatedQueryViews.keys().next().value
       const evicted = this.validatedQueryViews.get(oldest)
-      for (const kind of [EDGE_COVERAGE.CALLS, EDGE_COVERAGE.COMPLETE]) evicted[kind]?.release?.()
+      for (const kind of [EDGE_COVERAGE.CALLS, EDGE_COVERAGE.COMPLETE]) { evicted[kind]?.detach?.(); evicted[kind]?.release?.() }
       this.validatedQueryViews.delete(oldest)
     }
     return mapped
   }
   #rememberValidatedQueryView(generation, coverage, view, manifest, publishMapped = true) {
     const entry = this.validatedQueryViews.get(generation) ?? { manifest }
-    if (entry[coverage] !== view) entry[coverage]?.release?.()
+    if (entry[coverage] !== view) { entry[coverage]?.detach?.(); entry[coverage]?.release?.() }
     entry[coverage] = view
     this.validatedQueryViews.delete(generation)
     this.validatedQueryViews.set(generation, entry)
     while (this.validatedQueryViews.size > 2) {
       const oldest = this.validatedQueryViews.keys().next().value
       const evicted = this.validatedQueryViews.get(oldest)
-      for (const kind of [EDGE_COVERAGE.CALLS, EDGE_COVERAGE.COMPLETE]) evicted[kind]?.release?.()
+      for (const kind of [EDGE_COVERAGE.CALLS, EDGE_COVERAGE.COMPLETE]) { evicted[kind]?.detach?.(); evicted[kind]?.release?.() }
       this.validatedQueryViews.delete(oldest)
     }
     if (publishMapped) this.mmapQueryCache.publish({ generation, coverage: coverageName(coverage), view: { graph: view.graph, manifest } })
@@ -609,11 +627,12 @@ export class CodeGraphEngine {
   // generation drops it, since partitions are content-addressed and never mutate in place.
   #cacheValidationPartitions(manifest, partitions) {
     const analyzerCounts = new Map()
-    for (const file of Object.keys(partitions)) {
+    const files = Object.keys(partitions).sort((left, right) => left.localeCompare(right))
+    for (const file of files) {
       const analyzer = this.languageAnalyzers.analyzerFor(file)
       if (analyzer) analyzerCounts.set(analyzer.id, (analyzerCounts.get(analyzer.id) ?? 0) + 1)
     }
-    this.validationBasePartitions = { generation: manifest.generation, partitions, analyzerCounts }
+    this.validationBasePartitions = { generation: manifest.generation, partitions, analyzerCounts, files }
     this.validatedManifest = manifest
   }
   #readPartitions(manifest) {
@@ -638,7 +657,8 @@ export class CodeGraphEngine {
       if (cached) return cached
     }
     const manifest = this.store.readGeneration(generation)
-    if (!this.languageAnalyzers.isManifestCompatible(manifest, this.policy.scan())) throw new Error(`generation ${manifest.generation} has incompatible analyzer metadata; reconcile before querying`)
+    const analyzerCounts = this.validationBasePartitions?.generation === manifest.generation ? this.validationBasePartitions.analyzerCounts : null
+    if (!this.languageAnalyzers.isManifestCompatible(manifest, analyzerCounts ?? this.policy.scan())) throw new Error(`generation ${manifest.generation} has incompatible analyzer metadata; reconcile before querying`)
     const cached = this.#cachedValidatedQueryView(manifest.generation, coverage)
     if (cached) return cached
     const stored = manifestCoverage(manifest)
@@ -646,9 +666,17 @@ export class CodeGraphEngine {
       throw new Error(`complete query view for ${manifest.generation} has not been materialized`)
     }
     const graph = this.#graphFromPartitions(manifest, stored)
+    this.mmapQueryCache.publish({ generation: manifest.generation, coverage: coverageName(coverage), view: { graph, manifest } })
+    if (coverage !== stored) this.mmapQueryCache.publish({ generation: manifest.generation, coverage: coverageName(stored), view: { graph, manifest } })
+    const mapped = this.#cachedValidatedQueryView(manifest.generation, stored)
+    if (mapped) {
+      Object.defineProperty(mapped, 'graph', { value: graph })
+      if (coverage !== stored) this.#rememberValidatedQueryView(manifest.generation, coverage, mapped, manifest, false)
+      return mapped
+    }
     const view = this.queryViewFactory(graph, manifest)
-    this.#rememberValidatedQueryView(manifest.generation, coverage, view, manifest)
-    if (coverage !== stored) this.#rememberValidatedQueryView(manifest.generation, stored, view, manifest)
+    this.#rememberValidatedQueryView(manifest.generation, coverage, view, manifest, false)
+    if (coverage !== stored) this.#rememberValidatedQueryView(manifest.generation, stored, view, manifest, false)
     return view
   }
   #provisionalQueryView() {
@@ -888,6 +916,17 @@ export class CodeGraphEngine {
       }
       if (!result.partitions) throw new Error('semantic validation omitted shared partition results')
       if (result.edgePatches !== undefined && (!Array.isArray(result.edgePatches) || result.edgePatches.some((patch) => !patch || typeof patch.key !== 'string' || typeof patch.file !== 'string' || !['base', 'edge'].every((field) => patch[field] == null || typeof patch[field].from === 'string' && typeof patch[field].to === 'string' && Number.isInteger(patch[field].line) && typeof patch[field].call === 'boolean')))) throw new Error('semantic validation returned malformed edge patches')
+      if (result.publicationChanges !== undefined) {
+        const facts = result.publicationChanges
+        if (!facts || !Array.isArray(facts.groups) || !Number.isInteger(facts.rawUnresolvedBeforeCount) || facts.rawUnresolvedBeforeCount < 0) throw new Error('semantic validation returned malformed publication changes')
+        for (const group of facts.groups) {
+          if (!group || typeof group.from !== 'string' || typeof group.to !== 'string' || !Number.isInteger(group.line)) throw new Error('semantic validation returned malformed publication group')
+          for (const side of ['before', 'after']) for (const kind of ['edges', 'unresolved', 'missing']) {
+            if (!Array.isArray(group[side]?.[kind])) throw new Error('semantic validation omitted publication group rows')
+            for (const row of group[side][kind]) if (!row || row.from !== group.from || row.to !== group.to || row.line !== group.line || (kind === 'edges' ? typeof row.call !== 'boolean' : row.reason !== 'dangling-symbol-source' && row.reason !== 'dangling-symbol-target')) throw new Error('semantic validation returned malformed publication group row')
+          }
+        }
+      }
       const partitionsByFile = result.partitions
       const partitionFiles = Object.keys(partitionsByFile)
       if (result.mode === 'full') partitionFiles.sort()
@@ -975,13 +1014,51 @@ export class CodeGraphEngine {
         }
       }
       const generationCoverage = result.mode === 'full' ? EDGE_COVERAGE.COMPLETE : manifestCoverage(base)
+      let publicationView = null; let copiedOutputBytes = 0; let publicationMode = 'existing-fallback'
+      if (result.mode === 'delta' && result.publicationChanges) {
+        const parent = this.#cachedValidatedQueryView(base.generation, generationCoverage)
+        const parentGraph = parent?.mapped ? Object.getOwnPropertyDescriptor(parent, 'graph')?.value ?? (this.validationBasePartitions.files ? { files: this.validationBasePartitions.files, edgeCoverage: coverageName(generationCoverage) } : null) : null
+        if (parentGraph && Array.isArray(result.publicationChanges.groups)) {
+          for (const entry of this.validatedQueryViews.values()) for (const kind of [EDGE_COVERAGE.CALLS, EDGE_COVERAGE.COMPLETE]) {
+            try { copiedOutputBytes += entry[kind]?.detach?.() ?? 0 } catch {}
+          }
+          if (parent.pageOffset === 0) publicationView = { parent, parentGraph, file: changedFiles[0], oldPartition: basePartitions[changedFiles[0]], newPartition: partitionsByFile[changedFiles[0]], publicationChanges: result.publicationChanges }
+        }
+      }
       const generation = this.store.publish({ version: 3, root: this.root, edgeCoverage: coverageName(generationCoverage), controlHashes: controlFileHashes(this.root, this.languageAnalyzers), analyzers: analyzers, sources: sourceIds, sourceMetadata: nextSourceMetadata, partitions: partitionIds, internalPartitions: internalPartitionIds, partitionHashes: partitionIds, parsedFiles: result.mode === 'delta' ? returnedSourceFiles : changedFiles.filter((file) => productionBlobs[file] !== undefined).sort(), validatedFiles, ...(edgePatches.length ? { edgePatches } : {}), unresolvedEdges })
+      if (publicationView) {
+        publicationView.manifest = generation
+        const requested = EDGE_COVERAGE.CALLS
+        this.mmapQueryCache.publish({ generation: generation.generation, coverage: coverageName(requested), view: publicationView })
+        if (requested !== generationCoverage) this.mmapQueryCache.publish({ generation: generation.generation, coverage: coverageName(generationCoverage), view: publicationView })
+        const mapped = this.#cachedValidatedQueryView(generation.generation, generationCoverage)
+        if (mapped) {
+          publicationMode = 'ordered-delta'
+          Object.defineProperty(mapped, 'graph', { value: publicationView.graph })
+          if (requested !== generationCoverage) this.#rememberValidatedQueryView(generation.generation, requested, mapped, generation, false)
+        } else if (publicationView.graph) {
+          const view = this.queryViewFactory(publicationView.graph, generation)
+          this.#rememberValidatedQueryView(generation.generation, requested, view, generation, false)
+          if (requested !== generationCoverage) this.#rememberValidatedQueryView(generation.generation, generationCoverage, view, generation, false)
+        }
+      }
       this.validatedGeneration = generation.generation
       this.publishedValidationRevision = revision
       this.validatedSourceBlobs = sourceIds
       this.validationWorkerHydrated = true
       if (result.mode === 'full') this.#cacheValidationPartitions(generation, partitionsByFile)
       else {
+        if (publicationView?.graph) this.validationBasePartitions.files = publicationView.graph.files
+        else if (this.validationBasePartitions.files) {
+          const files = []; const changed = changedFiles[0]; let inserted = false
+          for (const file of this.validationBasePartitions.files) {
+            if (file === changed) { if (!tombstones.length) files.push(file); inserted = true; continue }
+            if (!inserted && !tombstones.length && changed.localeCompare(file) < 0) { files.push(changed); inserted = true }
+            files.push(file)
+          }
+          if (!inserted && !tombstones.length) files.push(changed)
+          this.validationBasePartitions.files = files
+        }
         for (const change of capturedChanges) {
           const analyzer = this.languageAnalyzers.analyzerFor(change.path)
           if (analyzer) analyzerCounts.set(analyzer.id, (analyzerCounts.get(analyzer.id) ?? 0) + (change.type === 'unlink' ? -1 : Object.hasOwn(base.sources ?? {}, change.path) ? 0 : 1))
@@ -993,7 +1070,7 @@ export class CodeGraphEngine {
       }
       for (const change of capturedChanges) if (this.validationChanges.get(change.path) === change) this.validationChanges.delete(change.path)
       await this.validationWorker.advanceGeneration(result.baseGeneration, generation.generation)
-      return { ...generation, validationMode: result.mode, validatedFiles, internalBuildCount: result.internalBuildCount ?? validatedFiles.length, internalRebuiltFiles: result.internalRebuiltFiles ?? validatedFiles, internalReusedFiles: result.internalReusedFiles ?? [], ...(result.workCounters !== undefined ? { workCounters: result.workCounters } : {}) }
+      return { ...generation, validationMode: result.mode, validatedFiles, internalBuildCount: result.internalBuildCount ?? validatedFiles.length, internalRebuiltFiles: result.internalRebuiltFiles ?? validatedFiles, internalReusedFiles: result.internalReusedFiles ?? [], ...(result.workCounters !== undefined ? { workCounters: result.workCounters } : {}), ...(result.mode === 'delta' ? { publicationMode, copiedOutputBytes } : {}) }
     } catch (error) { this.validationWorkerHydrated = false; this.validationBasePartitions = null; args.status = 'error'; args.error = error.message; throw error } finally { if (token) this.profiler.end(token); try { await this.profiler?.write() } catch {} }
   }
   async #readSources(files, profile) {

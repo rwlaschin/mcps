@@ -236,7 +236,7 @@ async function cleanup() {
     for (const item of roots.values()) if (!item.reads && item.cache && !item.cache.leases.some(Boolean) && heavy?.item !== item && retiringHeavy?.item !== item && running?.item !== item) {
       await releaseQuery(item)
     }
-    if (!running && heavy && !heavy.item.reads) {
+    if (!running && heavy && idle(heavy.item)) {
       const item = heavy.item
       await deactivate()
       if (rss() > retentionHighWaterBytes && !item.reads && item.cache && !item.cache.leases.some(Boolean) && heavy?.item !== item && retiringHeavy?.item !== item && running?.item !== item) await releaseQuery(item)

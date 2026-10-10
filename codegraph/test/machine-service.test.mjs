@@ -220,23 +220,37 @@ test('domain analysis: root scheduling serves a waiting second root before anoth
   assert.deepEqual(completions, ['a', 'b', 'a'])
 })
 
-test('boundary analysis: RSS above one GiB disposes the idle heavy owner after its operation', { timeout: 3000 }, async (t) => {
+for (const { name, owner, interimDisposals, retained, expectedUpdates } of [
+  { name: 'a connected owner reuses one engine across a build and two updates', owner: 'retention-client', interimDisposals: 0, retained: true, expectedUpdates: [{ updated: true }, { updated: true }] },
+  { name: 'an unowned completed operation releases its engine', owner: undefined, interimDisposals: 1, retained: false, expectedUpdates: [] },
+]) test(`boundary analysis: RSS above one GiB ${name}`, { timeout: 3000 }, async (t) => {
   const { createService } = await import('../mcp-server.mjs')
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-machine-pressure-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  let engines = 0
   let disposals = 0
   let disposalCompleted
-  const disposed = new Promise((resolve) => { disposalCompleted = resolve })
+  const disposed = new Promise(resolve => { disposalCompleted = resolve })
   const service = createService({ workerCount: 1, rss: () => 1073741825,
-    engineFactory: () => ({ build: async () => ({ indexed: 1 }), reconcile: async () => {}, incremental: async () => {}, registeredFiles: () => new Set(), dispose: async () => { disposals += 1; disposalCompleted() } }),
+    engineFactory: () => { engines += 1; return { build: async () => ({ indexed: 1 }), reconcile: async () => {}, incremental: async () => ({ updated: true }), registeredFiles: () => new Set(), dispose: async () => { disposals += 1; disposalCompleted() } } },
     watchFactory: () => Object.assign(new EventEmitter(), { close() {} }),
   })
   t.after(() => service.close())
 
-  const result = await service.mutate(root, 'build', { coverage: 'calls' }, { owner: 'retention-client' })
-  await disposed
+  const result = await service.mutate(root, 'build', { coverage: 'calls' }, { owner })
+  const updates = []
+  if (owner) {
+    updates.push(await service.mutate(root, 'incremental', { events: [{ type: 'change', path: 'one.ts' }] }, { owner }))
+    updates.push(await service.mutate(root, 'incremental', { events: [{ type: 'change', path: 'two.ts' }] }, { owner }))
+  }
+  if (!owner) await disposed
+  const afterOperations = { engines, disposals, retained: service.status().heavyRoot === fs.realpathSync(root) }
+  await service.release(fs.realpathSync(root), owner)
 
-  assert.deepEqual({ result, disposals, heavyRoot: service.status().heavyRoot }, { result: { indexed: 1 }, disposals: 1, heavyRoot: null })
+  assert.deepEqual({ result, updates, afterOperations, finalDisposals: disposals, heavyRoot: service.status().heavyRoot, roots: service.status().roots.length }, {
+    result: { indexed: 1 }, updates: expectedUpdates,
+    afterOperations: { engines: 1, disposals: interimDisposals, retained }, finalDisposals: 1, heavyRoot: null, roots: 0,
+  })
 })
 
 for (const { name, rssBytes } of [
@@ -386,14 +400,16 @@ test('domain analysis: cancelling one identical index waiter leaves the survivin
   assert.deepEqual({ result: await surviving, builds, disposals }, { result: { indexed: 1 }, builds: 1, disposals: 0 })
 })
 
-test('domain analysis: RSS pressure preserves an active streamed query owner until the reader releases it', { timeout: 10000 }, async (t) => {
+test('domain analysis: RSS pressure preserves a streamed query engine until its final connected owner releases it', { timeout: 10000 }, async (t) => {
   const { createService } = await import('../mcp-server.mjs')
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-machine-active-reader-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   let rssBytes = 0
   let disposals = 0
+  let disposalCompleted
+  const disposed = new Promise(resolve => { disposalCompleted = resolve })
   const service = createService({ workerCount: 1, rss: () => rssBytes,
-    engineFactory: () => ({ reconcile: async () => {}, registeredFiles: () => new Set(), pinQuery: async () => ({ metadata: {}, rows: [{ sequence: 1 }, { sequence: 2 }] }), dispose: async () => { disposals += 1 } }),
+    engineFactory: () => ({ reconcile: async () => {}, registeredFiles: () => new Set(), pinQuery: async () => ({ metadata: {}, rows: [{ sequence: 1 }, { sequence: 2 }] }), dispose: async () => { disposals += 1; disposalCompleted() } }),
     watchFactory: () => Object.assign(new EventEmitter(), { close() {} }),
   })
   t.after(() => service.close())
@@ -407,7 +423,11 @@ test('domain analysis: RSS pressure preserves an active streamed query owner unt
   const second = await reader.next()
   await reader.return()
 
-  assert.deepEqual({ first, second, heldDisposals, releasedDisposals: disposals }, { first: { value: { sequence: 1 }, done: false }, second: { value: { sequence: 2 }, done: false }, heldDisposals: 0, releasedDisposals: 1 })
+  const afterReaderReturn = disposals
+  await service.release(fs.realpathSync(root), 'reader-client')
+  await disposed
+
+  assert.deepEqual({ first, second, heldDisposals, afterReaderReturn, releasedDisposals: disposals, heavyRoot: service.status().heavyRoot }, { first: { value: { sequence: 1 }, done: false }, second: { value: { sequence: 2 }, done: false }, heldDisposals: 0, afterReaderReturn: 0, releasedDisposals: 1, heavyRoot: null })
 })
 
 test('domain analysis: fallback relationship rows finish materializing before another root disposes their engine', { timeout: 10000 }, async (t) => {

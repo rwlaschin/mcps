@@ -164,8 +164,8 @@ async function fullValidation(snapshot, sources, sourceBlobs, timing, timingMode
   const known = new Set(sources.keys()); const partitions = {}
   for await (const [file, source] of structuralPartitions(context, sources, structuralDiagnostics)) partitions[file] = parsePartition(file, source, known, context, null, EDGE_COVERAGE.COMPLETE)
   const cachedPartitions = symbolPartitions(partitions)
-  cache = { root: path.resolve(snapshot.root), baseGeneration: snapshot.baseGeneration, sourceBlobs: { ...sourceBlobs }, sources, partitions: cachedPartitions, internalFingerprints: partitionFingerprints(partitions), referenceIndex: createCachedReferenceIndex(cachedPartitions), compilerOptions: context.project.getCompilerOptions(), semanticSessions: new Map(), context }
-  return { revision: snapshot.revision, mode: 'full', timingMode, baseGeneration: snapshot.baseGeneration, sourceBlobs, partitions, structuralDiagnostics }
+  cache = { root: path.resolve(snapshot.root), baseGeneration: snapshot.baseGeneration, sourceBlobs: { ...sourceBlobs }, sources, partitions: cachedPartitions, internalFingerprints: partitionFingerprints(partitions), referenceIndex: createCachedReferenceIndex(cachedPartitions), compilerOptions: context.project.getCompilerOptions(), semanticSessions: new Map(), context: null }
+  return { revision: snapshot.revision, mode: 'full', timingMode, baseGeneration: snapshot.baseGeneration, sourceBlobs, partitions, structuralDiagnostics, semanticTraversalSummary: { ...context.semanticTraversalSummary } }
 }
 
 function ownedSnapshot(request, hydrate = false) {
@@ -189,7 +189,7 @@ function ownedSnapshot(request, hydrate = false) {
   const internalFingerprints = hydrate ? { ...(request.internalFingerprints ?? {}) } : partitionFingerprints(partitions)
   if (hydrate && (Object.keys(internalFingerprints).length !== files.length || files.some((file) => typeof internalFingerprints[file] !== 'string'))) throw new Error('semantic internal fingerprint membership mismatch')
   const cachedPartitions = symbolPartitions(partitions)
-  cache = { root: path.resolve(request.root), baseGeneration: request.generation ?? null, sourceBlobs, sources, partitions: cachedPartitions, internalFingerprints, referenceIndex: createCachedReferenceIndex(cachedPartitions, hydrate ? request.baseEdgePatches ?? request.edgePatches ?? [] : []), compilerOptions, semanticSessions: new Map(), context }
+  cache = { root: path.resolve(request.root), baseGeneration: request.generation ?? null, sourceBlobs, sources, partitions: cachedPartitions, internalFingerprints, referenceIndex: createCachedReferenceIndex(cachedPartitions, hydrate ? request.baseEdgePatches ?? request.edgePatches ?? [] : []), compilerOptions, semanticSessions: new Map(), context: null }
   return { mode: 'full', sourceBlobs, partitions }
 }
 
@@ -299,7 +299,7 @@ async function streamOwnedSnapshot(id, request) {
   }
   batches.flush(true)
   assertPoolActive(pool.metadata)
-  cache = { root: path.resolve(request.root), baseGeneration: request.generation ?? null, sourceBlobs, sources, partitions: cachedPartitions, internalFingerprints, referenceIndex: createCachedReferenceIndex(cachedPartitions), compilerOptions: context.project.getCompilerOptions(), semanticSessions: new Map(), context }
+  cache = { root: path.resolve(request.root), baseGeneration: request.generation ?? null, sourceBlobs, sources, partitions: cachedPartitions, internalFingerprints, referenceIndex: createCachedReferenceIndex(cachedPartitions), compilerOptions: context.project.getCompilerOptions(), semanticSessions: new Map(), context: null }
   partitionReceipts.sort((a, b) => a.file < b.file ? -1 : a.file > b.file ? 1 : 0)
   const semanticSessionStats = { ...context.project.getSourceFiles()[0]?.session.stats }
   debugPool('Worker Semantic Timing Summary', id, pool.debugId, { mode: 'full', ...semanticTiming, semanticSessionStats, operationElapsedMs: performance.now() - operationStarted })
@@ -342,10 +342,10 @@ function validateSnapshot(snapshot, timing) {
       delete retainedCache.sourceBlobs[changed.path]
       retainedCache.sources.delete(changed.path)
       const edgePatches = repairCachedReferences(referenceIndex, retainedPartitions, changed.path)
-      updateCachedGraphFacts(referenceIndex, retainedPartitions, changed.path, edgePatches)
+      const publicationChanges = updateCachedGraphFacts(referenceIndex, retainedPartitions, changed.path, edgePatches)
       retainedCache.context = null
       retainedCache.semanticSessions.delete(changed.path)
-      return { revision: snapshot.revision, mode: 'delta', timingMode: 'delta', baseGeneration: snapshot.baseGeneration, sourceBlobs: {}, partitions: {}, tombstones: [changed.path], edgePatches, unresolvedEdges: cachedUnresolvedEdges(referenceIndex), publicationEdgePatches: cachedPublicationEdgePatches(referenceIndex), workCounters, internalBuildCount: 0, internalRebuiltFiles: [], internalReusedFiles: [], semanticTraversalSummary: { completedFiles: 0, remainingFiles: 0, maximumTraversalsPerFile: 0 } }
+      return { revision: snapshot.revision, mode: 'delta', timingMode: 'delta', publicationChanges, baseGeneration: snapshot.baseGeneration, sourceBlobs: {}, partitions: {}, tombstones: [changed.path], edgePatches, unresolvedEdges: cachedUnresolvedEdges(referenceIndex), publicationEdgePatches: cachedPublicationEdgePatches(referenceIndex), workCounters, internalBuildCount: 0, internalRebuiltFiles: [], internalReusedFiles: [], semanticTraversalSummary: { completedFiles: 0, remainingFiles: 0, maximumTraversalsPerFile: 0 } }
     }
     let source = changed.source
     if (source === undefined) {
@@ -382,8 +382,8 @@ function validateSnapshot(snapshot, timing) {
     retainedCache.sources.set(changed.path, source)
     retainedCache.context = context
     const edgePatches = repairCachedReferences(referenceIndex, retainedPartitions, changed.path)
-    updateCachedGraphFacts(referenceIndex, retainedPartitions, changed.path, edgePatches)
-    return { revision: snapshot.revision, mode: 'delta', timingMode: 'delta', baseGeneration: snapshot.baseGeneration, sourceBlobs: { [changed.path]: contentDigest }, partitions, tombstones: [], edgePatches, unresolvedEdges: cachedUnresolvedEdges(referenceIndex), publicationEdgePatches: cachedPublicationEdgePatches(referenceIndex), workCounters, semanticSessionStats: retainedSession.session.stats, internalBuildCount: 1, internalRebuiltFiles: [changed.path], internalReusedFiles: [], semanticTraversalSummary: retainedSession.session.stats.analysisCacheHits ? { completedFiles: 0, remainingFiles: 0, maximumTraversalsPerFile: 0 } : { ...context.semanticTraversalSummary } }
+    const publicationChanges = updateCachedGraphFacts(referenceIndex, retainedPartitions, changed.path, edgePatches)
+    return { revision: snapshot.revision, mode: 'delta', timingMode: 'delta', publicationChanges, baseGeneration: snapshot.baseGeneration, sourceBlobs: { [changed.path]: contentDigest }, partitions, tombstones: [], edgePatches, unresolvedEdges: cachedUnresolvedEdges(referenceIndex), publicationEdgePatches: cachedPublicationEdgePatches(referenceIndex), workCounters, semanticSessionStats: retainedSession.session.stats, internalBuildCount: 1, internalRebuiltFiles: [changed.path], internalReusedFiles: [], semanticTraversalSummary: retainedSession.session.stats.analysisCacheHits ? { completedFiles: 0, remainingFiles: 0, maximumTraversalsPerFile: 0 } : { ...context.semanticTraversalSummary } }
   }
   const sourceBlobs = { ...(snapshot.baseSourceBlobs ?? retainedCache?.sourceBlobs ?? {}) }
   if (changes.length === 1 && snapshot.basePartitionIds) {
@@ -404,9 +404,9 @@ function validateSnapshot(snapshot, timing) {
       delete retainedFingerprints[changed.path]
       delete sourceBlobs[changed.path]
       const edgePatches = repairCachedReferences(referenceIndex, retainedPartitions, changed.path)
-      updateCachedGraphFacts(referenceIndex, retainedPartitions, changed.path, edgePatches)
+      const publicationChanges = updateCachedGraphFacts(referenceIndex, retainedPartitions, changed.path, edgePatches)
       cache = { root: path.resolve(snapshot.root), baseGeneration: snapshot.baseGeneration, sourceBlobs: { ...sourceBlobs }, sources: new Map(), partitions: retainedPartitions, internalFingerprints: retainedFingerprints, referenceIndex, compilerOptions, semanticSessions, context: null }
-      return { revision: snapshot.revision, mode: 'delta', timingMode: 'delta', baseGeneration: snapshot.baseGeneration, sourceBlobs, partitions: {}, tombstones: [changed.path], edgePatches, unresolvedEdges: cachedUnresolvedEdges(referenceIndex), publicationEdgePatches: cachedPublicationEdgePatches(referenceIndex), internalBuildCount: 0, internalRebuiltFiles: [], internalReusedFiles: [], semanticTraversalSummary: { completedFiles: 0, remainingFiles: 0, maximumTraversalsPerFile: 0 } }
+      return { revision: snapshot.revision, mode: 'delta', timingMode: 'delta', publicationChanges, baseGeneration: snapshot.baseGeneration, sourceBlobs: {}, partitions: {}, tombstones: [changed.path], edgePatches, unresolvedEdges: cachedUnresolvedEdges(referenceIndex), publicationEdgePatches: cachedPublicationEdgePatches(referenceIndex), internalBuildCount: 0, internalRebuiltFiles: [], internalReusedFiles: [], semanticTraversalSummary: { completedFiles: 0, remainingFiles: 0, maximumTraversalsPerFile: 0 } }
     }
     let source = changed.source
     if (source === undefined) {
@@ -434,10 +434,10 @@ function validateSnapshot(snapshot, timing) {
     const { internalPartition, internalFingerprint, ...symbolPartition } = partition
     cachedPartitions[changed.path] = symbolPartition
     const edgePatches = repairCachedReferences(referenceIndex, cachedPartitions, changed.path)
-    updateCachedGraphFacts(referenceIndex, cachedPartitions, changed.path, edgePatches)
+    const publicationChanges = updateCachedGraphFacts(referenceIndex, cachedPartitions, changed.path, edgePatches)
     const internalFingerprints = { ...retainedFingerprints, ...partitionFingerprints(partitions) }
     cache = { root: path.resolve(snapshot.root), baseGeneration: snapshot.baseGeneration, sourceBlobs: { ...sourceBlobs }, sources, partitions: cachedPartitions, internalFingerprints, referenceIndex, compilerOptions, semanticSessions, context }
-    return { revision: snapshot.revision, mode: 'delta', timingMode: 'delta', baseGeneration: snapshot.baseGeneration, sourceBlobs, partitions, edgePatches, unresolvedEdges: cachedUnresolvedEdges(referenceIndex), publicationEdgePatches: cachedPublicationEdgePatches(referenceIndex), semanticSessionStats: retainedSession.session.stats, internalBuildCount: 1, internalRebuiltFiles: [changed.path], internalReusedFiles: [], semanticTraversalSummary: { ...context.semanticTraversalSummary } }
+    return { revision: snapshot.revision, mode: 'delta', timingMode: 'delta', publicationChanges, baseGeneration: snapshot.baseGeneration, sourceBlobs: { [changed.path]: contentDigest }, partitions, edgePatches, unresolvedEdges: cachedUnresolvedEdges(referenceIndex), publicationEdgePatches: cachedPublicationEdgePatches(referenceIndex), semanticSessionStats: retainedSession.session.stats, internalBuildCount: 1, internalRebuiltFiles: [changed.path], internalReusedFiles: [], semanticTraversalSummary: { ...context.semanticTraversalSummary } }
   }
   if (changes.length === 1) throw new Error(`single-file semantic delta cannot process: ${changes[0].path}`)
   let sources

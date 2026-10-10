@@ -267,6 +267,31 @@ test('cache compatibility: a legacy TypeScript manifest cannot activate when ano
   assert.equal(registry.isManifestCompatible({ version: 3 }, ['src/value.ts', 'cmd/server/main.go', 'go.mod']), false)
 })
 
+// Equivalence, boundary, all-pairs, error-guessing and domain analysis:
+// count zero/one/many × current/missing/stale metadata × TS-only/mixed ownership.
+for (const { name, manifest, counts, compatible } of [
+  { name: 'one active TypeScript owner accepts its matching cache key', manifest: { analyzers: { typescript: 'typescript-1' } }, counts: [['typescript', 1]], compatible: true },
+  { name: 'many active TypeScript owners reject a stale cache key', manifest: { analyzers: { typescript: 'typescript-0' } }, counts: [['typescript', 30]], compatible: false },
+  { name: 'an active TypeScript owner rejects a missing cache key', manifest: { analyzers: {} }, counts: [['typescript', 1]], compatible: false },
+  { name: 'zero Go owners ignore a stale inactive Go cache key', manifest: { analyzers: { typescript: 'typescript-1', go: 'go-0' } }, counts: [['typescript', 1], ['go', 0]], compatible: true },
+  { name: 'one active Go owner rejects its stale cache key', manifest: { analyzers: { typescript: 'typescript-1', go: 'go-0' } }, counts: [['typescript', 1], ['go', 1]], compatible: false },
+  { name: 'mixed active owners accept both matching cache keys', manifest: { analyzers: { typescript: 'typescript-1', go: 'go-1' } }, counts: [['typescript', 1], ['go', 1]], compatible: true },
+  { name: 'legacy metadata accepts TypeScript with inactive Go', manifest: { version: 3 }, counts: [['typescript', 1], ['go', 0]], compatible: true },
+  { name: 'legacy metadata rejects an active Go owner', manifest: { version: 3 }, counts: [['typescript', 1], ['go', 1]], compatible: false },
+  { name: 'empty maintained counts accept an empty generation', manifest: { analyzers: {} }, counts: [], compatible: true },
+]) {
+  test(`maintained analyzer counts: ${name}`, async () => {
+    const { createLanguageAnalyzers } = await loadRegistry()
+    const registry = createLanguageAnalyzers('/repo', [
+      () => descriptor('typescript', ['.ts', '.js'], ['tsconfig.json', 'jsconfig.json']),
+      () => descriptor('go', ['.go'], ['go.mod']),
+    ])
+    // Any accidental file-based lookup must fail, even when counts are valid.
+    registry.metadata = () => { throw new Error('maintained counts traversed file metadata') }
+    assert.equal(registry.isManifestCompatible(manifest, new Map(counts)), compatible)
+  })
+}
+
 test('parity fixture: TypeScript and JavaScript partition bytes and normalized manifest remain exact', async () => {
   const root = copyFixture()
   const engine = new CodeGraphEngine(root)

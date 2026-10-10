@@ -48,6 +48,12 @@ export function createLanguageAnalyzers(root, factories) {
     active(files) { return [...new Set(files.map((file) => registry.analyzerFor(file)).filter(Boolean))] },
     metadata(files) { return Object.fromEntries(registry.active(files).map(({ id, cacheKey }) => [id, cacheKey])) },
     isManifestCompatible(manifest, files) {
+      if (files instanceof Map) {
+        for (const analyzer of analyzers) if ((files.get(analyzer.id) ?? 0) > 0) {
+          if (manifest.analyzers ? manifest.analyzers[analyzer.id] !== analyzer.cacheKey : analyzer.id !== 'typescript') return false
+        }
+        return true
+      }
       const active = registry.metadata(files)
       return manifest.analyzers ? Object.entries(active).every(([id, key]) => manifest.analyzers[id] === key) : Object.keys(active).every((id) => id === 'typescript')
     },

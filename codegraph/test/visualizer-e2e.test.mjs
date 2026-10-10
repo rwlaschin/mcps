@@ -3,6 +3,49 @@ import assert from "node:assert/strict"
 import vm from "node:vm"
 import { createVisualizerServer, startVisualizer } from "../visualizer.mjs"
 import { EventEmitter } from "node:events"
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { QueryDaemon } from '../query-daemon.mjs'
+import { createService } from '../mcp-server.mjs'
+import { subscribeChanges } from '../query-client.mjs'
+
+async function ownedSubscriptionVisualizer(t) {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cg-visualizer-sse-')))
+  fs.mkdirSync(path.join(root, 'src'))
+  const sourcePath = path.join(root, 'src/a.ts')
+  fs.writeFileSync(sourcePath, 'export function a(){ return 1 }\n')
+  const service = createService({ workerCount: 1 })
+  const daemon = new QueryDaemon(root, {
+    endpoint: { host: '127.0.0.1', port: 0 }, tokenPath: path.join(root, 'token'),
+    serviceFactory: () => service,
+  })
+  let server, subscription
+  t.after(async () => {
+    await server?.watcher?.close()
+    server?.emit('close')
+    await subscription
+    await daemon.close()
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+  await daemon.start()
+  const built = await service.mutate(root, 'build')
+  const watcher = new EventEmitter()
+  watcher.close = async () => { const release = await subscription; await release?.() }
+  server = createVisualizerServer(root, {
+    debounceMs: 10,
+    sourcePolicy: { acceptWatchPath: file => file === sourcePath },
+    watch: (_root, _options, callback) => {
+      subscription = subscribeChanges(root, event => {
+        watcher.emit('status', event)
+        if (event.status === 'indexing' || event.status === 'ready') callback('change', 'src/a.ts')
+      }, { endpoint: daemon.endpoint, tokenPath: daemon.tokenPath })
+      return watcher
+    },
+  })
+  await subscription
+  return { server, watcher, sourcePath, root, generation: built.generation }
+}
 
 function simulateRequest(server, url, method = "GET") {
   return new Promise((resolve) => {
@@ -69,7 +112,9 @@ test('E2E: complexity heatmap batches equal cells into color paths and resolves 
 
   assert.deepEqual({
     createsBatchedPaths: /createElementNS\([^\n]+"path"\)/.test(renderer) && /(?:new Map|Map\()/.test(renderer),
-    createsPerFunctionRects: /createElementNS\([^\n]+"rect"\)/.test(renderer),
+    createsPerFunctionRects: [...renderer.matchAll(/createElementNS\([^\n]+"rect"\)/g)].length !== 1 || !/const marker = document\.createElementNS\([^\n]+"rect"\)/.test(renderer),
+    singleSelectionMarker: /marker\.setAttribute\("id", "complexity-selection"\)/.test(renderer) && /marker\.setAttribute\("pointer-events", "none"\)/.test(renderer),
+    targetsSelectedCell: /marker\.setAttribute\("x", item\.x\); marker\.setAttribute\("y", item\.y\)/.test(res.body) && /marker\.setAttribute\("width", item\.width\); marker\.setAttribute\("height", item\.height\)/.test(res.body),
     createsTextElements: /createElementNS\([^\n]+"text"\)/.test(renderer),
     resolvesGridCoordinates: /getBoundingClientRect/.test(renderer) && /Math\.floor/.test(renderer),
     previewsOnHover: /(?:pointermove|mousemove|mouseover)/.test(renderer) && /selection-details/.test(renderer),
@@ -78,6 +123,8 @@ test('E2E: complexity heatmap batches equal cells into color paths and resolves 
   }, {
     createsBatchedPaths: true,
     createsPerFunctionRects: false,
+    singleSelectionMarker: true,
+    targetsSelectedCell: true,
     createsTextElements: false,
     resolvesGridCoordinates: true,
     previewsOnHover: true,
@@ -261,96 +308,56 @@ test("E2E: visualizer server serves chord data on /chord", async () => {
   assert.equal(data.project.root, "/test/root")
 })
 
-test("E2E: visualizer server serves /events SSE stream with connected status", async () => {
-  const server = createVisualizerServer("/test/root")
-  const p = new Promise((resolve) => {
-    const req = new EventEmitter()
-    req.url = "/events"
-    req.method = "GET"
-    req.headers = { host: "127.0.0.1:7331" }
-
-    const res = new EventEmitter()
-    let statusCode = 0
-    const headers = {}
-    let initialChunk = ""
-
-    res.writeHead = (code, h = {}) => {
-      statusCode = code
-      Object.assign(headers, h)
-    }
-    res.write = (chunk) => {
-      initialChunk += chunk
-      req.emit("close")
-      resolve({ statusCode, headers, initialChunk })
-    }
-    res.end = () => {}
-
-    server.emit("request", req, res)
-  })
-
-  const res = await p
-  assert.equal(res.statusCode, 200)
-  assert.equal(res.headers["content-type"], "text/event-stream")
-  assert.ok(res.initialChunk.includes('data: {"status":"connected"}'))
+test("E2E: visualizer server serves /events SSE stream with connected status", async (t) => {
+  const { server } = await ownedSubscriptionVisualizer(t)
+  const req = new EventEmitter()
+  req.url = '/events'; req.method = 'GET'; req.headers = { host: '127.0.0.1:7331' }
+  const res = new EventEmitter()
+  let statusCode, headers, initialChunk = ''
+  res.writeHead = (code, values) => { statusCode = code; headers = values }
+  res.write = chunk => { initialChunk += chunk; return true }
+  res.end = () => {}
+  t.after(() => req.emit('close'))
+  server.emit('request', req, res)
+  assert.equal(statusCode, 200)
+  assert.equal(headers['content-type'], 'text/event-stream')
+  assert.ok(initialChunk.includes('data: {"status":"connected"}'))
 })
 
-test("E2E: visualizer detects file change, logs debounce, and dispatches ready event over SSE", async () => {
-  const os = await import("node:os")
-  const fs = await import("node:fs")
-  const path = await import("node:path")
-
-  const rawTmp = fs.mkdtempSync(path.join(os.tmpdir(), "codegraph-test-"))
-  const tmpRoot = fs.realpathSync(rawTmp)
-  const codegraphDir = path.join(tmpRoot, ".codegraph")
-  fs.mkdirSync(codegraphDir, { recursive: true })
-
-  try {
-    const server = createVisualizerServer(tmpRoot, { debounceMs: 150, usePolling: true })
-    const receivedEvents = []
-
-    const req = new EventEmitter()
-    req.url = "/events"
-    req.method = "GET"
-    req.headers = { host: "127.0.0.1:7331" }
-
-    const res = new EventEmitter()
-    res.writeHead = () => {}
-    res.write = (chunk) => {
-      const lines = chunk.toString().split("\n")
-      for (const line of lines) {
-        if (line.startsWith("data: ")) {
-          try {
-            receivedEvents.push(JSON.parse(line.slice(6)))
-          } catch {}
-        }
-      }
+test("E2E: visualizer detects file change, logs debounce, and dispatches ready event over SSE", async (t) => {
+  const { server, watcher, sourcePath, root, generation } = await ownedSubscriptionVisualizer(t)
+  const receivedEvents = []
+  const req = new EventEmitter()
+  req.url = '/events'; req.method = 'GET'; req.headers = { host: '127.0.0.1:7331' }
+  const res = new EventEmitter()
+  res.writeHead = () => {}
+  let resolveReady
+  const ready = new Promise(resolve => { resolveReady = resolve })
+  res.write = chunk => {
+    for (const line of String(chunk).split('\n')) if (line.startsWith('data: ')) {
+      const event = JSON.parse(line.slice(6))
+      receivedEvents.push(event)
+      if (event.status === 'ready') resolveReady()
     }
-    res.end = () => {}
-
-    server.emit("request", req, res)
-    assert.equal(receivedEvents[0]?.status, "connected")
-
-    // Wait for chokidar watcher to be fully ready
-    if (server.watcher) {
-      await new Promise((r) => server.watcher.on("ready", r))
-    }
-
-    // Simulate CodeGraph daemon updating .codegraph/CURRENT
-    fs.writeFileSync(path.join(codegraphDir, "CURRENT"), "gen-test-12345\n")
-
-    // Wait for the 150ms quiet-window debounce to complete and broadcast
-    await new Promise((r) => setTimeout(r, 450))
-
-    // Confirm that the server detected the file and broadcasted indexing then ready
-    const statuses = receivedEvents.map((e) => e.status)
-    assert.ok(statuses.includes("indexing"), "Server must broadcast indexing status when file changes")
-    assert.ok(statuses.includes("ready"), "Server must broadcast ready status after debounce quiet period")
-
-    req.emit("close")
-    await server.watcher?.close()
-  } finally {
-    fs.rmSync(tmpRoot, { recursive: true, force: true })
+    return true
   }
+  res.end = () => {}
+  t.after(() => req.emit('close'))
+  server.emit('request', req, res)
+  assert.equal(receivedEvents[0]?.status, 'connected')
+  let resolvePublished
+  const published = new Promise(resolve => { resolvePublished = resolve })
+  watcher.on('status', event => { if (event.status === 'ready') resolvePublished() })
+  fs.writeFileSync(sourcePath, 'export function a(){ return 2 }\n')
+  await published
+  const current = fs.readFileSync(path.join(root, '.codegraph/CURRENT'), 'utf8').trim()
+  assert.notEqual(current, generation, 'Native source mutation must publish a new validated generation')
+  const manifest = JSON.parse(fs.readFileSync(path.join(root, '.codegraph/generations', current + '.json'), 'utf8'))
+  assert.equal(fs.readFileSync(path.join(root, '.codegraph/sources', manifest.sources['src/a.ts']), 'utf8'), fs.readFileSync(sourcePath, 'utf8'))
+  await ready
+  const statuses = receivedEvents.map(event => event.status)
+  assert.ok(statuses.includes('indexing'), 'Server must broadcast indexing status when file changes')
+  assert.ok(statuses.includes('ready'), 'Server must broadcast ready status after debounce quiet period')
 })
 
 test("E2E: visualizer server returns 404 on unknown routes", async () => {
@@ -409,10 +416,13 @@ test('E2E: complexity inspector counts only flagged for-family nodes and semanti
   const server = createVisualizerServer('/test/root')
   const res = await simulateRequest(server, '/')
   const inspector = res.body.slice(res.body.indexOf('function selectSummaryItem('), res.body.indexOf('canvas.addEventListener("click"'))
+  const producer = fs.readFileSync(new URL('../daemon-query-engine.mjs', import.meta.url), 'utf8')
+  const detailsProducer = producer.slice(producer.indexOf("if (request.operation === 'details')"), producer.indexOf('const cap ='))
   assert.deepEqual({
-    flaggedForLoops: /record\.record\s*===\s*["']node["'][\s\S]*?record\.node\.flags\s*&\s*1/.test(inspector),
-    callRelations: /record\.record\s*===\s*["']relation["'][\s\S]*?record\.relation\.kind\s*===\s*["']call["']/.test(inspector),
-  }, { flaggedForLoops: true, callRelations: true })
+    flaggedForLoops: /node\.flags\s*&\s*1\)\s*forLoops\+\+/.test(detailsProducer) && /field\(forLoops\)/.test(inspector),
+    callRelations: /relation\.kind\s*===\s*["']call["'][\s\S]*?functionCalls\+\+/.test(detailsProducer) && /field\(functionCalls\)/.test(inspector),
+    compactDetails: /const \{ forLoops, functionCalls, targetSymbolIds \} = selectedDetails/.test(inspector) && /record\.record === ["']details["']/.test(inspector),
+  }, { flaggedForLoops: true, callRelations: true, compactDetails: true })
 })
 
 test('E2E: complexity inspector does not render the miniature control-flow graph', async () => {
@@ -432,7 +442,7 @@ test('E2E: 320-pixel Complexity inspector contains its ordered metric and conten
     fixedTextControl: /className\s*=\s*["']ctrl-btn["']/.test(inspector),
     scalarMetricGrid: /grid-template-columns:\s*repeat\(3,\s*1fr\)/.test(res.body) && /append\([^)]*cyclomatic[^)]*nesting[^)]*branching/.test(inspector),
     contentsGrid: /grid-template-columns:\s*repeat\(2,\s*1fr\)/.test(res.body) && /append\([^)]*loopCount[^)]*callCount/.test(inspector),
-    calledFunctionsHeading: /Called functions[^\n]*calls\.length|calls\.length[^\n]*Called functions/.test(inspector),
+    calledFunctionsHeading: /Called functions[^\n]*targetSymbolIds\.length/.test(inspector) && /calledHeading\.dataset\.totalCalls\s*=\s*functionCalls/.test(inspector) && /field\(functionCalls\)/.test(inspector),
     safeValueWrapping: /\.node-detail-val\s*\{[^}]*overflow-wrap:\s*anywhere[^}]*word-break:\s*normal/.test(res.body),
   }, { fixedSidebar: true, containedDetails: true, fixedTextControl: false, scalarMetricGrid: true, contentsGrid: true, calledFunctionsHeading: true, safeValueWrapping: true })
 })
@@ -448,7 +458,7 @@ test('E2E: Complexity inspector call navigation handles long resolved unavailabl
     keyboardFocus: /\.sidebar-item-link:focus-visible\s*\{/.test(res.body),
     unavailableTarget: /createElement\(["']span["']\)[\s\S]*className\s*=\s*["'][^"']*(?:muted|unavailable)[^"']*["'][\s\S]*\.title\s*=/.test(inspector) && /text-overflow:\s*ellipsis/.test(res.body),
     emptyCalls: /No internal function calls/.test(inspector),
-    navigationOrder: /appendChild\(back\)[\s\S]*appendChild\(calledHeading\)[\s\S]*for\s*\(const call of calls\)/.test(inspector),
+    navigationOrder: /appendChild\(back\)[\s\S]*appendChild\(calledHeading\)[\s\S]*for\s*\(const targetSymbolId of targetSymbolIds\)/.test(inspector),
   }, { contextualBack: true, resolvedLongNames: true, stackedCallButton: true, keyboardFocus: true, unavailableTarget: true, emptyCalls: true, navigationOrder: true })
 })
 

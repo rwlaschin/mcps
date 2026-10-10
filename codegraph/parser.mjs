@@ -1,8 +1,7 @@
 import path from 'node:path'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
-import { Node, SyntaxKind, ts, getCompilerOptionsFromTsConfig } from 'ts-morph'
-import { RealFileSystemHost } from '@ts-morph/common'
+import { SyntaxKind, ts, getCompilerOptionsFromTsConfig, RealFileSystemHost } from '@ts-morph/common'
 import { PrefetchedFileSystemHost } from './prefetched-file-system.mjs'
 import { createRawSemanticProject } from './one-file-semantic-library.mjs'
 import { EDGE_COVERAGE, requireCoverage } from './edge-coverage.mjs'
@@ -86,14 +85,14 @@ export function createOneFileSemanticProject(root, sources) {
 
 function nodeName(node) {
   const named = node.getName?.(); if (named) return named
-  if (Node.isConstructorDeclaration(node)) return 'constructor'
-  if ((Node.isFunctionDeclaration(node) || Node.isClassDeclaration(node)) && node.isDefaultExport?.()) return 'default'
+  if ((node?.compilerNode.kind === SyntaxKind.Constructor)) return 'constructor'
+  if (((node?.compilerNode.kind === SyntaxKind.FunctionDeclaration) || (node?.compilerNode.kind === SyntaxKind.ClassDeclaration)) && node.isDefaultExport?.()) return 'default'
   return null
 }
 
 function semanticPath(node) {
   const parts = []
-  for (let cur = node.getParent(); cur && !Node.isSourceFile(cur); cur = cur.getParent()) {
+  for (let cur = node.getParent(); cur && !(cur?.compilerNode.kind === SyntaxKind.SourceFile); cur = cur.getParent()) {
     const name = nodeName(cur)
     if (name) parts.unshift(`${declarationKinds.get(cur.getKind()) ?? cur.getKindName()}:${name}`)
   }
@@ -108,7 +107,7 @@ function semanticSignature(node) {
   return `<${typeParameters}>(${parameters}):${returnType || declaredType}`
 }
 
-function collectFileSyntax(file, source, lineCursor, timing, preparedStructuralGraph, deferStructuralGraph = false) {
+function collectFileSyntax(file, source, lineCursor, timing, preparedStructuralGraph, deferStructuralGraph = false, byDeclaration = null) {
   const started = performance.now()
   const nodesByKind = new Map([...declarationKinds.keys()].map((syntaxKind) => [syntaxKind, []]))
   const identifiers = []
@@ -119,7 +118,7 @@ function collectFileSyntax(file, source, lineCursor, timing, preparedStructuralG
   lineCursor.reset(source)
   const record = (node, owner) => {
     const bucket = nodesByKind.get(node.getKind())
-    const isIdentifier = Node.isIdentifier(node)
+    const isIdentifier = (node?.compilerNode.kind === SyntaxKind.Identifier)
     let fact = bucket ? syntaxFacts.get(node.compilerNode) : null
     if (bucket && !fact) { fact = { name: nodeName(node), signature: semanticSignature(node) }; syntaxFacts.set(node.compilerNode, fact) }
     if (bucket || isIdentifier) {
@@ -129,7 +128,52 @@ function collectFileSyntax(file, source, lineCursor, timing, preparedStructuralG
     }
     return fact?.name ? node.compilerNode : owner
   }
-  if (nativeTraversal) {
+  if (structuralCache && file.session?.sourceFile === file.compilerNode) {
+    const inventories = structuralCache.inventories ??= new WeakMap()
+    const stats = structuralCache.inventoryStats = { rebuiltOwners: 0, reusedOwners: 0, visitedNodes: 0, deletedDeclarations: 0 }
+    const boundary = node => declarationKinds.has(node.kind) || ts.isFunctionLike(node) || node.kind === SyntaxKind.Block || node.kind === SyntaxKind.CatchClause || node.kind === SyntaxKind.ModuleBlock
+    const relevant = node => declarationKinds.has(node.kind) || node.kind === SyntaxKind.Identifier
+    const replay = (root, inherited) => {
+      const owner = relevant(root) ? record(file.session.wrap(root), inherited) : inherited
+      const retained = inventories.get(root)
+      if (retained) {
+        retained.currentSourceRoot = file.compilerNode
+        stats.reusedOwners += 1
+        for (const entry of retained.entries) {
+          const incoming = entry.owner ?? owner
+          if (entry.nested) replay(entry.node, incoming)
+          else record(file.session.wrap(entry.node), incoming)
+        }
+        return
+      }
+      stats.rebuiltOwners += 1
+      const entries = []
+      const visitChildren = (node, incoming) => {
+        const items = children ? [] : null
+        ts.forEachChild(node, child => {
+          stats.visitedNodes += 1
+          if (children) items.push(file.session.wrap(child))
+          const savedOwner = incoming === owner ? null : incoming
+          if (boundary(child)) { entries.push({ node: child, owner: savedOwner, nested: true }); replay(child, incoming); return }
+          let nextOwner = incoming
+          if (relevant(child)) { entries.push({ node: child, owner: savedOwner }); nextOwner = record(file.session.wrap(child), incoming) }
+          visitChildren(child, nextOwner)
+        })
+        if (children) children.set(node, items)
+      }
+      visitChildren(root, owner)
+      inventories.set(root, { entries, currentSourceRoot: file.compilerNode })
+    }
+    replay(file.compilerNode, null)
+    const prune = root => {
+      const retained = inventories.get(root)
+      if (!retained || retained.currentSourceRoot === file.compilerNode) return
+      if (declarationKinds.has(root.kind) && byDeclaration?.delete(root)) stats.deletedDeclarations += 1
+      for (const entry of retained.entries) if (entry.nested) prune(entry.node)
+    }
+    if (structuralCache.currentRoot) prune(structuralCache.currentRoot)
+    structuralCache.currentRoot = file.compilerNode
+  } else if (nativeTraversal) {
     const visit = (node, owner) => {
       const nextOwner = declarationKinds.has(node.kind) || node.kind === SyntaxKind.Identifier ? record(file.session.wrap(node), owner) : owner
       ts.forEachChild(node, child => { visit(child, nextOwner) })
@@ -156,7 +200,13 @@ function collectFileSyntax(file, source, lineCursor, timing, preparedStructuralG
       const qualifiedPath = semanticPath(node)
       const group = `${qualifiedPath}:${kind}:${name}:${signature}`; const ordinal = groups.get(group) ?? 0; groups.set(group, ordinal + 1)
       const rel = slash(path.relative(file.getProject().__codegraphRoot, file.getFilePath()))
-      result.push({ node, identity: { id: contentHash(`${rel}\0${qualifiedPath}\0${kind}\0${name}\0${signature}\0${ordinal}`).slice(0, 24), file: rel, name, kind, line, qualifiedPath, signature, ordinal } })
+      const fact = syntaxFacts.get(node.compilerNode)
+      const previous = fact.identity
+      const identity = previous && previous.file === rel && previous.name === name && previous.kind === kind && previous.signature === signature && previous.qualifiedPath === qualifiedPath && previous.ordinal === ordinal
+        ? previous.line === line ? previous : { ...previous, line }
+        : { id: contentHash(`${rel}\0${qualifiedPath}\0${kind}\0${name}\0${signature}\0${ordinal}`).slice(0, 24), file: rel, name, kind, line, qualifiedPath, signature, ordinal }
+      fact.identity = identity
+      result.push({ node, identity })
     }
   }
   const rel = slash(path.relative(file.getProject().__codegraphRoot, file.getFilePath()))
@@ -175,15 +225,16 @@ function ensureSemanticFile(context, file, profiler = context.profiler) {
     const args = { file: rel, descendantTraversals: 1, declarationCount: 0, identifierCount: 0 }
     const profile = profiler?.begin('collect-file-syntax', args)
     try {
-      for (const node of context.nodesByFile.get(filePath) ?? []) context.byDeclaration.delete(node)
+      const retainedFacts = file.session?.sourceFile === file.compilerNode ? file.structuralCache : null
+      if (!retainedFacts) for (const node of context.nodesByFile.get(filePath) ?? []) context.byDeclaration.delete(node)
       const preparedStructuralGraph = context.preparedStructuralGraphs?.get(filePath)
-      const analysis = collectFileSyntax(file, file.getFullText(), context.lineCursor, context.semanticTiming, preparedStructuralGraph, context.deferStructuralGraph)
+      const analysis = collectFileSyntax(file, file.getFullText(), context.lineCursor, context.semanticTiming, preparedStructuralGraph, context.deferStructuralGraph, context.byDeclaration)
       context.preparedStructuralGraphs?.delete(filePath)
       args.declarationCount = analysis.rows.length
       args.identifierCount = analysis.identifiers.length
       context.perFile.set(filePath, analysis)
-      context.nodesByFile.set(filePath, analysis.rows.map((row) => row.node.compilerNode))
-      for (const row of analysis.rows) context.byDeclaration.set(row.node.compilerNode, row.identity)
+      if (!retainedFacts) context.nodesByFile.set(filePath, analysis.rows.map((row) => row.node.compilerNode))
+      for (const row of analysis.rows) if (context.byDeclaration.get(row.node.compilerNode) !== row.identity) context.byDeclaration.set(row.node.compilerNode, row.identity)
       context.preparedFiles.add(filePath)
       const traversals = (context.traversalsByFile.get(filePath) ?? 0) + 1
       context.traversalsByFile.set(filePath, traversals)
@@ -207,8 +258,10 @@ export function refreshSemanticFiles(context, files, profiler = null) {
       context.eligibleFiles.add(filePath)
       context.semanticTraversalSummary.remainingFiles += 1
     }
-    for (const node of context.nodesByFile.get(filePath) ?? []) context.byDeclaration.delete(node)
-    context.nodesByFile.delete(filePath)
+    if (file.session?.sourceFile !== file.compilerNode) {
+      for (const node of context.nodesByFile.get(filePath) ?? []) context.byDeclaration.delete(node)
+      context.nodesByFile.delete(filePath)
+    }
     context.perFile.delete(filePath)
     context.traversalsByFile.delete(filePath)
     if (context.preparedFiles.delete(filePath)) {
@@ -248,9 +301,9 @@ function identityForSymbol(symbol, context, identifierArgs) {
 
 function callExpressionForIdentifier(ident) {
   const parent = ident.getParent()
-  if (Node.isCallExpression(parent) && parent.getExpression() === ident) return true
+  if ((parent?.compilerNode.kind === SyntaxKind.CallExpression) && parent.getExpression() === ident) return true
   const grand = parent?.getParent()
-  return Node.isPropertyAccessExpression(parent) && parent.getNameNode() === ident && Node.isCallExpression(grand) && grand.getExpression() === parent
+  return (parent?.compilerNode.kind === SyntaxKind.PropertyAccessExpression) && parent.getNameNode() === ident && (grand?.compilerNode.kind === SyntaxKind.CallExpression) && grand.getExpression() === parent
 }
 
 function resolveIdentifierEdges(identifiers, localByNode, context, identifierArgs, coverage, targetByIdentifier, resolveMissing = null, references = null) {
@@ -305,7 +358,7 @@ export function parsePartition(rel, source, knownFiles, context, profiler = null
   let nestedStarted = context.semanticTiming && context.semanticTiming.syntaxCollectionMs + context.semanticTiming.structuralCfgMs
   const exportedIds = new Set()
   const symbolRows = rows.map(({ identity }) => identity)
-  const bindings = extractCachedBindings(file.compilerNode, symbolRows, ts, exportedIds)
+  const bindings = extractCachedBindings(file.compilerNode, symbolRows, ts, exportedIds, file.structuralCache)
   exportArgs.exportsVisited = bindings.length
   if (context.semanticTiming) context.semanticTiming.exportsMs += Math.max(0, performance.now() - started - (context.semanticTiming.syntaxCollectionMs + context.semanticTiming.structuralCfgMs - nestedStarted))
   if (exportProfile) profiler.end(exportProfile)
@@ -323,16 +376,16 @@ export function parsePartition(rel, source, knownFiles, context, profiler = null
   const references = []
   const resolveMissing = (ident, symbol) => {
     const parent = ident.getParent()
-    if (Node.isPropertyAccessExpression(parent) && parent.getNameNode() === ident) return null
+    if ((parent?.compilerNode.kind === SyntaxKind.PropertyAccessExpression) && parent.getNameNode() === ident) return null
     const imported = imports.get(ident.getText())
     if (!imported) return null
     const declaration = symbol.getDeclarations?.().find((node) => node.getStart() >= imported.start && node.getEnd() <= imported.end)
     if (!declaration) return null
-    const propertyAccess = Node.isPropertyAccessExpression(parent) && parent.getExpression() === ident ? parent : null
+    const propertyAccess = (parent?.compilerNode.kind === SyntaxKind.PropertyAccessExpression) && parent.getExpression() === ident ? parent : null
     const property = propertyAccess?.getName() ?? null
     const reference = { specifier: imported.specifier, remote: imported.remote, namespace: Boolean(imported.namespace), property }
     const target = cachedPartitions && resolveCachedImport(cachedPartitions, rel, reference, property)
-    return { target, call: propertyAccess ? Node.isCallExpression(propertyAccess.getParent()) : false, reference }
+    return { target, call: propertyAccess ? (propertyAccess.getParent()?.compilerNode.kind === SyntaxKind.CallExpression) : false, reference }
   }
   const localByNode = new Map(rows.map(({ node, identity }) => [node.compilerNode, identity]))
   const targetByIdentifier = new Map()
@@ -365,7 +418,7 @@ export function parsePartition(rel, source, knownFiles, context, profiler = null
   const sourceHash = contentHash(source)
   if (sourceHashProfile) profiler.end(sourceHashProfile)
   const resolveInternalTarget = (identifier) => {
-    if (!identifier || typeof identifier.getKind !== 'function' || !Node.isIdentifier(identifier)) return null
+    if (!identifier || typeof identifier.getKind !== 'function' || !(identifier?.compilerNode.kind === SyntaxKind.Identifier)) return null
     if (targetByIdentifier.has(identifier.compilerNode)) return targetByIdentifier.get(identifier.compilerNode)
     let symbol = identifier.getSymbol?.()
     if (!symbol) { targetByIdentifier.set(identifier.compilerNode, null); return null }

@@ -12,6 +12,11 @@ export async function *streamQuery(root, query, options = {}) {
 
 export async function subscribeChanges(root, listener, options = {}) {
   const client = await connectQueryDaemon(root, options)
-  const unsubscribe = await client.subscribe(listener, { root })
-  return async () => { await unsubscribe(); await client.close() }
+  let unsubscribe
+  try { unsubscribe = await client.subscribe(listener, { root }) }
+  catch (error) { await client.close(); throw error }
+  return async () => {
+    try { await unsubscribe() }
+    finally { await client.close() }
+  }
 }

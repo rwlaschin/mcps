@@ -8,6 +8,18 @@ import test from 'node:test'
 
 import * as benchmark from '../scripts/codegraph.performance.mjs'
 import * as parserPoolModule from '../parser-apartment-pool.mjs'
+import { QueryDaemonClient } from '../query-daemon.mjs'
+
+// Transport/process plumbing only: no profile unit test opens the user's global service.
+function isolatedProfileService(t) {
+  const service = new EventEmitter(); service.pid = 43; service.exitCode = null; service.signalCode = null; service.stderr = new EventEmitter()
+  service.kill = signal => { service.signalCode = signal; queueMicrotask(() => service.emit('exit', null, signal)); return true }
+  const state = { closes: 0, requests: [] }
+  t.mock.method(QueryDaemonClient.prototype, 'connect', async function () { return this })
+  t.mock.method(QueryDaemonClient.prototype, 'request', async (_operation) => { state.requests.push(_operation); if (_operation === 'status') return { servicePid: 43 }; assert.equal(_operation, 'shutdown'); service.exitCode = 0; queueMicrotask(() => service.emit('exit', 0, null)); return {} })
+  t.mock.method(QueryDaemonClient.prototype, 'close', async () => { state.closes++ })
+  return { service, state }
+}
 
 const completeReport = {
   schemaVersion: 2,
@@ -842,15 +854,17 @@ test('error guessing: Markdown avoids instructional placeholder labels', () => {
   assert.doesNotMatch(benchmark.renderMarkdown(completeReport), /Thing being tested|Cold or warm/i)
 })
 
-test('equivalence partition: CPU profile launch passes only CPU profiler flags', async () => {
+test('equivalence partition: CPU profile launch passes only CPU profiler flags', async (t) => {
+  const { service } = isolatedProfileService(t)
   const child = new EventEmitter()
   child.pid = 42; child.exitCode = 0; child.signalCode = null
   child.stdout = new EventEmitter(); child.stderr = new EventEmitter(); child.stdin = { write() {}, end() {} }
-  let args
+  let args, proxyArgs
 
-  await benchmark.startMcp({ root: '/repo', profile: { cpu: '/private/tmp/profiles/update.cpuprofile' }, spawnChild: (_command, childArgs) => { args = childArgs; return child } }).stop()
+  await benchmark.startMcp({ root: '/repo', profile: { cpu: '/private/tmp/profiles/update.cpuprofile' }, spawnChild: (_command, childArgs) => { if (childArgs.includes('daemon')) { args = childArgs; return service } proxyArgs = childArgs; return child } }).stop()
 
-  assert.deepEqual(args, ['--cpu-prof', '--cpu-prof-dir=/private/tmp/profiles', '--cpu-prof-name=update.cpuprofile', path.resolve(import.meta.dirname, '..', 'mcp.mjs')])
+  assert.deepEqual(args, ['--cpu-prof', '--cpu-prof-dir=/private/tmp/profiles', '--cpu-prof-name=update.cpuprofile', path.resolve(import.meta.dirname, '..', 'tool.mjs'), 'daemon', '--root', '/repo'])
+  assert.deepEqual(proxyArgs, [path.resolve(import.meta.dirname, '..', 'mcp.mjs')])
 })
 
 test('error guessing: a synchronous MCP spawn failure closes the diagnostic file descriptor', (t) => {
@@ -896,6 +910,7 @@ test('process lifecycle: controller termination stops the MCP group once and unr
 })
 
 test('domain analysis: clean CPU shutdown reports deterministic main and semantic-worker profile paths', async (t) => {
+  const { service } = isolatedProfileService(t)
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-cpu-artifacts-'))
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
   fs.writeFileSync(path.join(directory, 'CPU.before.cpuprofile'), 'preexisting')
@@ -903,7 +918,7 @@ test('domain analysis: clean CPU shutdown reports deterministic main and semanti
   child.pid = 42; child.exitCode = null; child.signalCode = null
   child.stdout = new EventEmitter(); child.stderr = new EventEmitter()
   child.stdin = { write() {}, end() { fs.writeFileSync(path.join(directory, 'update.cpuprofile'), 'main'); fs.writeFileSync(path.join(directory, 'update.worker-semantic.cpuprofile'), 'worker'); queueMicrotask(() => child.emit('exit', 0, null)) } }
-  const mcp = benchmark.startMcp({ root: '/repo', profile: { cpu: path.join(directory, 'update.cpuprofile') }, spawnChild: () => child, platform: 'linux', killProcess() {} })
+  const mcp = benchmark.startMcp({ root: '/repo', profile: { cpu: path.join(directory, 'update.cpuprofile') }, spawnChild: (_command, childArgs) => childArgs.includes('daemon') ? service : child, platform: 'linux', killProcess() {} })
 
   const stopped = await mcp.stop()
 
@@ -914,12 +929,13 @@ test('domain analysis: clean CPU shutdown reports deterministic main and semanti
 })
 
 test('error guessing: timed-out CPU shutdown leaves deterministic profiles at their requested paths', async (t) => {
+  const { service } = isolatedProfileService(t)
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-cpu-timeout-'))
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
   const child = new EventEmitter()
   child.pid = 42; child.exitCode = null; child.signalCode = null
   child.stdout = new EventEmitter(); child.stderr = new EventEmitter(); child.stdin = { write() {}, end() {} }
-  const mcp = benchmark.startMcp({ root: '/repo', profile: { cpu: path.join(directory, 'timeout.cpuprofile') }, spawnChild: () => child, platform: 'linux', shutdownTimeoutMs: 1, killProcess: () => { fs.writeFileSync(path.join(directory, 'timeout.cpuprofile'), 'main'); fs.writeFileSync(path.join(directory, 'timeout.worker-semantic.cpuprofile'), 'worker') } })
+  const mcp = benchmark.startMcp({ root: '/repo', profile: { cpu: path.join(directory, 'timeout.cpuprofile') }, spawnChild: (_command, childArgs) => childArgs.includes('daemon') ? service : child, platform: 'linux', shutdownTimeoutMs: 1, killProcess: () => { fs.writeFileSync(path.join(directory, 'timeout.cpuprofile'), 'main'); fs.writeFileSync(path.join(directory, 'timeout.worker-semantic.cpuprofile'), 'worker') } })
 
   await assert.rejects(mcp.stop(), /shutdown timed out/)
 
@@ -930,6 +946,7 @@ test('error guessing: timed-out CPU shutdown leaves deterministic profiles at th
 })
 
 test('domain analysis: clean profiled shutdown preserves child diagnostics at the caller path and scopes pool logging to that child', async (t) => {
+  const { service } = isolatedProfileService(t)
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-diagnostic-clean-'))
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
   const diagnosticLog = path.join(directory, 'update.pool.log')
@@ -939,7 +956,7 @@ test('domain analysis: clean profiled shutdown preserves child diagnostics at th
   child.stdin = { write() {}, end() { child.stderr.emit('data', 'worker allocated slot 4\n'); child.stderr.emit('data', 'main restored slot 4\n'); queueMicrotask(() => child.emit('exit', 0, null)) } }
   let childEnvironment
   const parentDebug = process.env.CODEGRAPH_DEBUG_POOL
-  const mcp = benchmark.startMcp({ root: '/repo', profile: { cpu: path.join(directory, 'update.cpuprofile') }, diagnosticLog, spawnChild: (_command, _args, options) => { childEnvironment = options.env; return child }, platform: 'linux', killProcess() {} })
+  const mcp = benchmark.startMcp({ root: '/repo', profile: { cpu: path.join(directory, 'update.cpuprofile') }, diagnosticLog, spawnChild: (_command, childArgs, options) => { childEnvironment = options.env; return childArgs.includes('daemon') ? service : child }, platform: 'linux', killProcess() {} })
 
   await mcp.stop()
   fs.renameSync(diagnosticLog, path.join(directory, 'closed.pool.log'))
@@ -951,13 +968,14 @@ test('domain analysis: clean profiled shutdown preserves child diagnostics at th
 })
 
 test('error guessing: timed-out profiled shutdown preserves and closes diagnostics written before forced termination', async (t) => {
+  const { service } = isolatedProfileService(t)
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-diagnostic-timeout-'))
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
   const diagnosticLog = path.join(directory, 'update.pool.log')
   const child = new EventEmitter()
   child.pid = 42; child.exitCode = null; child.signalCode = null
   child.stdout = new EventEmitter(); child.stderr = new EventEmitter(); child.stdin = { write() {}, end() { child.stderr.emit('data', 'waiting for pool slot 299\n') } }
-  const mcp = benchmark.startMcp({ root: '/repo', profile: { cpu: path.join(directory, 'update.cpuprofile') }, diagnosticLog, spawnChild: () => child, platform: 'linux', shutdownTimeoutMs: 1, killProcess() {} })
+  const mcp = benchmark.startMcp({ root: '/repo', profile: { cpu: path.join(directory, 'update.cpuprofile') }, diagnosticLog, spawnChild: (_command, childArgs) => childArgs.includes('daemon') ? service : child, platform: 'linux', shutdownTimeoutMs: 1, killProcess() {} })
 
   await assert.rejects(mcp.stop(), /shutdown timed out/)
   fs.renameSync(diagnosticLog, path.join(directory, 'closed.pool.log'))
@@ -965,26 +983,30 @@ test('error guessing: timed-out profiled shutdown preserves and closes diagnosti
   assert.equal(fs.readFileSync(path.join(directory, 'closed.pool.log'), 'utf8'), 'waiting for pool slot 299\n')
 })
 
-test('equivalence partition: heap profile launch passes only heap profiler flags', async () => {
+test('equivalence partition: heap profile launch passes only heap profiler flags', async (t) => {
+  const { service } = isolatedProfileService(t)
   const child = new EventEmitter()
   child.pid = 42; child.exitCode = 0; child.signalCode = null
   child.stdout = new EventEmitter(); child.stderr = new EventEmitter(); child.stdin = { write() {}, end() {} }
-  let args
+  let args, proxyArgs
 
-  await benchmark.startMcp({ root: '/repo', profile: { heap: '/private/tmp/profiles/update.heapprofile' }, spawnChild: (_command, childArgs) => { args = childArgs; return child } }).stop()
+  await benchmark.startMcp({ root: '/repo', profile: { heap: '/private/tmp/profiles/update.heapprofile' }, spawnChild: (_command, childArgs) => { if (childArgs.includes('daemon')) { args = childArgs; return service } proxyArgs = childArgs; return child } }).stop()
 
-  assert.deepEqual(args, ['--heap-prof', '--heap-prof-dir=/private/tmp/profiles', '--heap-prof-name=update.heapprofile', path.resolve(import.meta.dirname, '..', 'mcp.mjs')])
+  assert.deepEqual(args, ['--heap-prof', '--heap-prof-dir=/private/tmp/profiles', '--heap-prof-name=update.heapprofile', path.resolve(import.meta.dirname, '..', 'tool.mjs'), 'daemon', '--root', '/repo'])
+  assert.deepEqual(proxyArgs, [path.resolve(import.meta.dirname, '..', 'mcp.mjs')])
 })
 
-test('equivalence partition: trace profile launch passes only trace profiler flags', async () => {
+test('equivalence partition: trace profile launch passes only trace profiler flags', async (t) => {
+  const { service } = isolatedProfileService(t)
   const child = new EventEmitter()
   child.pid = 42; child.exitCode = 0; child.signalCode = null
   child.stdout = new EventEmitter(); child.stderr = new EventEmitter(); child.stdin = { write() {}, end() {} }
-  let args
+  let args, proxyArgs
 
-  await benchmark.startMcp({ root: '/repo', profile: { trace: '/private/tmp/profiles/update.trace.json' }, spawnChild: (_command, childArgs) => { args = childArgs; return child } }).stop()
+  await benchmark.startMcp({ root: '/repo', profile: { trace: '/private/tmp/profiles/update.trace.json' }, spawnChild: (_command, childArgs) => { if (childArgs.includes('daemon')) { args = childArgs; return service } proxyArgs = childArgs; return child } }).stop()
 
-  assert.deepEqual(args, ['--trace-event-categories=v8,node,node.async_hooks', '--trace-event-file-pattern=/private/tmp/profiles/update.trace.json', path.resolve(import.meta.dirname, '..', 'mcp.mjs')])
+  assert.deepEqual(args, ['--trace-event-categories=v8,node,node.async_hooks', '--trace-event-file-pattern=/private/tmp/profiles/update.trace.json', path.resolve(import.meta.dirname, '..', 'tool.mjs'), 'daemon', '--root', '/repo'])
+  assert.deepEqual(proxyArgs, [path.resolve(import.meta.dirname, '..', 'mcp.mjs')])
 })
 
 test('domain analysis: POSIX shutdown signals the whole MCP process group', async () => {
@@ -1428,4 +1450,47 @@ test('error guessing: runCli reports a failed execution and sets exit code one',
 
 test('domain analysis: resolves the production MCP entry point', () => {
   assert.equal(benchmark.resolveMcpPath(), path.resolve(import.meta.dirname, '..', 'mcp.mjs'))
+})
+
+test('profile startup signal boundary: a SIGTERM-exited owned service rejects readiness instead of retrying forever', { timeout: 1000 }, async t => {
+  const { service } = isolatedProfileService(t)
+  service.exitCode = null; service.signalCode = 'SIGTERM'
+  t.mock.method(QueryDaemonClient.prototype, 'connect', async () => { throw new Error('connect ECONNREFUSED') })
+  const proxy = new EventEmitter(); proxy.pid = 42; proxy.exitCode = 0; proxy.signalCode = null
+  proxy.stdout = new EventEmitter(); proxy.stderr = new EventEmitter(); proxy.stdin = { write() {}, end() {} }
+  const mcp = benchmark.startMcp({ root: '/repo', profile: { cpu: '/private/tmp/profiles/signal.cpuprofile' }, requestTimeoutMs: 40, spawnChild: (_command, args) => args.includes('daemon') ? service : proxy })
+  t.after(async () => { service.exitCode = 1; service.emit('exit', 1, null); await mcp.stop().catch(() => {}) })
+  await assert.rejects(mcp.timed('ping', {}), /profile service failed to bind/)
+})
+
+test('profile cleanup error guessing: a throwing owned-service kill still closes the daemon client', async t => {
+  const { service, state } = isolatedProfileService(t)
+  service.kill = () => { throw new Error('owned kill denied') }
+  const proxy = new EventEmitter(); proxy.pid = 42; proxy.exitCode = 2; proxy.signalCode = null
+  proxy.stdout = new EventEmitter(); proxy.stderr = new EventEmitter(); proxy.stdin = { write() {}, end() {} }
+  const mcp = benchmark.startMcp({ root: '/repo', profile: { cpu: '/private/tmp/profiles/kill-error.cpuprofile' }, spawnChild: (_command, args) => args.includes('daemon') ? service : proxy })
+  t.after(async () => { service.exitCode = 1; await mcp.stop().catch(() => {}) })
+  await assert.rejects(mcp.stop(), /owned kill denied/)
+  assert.equal(state.closes, 1, 'a cleanup signal failure must not retain the service client')
+})
+
+test('profile cleanup exited partition: an already-exited owned service is never signalled and its client closes', async t => {
+  const { service, state } = isolatedProfileService(t); service.exitCode = 1; service.signalCode = null
+  let kills = 0; service.kill = () => { kills++; throw new Error('must not signal an exited child') }
+  const proxy = new EventEmitter(); proxy.pid = 42; proxy.exitCode = 2; proxy.signalCode = null
+  proxy.stdout = new EventEmitter(); proxy.stderr = new EventEmitter(); proxy.stdin = { write() {}, end() {} }
+  const mcp = benchmark.startMcp({ root: '/repo', profile: { cpu: '/private/tmp/profiles/exited.cpuprofile' }, spawnChild: (_command, args) => args.includes('daemon') ? service : proxy })
+  await assert.rejects(mcp.stop(), /MCP shutdown failed \(2\)/)
+  assert.deepEqual({ kills, closes: state.closes }, { kills: 0, closes: 1 })
+})
+
+test('profile cleanup signalled partition: a SIGTERM-exited owned service is never signalled again and its client closes', async t => {
+  const { service, state } = isolatedProfileService(t); service.exitCode = null; service.signalCode = 'SIGTERM'
+  let kills = 0; service.kill = () => { kills++; throw new Error('must not signal a signal-exited child') }
+  const proxy = new EventEmitter(); proxy.pid = 42; proxy.exitCode = 2; proxy.signalCode = null
+  proxy.stdout = new EventEmitter(); proxy.stderr = new EventEmitter(); proxy.stdin = { write() {}, end() {} }
+  const mcp = benchmark.startMcp({ root: '/repo', profile: { cpu: '/private/tmp/profiles/signalled-exit.cpuprofile' }, spawnChild: (_command, args) => args.includes('daemon') ? service : proxy })
+  t.after(async () => { service.exitCode = 1; await mcp.stop().catch(() => {}) })
+  await assert.rejects(mcp.stop(), /MCP shutdown failed \(2\)/)
+  assert.deepEqual({ kills, closes: state.closes }, { kills: 0, closes: 1 })
 })

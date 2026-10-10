@@ -41,7 +41,7 @@ const indexesFor = (partition) => {
   return indexes
 }
 
-export function extractCachedBindings(sourceFile, symbols, ts, exportedIds = null) {
+export function extractCachedBindings(sourceFile, symbols, ts, exportedIds = null, structuralCache = null) {
   const symbolByName = new Map()
   for (const symbol of symbols) if (symbol.qualifiedPath === '<module>') {
     const rows = symbolByName.get(symbol.name)
@@ -56,25 +56,32 @@ export function extractCachedBindings(sourceFile, symbols, ts, exportedIds = nul
     direct.set(name, { kind: 'symbol', name, target: symbols[0].id })
   }
   const bindings = []
+  const exportFacts = structuralCache ? structuralCache.exports ??= new WeakMap() : null
   for (const statement of sourceFile.statements) {
-    if (ts.isExportAssignment(statement) && !statement.isExportEquals && ts.isIdentifier(statement.expression)) bind(statement.expression.text, 'default')
-    const modifiers = statement.modifiers ?? []
-    if (modifiers.some((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword)) {
-      const name = statement.name?.text ?? (modifiers.some((modifier) => modifier.kind === ts.SyntaxKind.DefaultKeyword) ? 'default' : null)
-      if (name) bind(name, modifiers.some((modifier) => modifier.kind === ts.SyntaxKind.DefaultKeyword) ? 'default' : name)
-      if (ts.isVariableStatement(statement)) for (const declaration of statement.declarationList.declarations) if (ts.isIdentifier(declaration.name)) bind(declaration.name.text)
-    }
-    if (!ts.isExportDeclaration(statement)) continue
-    const specifier = statement.moduleSpecifier && ts.isStringLiteral(statement.moduleSpecifier) ? statement.moduleSpecifier.text : null
-    if (!specifier) {
-      if (statement.exportClause && ts.isNamedExports(statement.exportClause)) for (const element of statement.exportClause.elements) {
-        bind(element.propertyName?.text ?? element.name.text, element.name.text)
+    let facts = exportFacts?.get(statement)
+    if (!facts) {
+      facts = []
+      if (ts.isExportAssignment(statement) && !statement.isExportEquals && ts.isIdentifier(statement.expression)) facts.push({ kind: 'symbol', local: statement.expression.text, name: 'default' })
+      const modifiers = statement.modifiers ?? []
+      if (modifiers.some((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword)) {
+        const name = statement.name?.text ?? (modifiers.some((modifier) => modifier.kind === ts.SyntaxKind.DefaultKeyword) ? 'default' : null)
+        if (name) facts.push({ kind: 'symbol', local: name, name: modifiers.some((modifier) => modifier.kind === ts.SyntaxKind.DefaultKeyword) ? 'default' : name })
+        if (ts.isVariableStatement(statement)) for (const declaration of statement.declarationList.declarations) if (ts.isIdentifier(declaration.name)) facts.push({ kind: 'symbol', local: declaration.name.text, name: declaration.name.text })
       }
-      continue
+      if (ts.isExportDeclaration(statement)) {
+        const specifier = statement.moduleSpecifier && ts.isStringLiteral(statement.moduleSpecifier) ? statement.moduleSpecifier.text : null
+        if (!specifier) {
+          if (statement.exportClause && ts.isNamedExports(statement.exportClause)) for (const element of statement.exportClause.elements) facts.push({ kind: 'symbol', local: element.propertyName?.text ?? element.name.text, name: element.name.text })
+        } else if (!statement.exportClause) facts.push({ kind: 'star', specifier })
+        else if (ts.isNamespaceExport(statement.exportClause)) facts.push({ kind: 'namespace', name: statement.exportClause.name.text, specifier })
+        else if (ts.isNamedExports(statement.exportClause)) for (const element of statement.exportClause.elements) facts.push({ kind: 'reexport', name: element.name.text, specifier, remote: element.propertyName?.text ?? element.name.text })
+      }
+      exportFacts?.set(statement, facts)
     }
-    if (!statement.exportClause) { bindings.push({ kind: 'star', specifier }); continue }
-    if (ts.isNamespaceExport(statement.exportClause)) { bindings.push({ kind: 'namespace', name: statement.exportClause.name.text, specifier }); continue }
-    if (ts.isNamedExports(statement.exportClause)) for (const element of statement.exportClause.elements) bindings.push({ kind: 'reexport', name: element.name.text, specifier, remote: element.propertyName?.text ?? element.name.text })
+    for (const fact of facts) {
+      if (fact.kind === 'symbol') bind(fact.local, fact.name)
+      else bindings.push({ ...fact })
+    }
   }
   return [...direct.values(), ...bindings]
 }
@@ -181,8 +188,8 @@ const classifyGraphRecord = (index, record) => {
   else if (!record.unresolved && unresolved) moveUnresolvedRecord(index, record, true)
   record.unresolved = unresolved
 }
-const addGraphRecord = (index, edge, missing = false) => {
-  const record = { edge, missing, ordinal: index.nextOrdinal++, active: true, unresolved: null }
+const addGraphRecord = (index, edge, missing = false, ownerFile = null, edgeOrdinal = null, patchKey = null) => {
+  const record = { edge, missing, ownerFile, edgeOrdinal, patchKey, ordinal: index.nextOrdinal++, active: true, unresolved: null }
   for (const id of edge.from === edge.to ? [edge.from] : [edge.from, edge.to]) {
     let bucket = index.byEndpoint.get(id)
     if (!bucket) index.byEndpoint.set(id, bucket = new Set())
@@ -232,8 +239,8 @@ const removePublicationPatch = (index, patch) => {
 const addPublicationPatch = (index, patch) => {
   const stored = { ...patch }
   if (stored.base) changeRemoval(index, stored.base, 1)
-  if (stored.edge) stored.edgeRecord = addGraphRecord(index, stored.edge)
-  if (stored.missing) stored.missingRecord = addGraphRecord(index, stored.missing, true)
+  if (stored.edge) stored.edgeRecord = addGraphRecord(index, stored.edge, false, null, null, stored.key)
+  if (stored.missing) stored.missingRecord = addGraphRecord(index, stored.missing, true, null, null, stored.key)
   index.patches.set(stored.key, stored)
   let bucket = index.patchesByFile.get(stored.file)
   if (!bucket) index.patchesByFile.set(stored.file, bucket = new Set())
@@ -251,8 +258,9 @@ const addGraphFile = (index, file, partition, affected = null) => {
     index.symbols.set(symbol.id, (index.symbols.get(symbol.id) ?? 0) + 1)
     affected?.add(symbol.id)
   }
+  let edgeOrdinal = 0
   for (const edge of partition.edges ?? []) {
-    const record = addGraphRecord(index, edge)
+    const record = addGraphRecord(index, edge, false, file, edgeOrdinal++)
     records.push(record)
     const key = graphEdgeKey(edge)
     let bucket = index.rawByKey.get(key)
@@ -280,6 +288,66 @@ export function updateCachedGraphFacts(index, files, changedFile, repairs) {
   index.graphRecordsVisited = 0; index.outputSlotMoves = 0
   const affected = new Set()
   const old = index.graphByFile.get(changedFile)
+  const changed = fileAt(files, changedFile)
+  const groups = new Map()
+  const addGroup = (edge) => {
+    if (!edge) return
+    const key = `${edge.from}\0${edge.to}\0${edge.line}`
+    if (!groups.has(key)) groups.set(key, { from: edge.from, to: edge.to, line: edge.line })
+  }
+  for (const record of old?.records ?? []) addGroup(record.edge)
+  for (const edge of changed?.edges ?? []) addGroup(edge)
+  for (const patch of index.patchesByFile.get(changedFile) ?? []) {
+    addGroup(patch.base); addGroup(patch.edge); addGroup(patch.missing)
+  }
+  for (const repair of repairs) {
+    addGroup(repair.base); addGroup(repair.edge)
+    const previous = index.patches.get(repair.key)
+    addGroup(previous?.base); addGroup(previous?.edge); addGroup(previous?.missing)
+  }
+  for (const id of old?.ids ?? []) affected.add(id)
+  for (const symbol of changed?.symbols ?? []) affected.add(symbol.id)
+  for (const id of affected) for (const record of index.byEndpoint.get(id) ?? []) addGroup(record.edge)
+  const patchGroups = () => {
+    const rows = new Map(); const visited = new Set()
+    for (const group of groups.values()) {
+      if (visited.has(group.from)) continue
+      visited.add(group.from)
+      for (const record of index.byEndpoint.get(group.from) ?? []) if (record.patchKey !== null && record.active && record.edge.from === group.from) {
+        const key = `${record.edge.from}\0${record.edge.to}\0${record.edge.line}`
+        if (!groups.has(key)) continue
+        let bucket = rows.get(key)
+        if (!bucket) rows.set(key, bucket = [])
+        bucket.push(record)
+      }
+    }
+    return rows
+  }
+  const groupRows = (group, patches) => {
+    const records = []
+    for (const call of [false, true]) for (const record of index.rawByKey.get(graphEdgeKey({ ...group, call })) ?? []) records.push(record)
+    for (const record of patches.get(`${group.from}\0${group.to}\0${group.line}`) ?? []) records.push(record)
+    records.sort((left, right) => left.patchKey === null && right.patchKey === null ? left.ownerFile.localeCompare(right.ownerFile) || left.edgeOrdinal - right.edgeOrdinal : left.patchKey === null ? -1 : right.patchKey === null ? 1 : left.patchKey < right.patchKey ? -1 : left.patchKey > right.patchKey ? 1 : 0)
+    const edges = []; const unresolved = []; const missing = []
+    let removedCalls = index.removals.get(graphEdgeKey({ ...group, call: true })) ?? 0
+    let removedReferences = index.removals.get(graphEdgeKey({ ...group, call: false })) ?? 0
+    for (const record of records) {
+      if (record.active && record.unresolved) (record.missing ? missing : unresolved).push(record)
+      if (record.patchKey === null) {
+        if (record.edge.call && removedCalls) { removedCalls--; continue }
+        if (!record.edge.call && removedReferences) { removedReferences--; continue }
+        if (index.symbols.has(record.edge.from) && index.symbols.has(record.edge.to)) edges.push(record.edge)
+      } else if (record.active && !record.missing && !record.unresolved) edges.push(record.edge)
+    }
+    unresolved.sort((left, right) => left.ordinal - right.ordinal)
+    missing.sort((left, right) => left.ordinal - right.ordinal)
+    for (let ordinal = 0; ordinal < unresolved.length; ordinal++) unresolved[ordinal] = unresolved[ordinal].unresolved
+    for (let ordinal = 0; ordinal < missing.length; ordinal++) missing[ordinal] = missing[ordinal].unresolved
+    return { edges, unresolved, missing }
+  }
+  const rawUnresolvedBeforeCount = index.unresolved.length
+  const beforePatches = patchGroups()
+  for (const group of groups.values()) group.before = groupRows(group, beforePatches)
   if (old) {
     for (const id of old.ids) {
       const count = index.symbols.get(id) - 1
@@ -297,7 +365,6 @@ export function updateCachedGraphFacts(index, files, changedFile, repairs) {
     index.graphByFile.delete(changedFile)
   }
   for (const patch of index.patchesByFile.get(changedFile) ?? []) removePublicationPatch(index, patch)
-  const changed = fileAt(files, changedFile)
   if (changed) addGraphFile(index, changedFile, changed, affected)
   for (const repair of repairs) {
     const previous = index.patches.get(repair.key)
@@ -309,6 +376,22 @@ export function updateCachedGraphFacts(index, files, changedFile, repairs) {
   }
   const visited = new Set()
   for (const id of affected) for (const record of index.byEndpoint.get(id) ?? []) if (!visited.has(record)) { visited.add(record); classifyGraphRecord(index, record) }
+  const changedGroups = []; const afterPatches = patchGroups()
+  for (const group of groups.values()) {
+    group.after = groupRows(group, afterPatches)
+    let different = false
+    for (const kind of ['edges', 'unresolved', 'missing']) {
+      const before = group.before[kind], after = group.after[kind]
+      if (before.length !== after.length) { different = true; break }
+      for (let ordinal = 0; ordinal < before.length; ordinal++) {
+        const left = before[ordinal], right = after[ordinal]
+        if (left.from !== right.from || left.to !== right.to || left.line !== right.line || left.call !== right.call || left.reason !== right.reason) { different = true; break }
+      }
+      if (different) break
+    }
+    if (different) changedGroups.push(group)
+  }
+  return { groups: changedGroups, rawUnresolvedBeforeCount }
 }
 
 export function cachedUnresolvedEdges(index) {

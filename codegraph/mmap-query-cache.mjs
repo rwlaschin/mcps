@@ -32,6 +32,75 @@ const checksum = (bytes) => {
 const rootFingerprint = (root) => crypto.createHash('sha256').update(root).digest().readUInt32LE(0)
 
 const encodePage = ({ generation, coverage, view }) => {
+  const parent = view.parent
+  if (parent && !view.graph) {
+    const groups = []
+    for (const group of view.publicationChanges.groups) groups.push(group)
+    const edgeOrder = (left, right) => (left.from < right.from ? -1 : left.from > right.from ? 1 : 0) || (left.to < right.to ? -1 : left.to > right.to ? 1 : 0) || left.line - right.line
+    groups.sort(edgeOrder)
+    const removedSymbols = new Set()
+    for (const symbol of view.oldPartition?.symbols ?? []) removedSymbols.add(symbol.id)
+    const additions = []
+    for (const symbol of view.newPartition?.symbols ?? []) additions.push(symbol)
+    additions.sort((left, right) => left.id.localeCompare(right.id))
+    const symbols = []; const deletedSymbols = []; const addedSymbols = []
+    let added = 0
+    for (let ordinal = 0; ordinal < parent.data.getUint32(20, true); ordinal++) {
+      const symbol = view.parentGraph.symbols?.[ordinal] ?? parent.symbol(ordinal)
+      if (removedSymbols.has(symbol.id)) { deletedSymbols.push(ordinal); continue }
+      while (added < additions.length && additions[added].id.localeCompare(symbol.id) < 0) { addedSymbols.push(symbols.length); symbols.push(additions[added++]) }
+      symbols.push(symbol)
+    }
+    while (added < additions.length) { addedSymbols.push(symbols.length); symbols.push(additions[added++]) }
+    const edges = []; const deletedEdges = []; const addedEdges = []
+    const unresolvedEdges = []
+    const footer = parent.pageLength - FOOTER_BYTES
+    const unresolvedOffset = parent.data.getUint32(footer + 12, true)
+    const unresolvedAt = (ordinal) => {
+      if (view.parentGraph.unresolvedEdges) return view.parentGraph.unresolvedEdges[ordinal]
+      const base = unresolvedOffset + ordinal * UNRESOLVED_EDGE_BYTES
+      return { from: parent.string(parent.data.getUint32(base, true)), to: parent.string(parent.data.getUint32(base + 4, true)), line: parent.data.getInt32(base + 8, true), reason: parent.string(parent.data.getUint32(base + 12, true)) }
+    }
+    const mergeRows = (start, end, rowAt, kind, output, deleted = null, inserted = null) => {
+      let ordinal = start
+      for (const group of groups) {
+        while (ordinal < end) {
+          const row = rowAt(ordinal)
+          if (edgeOrder(row, group) >= 0) break
+          output.push(row); ordinal++
+        }
+        let removed = 0
+        while (ordinal < end) {
+          const row = rowAt(ordinal)
+          if (edgeOrder(row, group) !== 0) break
+          const expected = group.before[kind][removed++]
+          if (!expected || row.call !== expected.call || row.reason !== expected.reason) throw new Error('mapped publication parent occurrence mismatch')
+          if (deleted) deleted.push(ordinal)
+          ordinal++
+        }
+        if (removed !== group.before[kind].length) throw new Error('mapped publication parent occurrence count mismatch')
+        for (const row of group.after[kind]) { inserted?.push(output.length); output.push(row) }
+      }
+      while (ordinal < end) output.push(rowAt(ordinal++))
+    }
+    mergeRows(0, parent.data.getUint32(32, true), (ordinal) => view.parentGraph.edges?.[ordinal] ?? parent.edge(ordinal), 'edges', edges, deletedEdges, addedEdges)
+    const rawEnd = view.publicationChanges.rawUnresolvedBeforeCount
+    const unresolvedCount = parent.data.getUint32(footer + 16, true)
+    if (!Number.isInteger(rawEnd) || rawEnd < 0 || rawEnd > unresolvedCount) throw new Error('mapped publication unresolved boundary mismatch')
+    mergeRows(0, rawEnd, unresolvedAt, 'unresolved', unresolvedEdges)
+    mergeRows(rawEnd, unresolvedCount, unresolvedAt, 'missing', unresolvedEdges)
+    const files = []
+    let insertedFile = false
+    for (const file of view.parentGraph.files) {
+      if (file === view.file) { if (view.newPartition) files.push(file); insertedFile = true; continue }
+      if (!insertedFile && view.newPartition && view.file.localeCompare(file) < 0) { files.push(view.file); insertedFile = true }
+      files.push(file)
+    }
+    if (!insertedFile && view.newPartition) files.push(view.file)
+    const hasUnresolved = view.manifest ? Array.isArray(view.manifest.unresolvedEdges) : Boolean(parent.data.getUint32(footer + 20, true)) || unresolvedEdges.length > 0
+    view.graph = { generation, edgeCoverage: view.parentGraph.edgeCoverage, files, symbols, edges, ...(hasUnresolved ? { unresolvedEdges } : {}) }
+    view.indexChanges = { deletedSymbols, addedSymbols, deletedEdges, addedEdges }
+  }
   const graph = view.graph
   const strings = []
   const offsets = new Map()
@@ -79,9 +148,54 @@ const encodePage = ({ generation, coverage, view }) => {
   data.setUint32(56, generationOffset, true); data.setUint32(60, coverageOffset, true)
   for (const entry of strings) bytes.set(entry.bytes, PAGE_HEADER_BYTES + entry.offset)
 
-  const symbolIndex = new Map()
+  const changes = view.indexChanges
+  const rank = (rows, value, inserted = false) => {
+    let low = 0; let high = rows.length
+    while (low < high) { const middle = (low + high) >>> 1; if ((inserted ? rows[middle] - middle : rows[middle]) < value) low = middle + 1; else high = middle }
+    return low
+  }
+  const translate = (ordinal, deleted, inserted) => {
+    const survivor = ordinal - rank(deleted, ordinal)
+    return survivor + rank(inserted, survivor + 1, true)
+  }
+  const symbolIndex = parent ? null : new Map()
+  const addedSymbolIds = parent ? new Map() : null
+  if (parent) for (const ordinal of changes.addedSymbols) addedSymbolIds.set(graph.symbols[ordinal].id, ordinal)
+  const translateEndpoint = (ordinal) => {
+    const deletedRank = rank(changes.deletedSymbols, ordinal)
+    if (changes.deletedSymbols[deletedRank] !== ordinal) return translate(ordinal, changes.deletedSymbols, changes.addedSymbols)
+    const base = parent.data.getUint32(16, true) + ordinal * SYMBOL_BYTES
+    const replacement = addedSymbolIds.get(view.parentGraph.symbols?.[ordinal]?.id ?? parent.string(parent.data.getUint32(base, true)))
+    if (replacement === undefined) throw new Error('mapped publication retained edge targets a deleted symbol')
+    return replacement
+  }
+  const symbolOrdinal = (id) => {
+    if (!parent) return symbolIndex.get(id) ?? 0xffffffff
+    if (addedSymbolIds.has(id)) return addedSymbolIds.get(id)
+    const needle = encoded.get(id)
+    const footer = parent.pageLength - FOOTER_BYTES
+    const indexOffset = parent.data.getUint32(footer + 4, true)
+    let low = 0; let high = parent.data.getUint32(20, true)
+    while (low < high) {
+      const middle = (low + high) >>> 1
+      const offset = parent.data.getUint32(indexOffset + middle * INDEX_BYTES, true)
+      const start = parent.pageOffset + parent.data.getUint32(8, true) + offset
+      let cursor = 0
+      while (cursor < needle.length && parent.bytes[start + cursor] === needle[cursor]) cursor++
+      const difference = cursor === needle.length ? (parent.bytes[start + cursor] === 0 ? 0 : 1) : parent.bytes[start + cursor] - needle[cursor]
+      if (difference <= 0) low = middle + 1
+      else high = middle
+    }
+    if (!low) return 0xffffffff
+    const offset = parent.data.getUint32(indexOffset + (low - 1) * INDEX_BYTES, true)
+    const start = parent.pageOffset + parent.data.getUint32(8, true) + offset
+    for (let cursor = 0; cursor < needle.length; cursor++) if (parent.bytes[start + cursor] !== needle[cursor]) return 0xffffffff
+    if (parent.bytes[start + needle.length] !== 0) return 0xffffffff
+    const ordinal = parent.data.getUint32(indexOffset + (low - 1) * INDEX_BYTES + 4, true)
+    return translate(ordinal, changes.deletedSymbols, changes.addedSymbols)
+  }
   graph.symbols.forEach((symbol, index) => {
-    symbolIndex.set(symbol.id, index)
+    symbolIndex?.set(symbol.id, index)
     const base = symbolsOffset + index * SYMBOL_BYTES
     data.setUint32(base, intern(symbol.id), true); data.setUint32(base + 4, intern(symbol.file), true)
     data.setUint32(base + 8, intern(symbol.name), true); data.setUint32(base + 12, intern(symbol.kind), true)
@@ -89,9 +203,17 @@ const encodePage = ({ generation, coverage, view }) => {
     data.setUint32(base + 24, intern(symbol.signature ?? ''), true); data.setInt32(base + 28, symbol.ordinal ?? 0, true)
     data.setUint32(base + 32, symbol.exported ? 1 : 0, true)
   })
+  let oldEdgeOrdinal = 0; let deletedEdgeRank = 0; let insertedEdgeRank = 0
   graph.edges.forEach((edge, index) => {
     const base = edgesOffset + index * EDGE_BYTES
-    data.setUint32(base, symbolIndex.get(edge.from) ?? 0xffffffff, true); data.setUint32(base + 4, symbolIndex.get(edge.to) ?? 0xffffffff, true)
+    if (parent && changes.addedEdges[insertedEdgeRank] !== index) {
+      while (changes.deletedEdges[deletedEdgeRank] === oldEdgeOrdinal) { deletedEdgeRank++; oldEdgeOrdinal++ }
+      const oldBase = parent.data.getUint32(28, true) + oldEdgeOrdinal++ * EDGE_BYTES
+      data.setUint32(base, translateEndpoint(parent.data.getUint32(oldBase, true)), true); data.setUint32(base + 4, translateEndpoint(parent.data.getUint32(oldBase + 4, true)), true)
+    } else {
+      data.setUint32(base, symbolOrdinal(edge.from), true); data.setUint32(base + 4, symbolOrdinal(edge.to), true)
+      if (parent) insertedEdgeRank++
+    }
     data.setInt32(base + 8, edge.line, true); data.setUint32(base + 12, edge.call ? 1 : 0, true)
   })
   ;(graph.unresolvedEdges ?? []).forEach((edge, index) => {
@@ -99,13 +221,43 @@ const encodePage = ({ generation, coverage, view }) => {
     data.setUint32(base, intern(edge.from), true); data.setUint32(base + 4, intern(edge.to), true)
     data.setInt32(base + 8, edge.line, true); data.setUint32(base + 12, intern(edge.reason), true)
   })
-  const sortedSymbols = (key) => graph.symbols.map((symbol, index) => ({ key: key(symbol), index })).sort((left, right) => compareBytes(encoded.get(left.key), encoded.get(right.key)) || left.index - right.index)
-  sortedSymbols((symbol) => symbol.name).forEach((entry, index) => { data.setUint32(nameIndexOffset + index * INDEX_BYTES, intern(entry.key), true); data.setUint32(nameIndexOffset + index * INDEX_BYTES + 4, entry.index, true) })
-  sortedSymbols((symbol) => symbol.file).forEach((entry, index) => { data.setUint32(fileIndexOffset + index * INDEX_BYTES, intern(entry.key), true); data.setUint32(fileIndexOffset + index * INDEX_BYTES + 4, entry.index, true) })
-  const sortedEdges = (key) => graph.edges.map((edge, index) => ({ key: symbolIndex.get(key(edge)), index })).sort((left, right) => left.key - right.key || left.index - right.index)
-  sortedEdges((edge) => edge.to).forEach((entry, index) => { data.setUint32(incomingIndexOffset + index * INDEX_BYTES, entry.key, true); data.setUint32(incomingIndexOffset + index * INDEX_BYTES + 4, entry.index, true) })
-  sortedEdges((edge) => edge.from).forEach((entry, index) => { data.setUint32(outgoingIndexOffset + index * INDEX_BYTES, entry.key, true); data.setUint32(outgoingIndexOffset + index * INDEX_BYTES + 4, entry.index, true) })
-  sortedSymbols((symbol) => symbol.id).forEach((entry, index) => { data.setUint32(idIndexOffset + index * INDEX_BYTES, intern(entry.key), true); data.setUint32(idIndexOffset + index * INDEX_BYTES + 4, entry.index, true) })
+  if (parent) {
+    const mergeIndex = (oldStart, count, target, field, numeric) => {
+      const deleted = numeric ? changes.deletedEdges : changes.deletedSymbols
+      const inserted = numeric ? changes.addedEdges : changes.addedSymbols
+      const entries = []
+      for (const ordinal of inserted) entries.push({ key: numeric ? symbolOrdinal(graph.edges[ordinal][field]) : graph.symbols[ordinal][field], index: ordinal })
+      const order = (left, right) => (numeric ? left.key - right.key : compareBytes(encoded.get(left.key), encoded.get(right.key))) || left.index - right.index
+      entries.sort(order)
+      let added = 0; let output = 0
+      const write = (key, ordinal) => { data.setUint32(target + output * INDEX_BYTES, numeric ? key : intern(key), true); data.setUint32(target + output++ * INDEX_BYTES + 4, ordinal, true) }
+      for (let row = 0; row < count; row++) {
+        const oldOrdinal = parent.data.getUint32(oldStart + row * INDEX_BYTES + 4, true)
+        const deletedRank = rank(deleted, oldOrdinal)
+        if (deleted[deletedRank] === oldOrdinal) continue
+        const ordinal = translate(oldOrdinal, deleted, inserted)
+        const oldKey = parent.data.getUint32(oldStart + row * INDEX_BYTES, true)
+        const key = numeric ? translateEndpoint(oldKey) : graph.symbols[ordinal][field]
+        while (added < entries.length && ((numeric ? entries[added].key - key : compareBytes(encoded.get(entries[added].key), encoded.get(key))) || entries[added].index - ordinal) < 0) { write(entries[added].key, entries[added].index); added++ }
+        write(key, ordinal)
+      }
+      while (added < entries.length) { write(entries[added].key, entries[added].index); added++ }
+    }
+    const parentSymbols = parent.data.getUint32(20, true), parentEdges = parent.data.getUint32(32, true)
+    mergeIndex(parent.data.getUint32(40, true), parentSymbols, nameIndexOffset, 'name', false)
+    mergeIndex(parent.data.getUint32(44, true), parentSymbols, fileIndexOffset, 'file', false)
+    mergeIndex(parent.data.getUint32(48, true), parentEdges, incomingIndexOffset, 'to', true)
+    mergeIndex(parent.data.getUint32(52, true), parentEdges, outgoingIndexOffset, 'from', true)
+    mergeIndex(parent.data.getUint32(parent.pageLength - FOOTER_BYTES + 4, true), parentSymbols, idIndexOffset, 'id', false)
+  } else {
+    const sortedSymbols = (key) => graph.symbols.map((symbol, index) => ({ key: key(symbol), index })).sort((left, right) => compareBytes(encoded.get(left.key), encoded.get(right.key)) || left.index - right.index)
+    sortedSymbols((symbol) => symbol.name).forEach((entry, index) => { data.setUint32(nameIndexOffset + index * INDEX_BYTES, intern(entry.key), true); data.setUint32(nameIndexOffset + index * INDEX_BYTES + 4, entry.index, true) })
+    sortedSymbols((symbol) => symbol.file).forEach((entry, index) => { data.setUint32(fileIndexOffset + index * INDEX_BYTES, intern(entry.key), true); data.setUint32(fileIndexOffset + index * INDEX_BYTES + 4, entry.index, true) })
+    const sortedEdges = (key) => graph.edges.map((edge, index) => ({ key: symbolIndex.get(key(edge)), index })).sort((left, right) => left.key - right.key || left.index - right.index)
+    sortedEdges((edge) => edge.to).forEach((entry, index) => { data.setUint32(incomingIndexOffset + index * INDEX_BYTES, entry.key, true); data.setUint32(incomingIndexOffset + index * INDEX_BYTES + 4, entry.index, true) })
+    sortedEdges((edge) => edge.from).forEach((entry, index) => { data.setUint32(outgoingIndexOffset + index * INDEX_BYTES, entry.key, true); data.setUint32(outgoingIndexOffset + index * INDEX_BYTES + 4, entry.index, true) })
+    sortedSymbols((symbol) => symbol.id).forEach((entry, index) => { data.setUint32(idIndexOffset + index * INDEX_BYTES, intern(entry.key), true); data.setUint32(idIndexOffset + index * INDEX_BYTES + 4, entry.index, true) })
+  }
   data.setUint32(footerOffset, FOOTER_MAGIC, true); data.setUint32(footerOffset + 4, idIndexOffset, true); data.setUint32(footerOffset + 8, graph.symbols.length, true)
   data.setUint32(footerOffset + 12, unresolvedEdgesOffset, true); data.setUint32(footerOffset + 16, graph.unresolvedEdges?.length ?? 0, true)
   data.setUint32(footerOffset + 20, Array.isArray(graph.unresolvedEdges) ? 1 : 0, true)
@@ -123,6 +275,15 @@ class MappedQueryView {
     this.mapped = true
   }
   get generation() { return this.string(this.data.getUint32(56, true)) }
+  detach() {
+    if (this.pageOffset === 0) return 0
+    const bytes = new Uint8Array(this.pageLength)
+    bytes.set(this.bytes.subarray(this.pageOffset, this.pageOffset + this.pageLength))
+    const data = new DataView(bytes.buffer, bytes.byteOffset, this.pageLength)
+    this.bytes = bytes; this.pageOffset = 0; this.data = data
+    this.release()
+    return this.pageLength
+  }
   get edgeCoverage() { return this.string(this.data.getUint32(60, true)) }
   get symbols() { return this.matchingSymbols() }
   get files() { return [...new Set(this.symbols.map((symbol) => symbol.file))].sort() }
@@ -156,7 +317,10 @@ class MappedQueryView {
   edge(index) {
     this.decodeObserver?.({ type: 'edge', index })
     const base = this.data.getUint32(28, true) + index * EDGE_BYTES
-    return { from: this.symbol(this.data.getUint32(base, true)).id, to: this.symbol(this.data.getUint32(base + 4, true)).id, line: this.data.getInt32(base + 8, true), call: Boolean(this.data.getUint32(base + 12, true)) }
+    const from = this.data.getUint32(base, true), to = this.data.getUint32(base + 4, true)
+    const count = this.data.getUint32(20, true), symbols = this.data.getUint32(16, true)
+    if (from >= count || to >= count) throw new RangeError('edge symbol index out of bounds')
+    return { from: this.string(this.data.getUint32(symbols + from * SYMBOL_BYTES, true)), to: this.string(this.data.getUint32(symbols + to * SYMBOL_BYTES, true)), line: this.data.getInt32(base + 8, true), call: Boolean(this.data.getUint32(base + 12, true)) }
   }
   matchingSymbols(request = {}) {
     if (request.id) {

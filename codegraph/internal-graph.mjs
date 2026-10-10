@@ -1,8 +1,9 @@
-import { Node, SyntaxKind } from 'ts-morph'
+import ts from '@ts-morph/common/dist/typescript.js'
 import path from 'node:path'
 import { createRawSemanticProject } from './one-file-semantic-library.mjs'
 export { encodeInternalPartition, decodeInternalPartition, INTERNAL_SCHEMA_VERSION } from './store.mjs'
 
+const { SyntaxKind } = ts
 const assignments = new Set(Array.from({ length: SyntaxKind.LastAssignment - SyntaxKind.FirstAssignment + 1 }, (_, i) => SyntaxKind.FirstAssignment + i))
 const decisions = new Set(['&&', '||', '??'])
 const logicalAssignments = new Set(['&&=', '||=', '??='])
@@ -20,21 +21,21 @@ class Rows {
   [Symbol.iterator]() { return this.rows[Symbol.iterator]() }
 }
 const executableKind = (node) => {
-  if (Node.isSourceFile(node)) return 'module'
-  if (Node.isArrowFunction(node)) return 'arrow'
-  if (Node.isMethodDeclaration(node)) return 'method'
-  if (Node.isConstructorDeclaration(node)) return 'constructor'
-  if (Node.isGetAccessorDeclaration(node)) return 'getter'
-  if (Node.isSetAccessorDeclaration(node)) return 'setter'
-  if (Node.isClassStaticBlockDeclaration?.(node)) return 'static-block'
-  if (Node.isPropertyDeclaration(node) && node.getInitializer()) return 'field-initializer'
-  if (Node.isFunctionDeclaration(node) || Node.isFunctionExpression(node)) return 'function'
+  if ((node?.compilerNode.kind === SyntaxKind.SourceFile)) return 'module'
+  if ((node?.compilerNode.kind === SyntaxKind.ArrowFunction)) return 'arrow'
+  if ((node?.compilerNode.kind === SyntaxKind.MethodDeclaration)) return 'method'
+  if ((node?.compilerNode.kind === SyntaxKind.Constructor)) return 'constructor'
+  if ((node?.compilerNode.kind === SyntaxKind.GetAccessor)) return 'getter'
+  if ((node?.compilerNode.kind === SyntaxKind.SetAccessor)) return 'setter'
+  if ((node?.compilerNode.kind === SyntaxKind.ClassStaticBlockDeclaration)) return 'static-block'
+  if ((node?.compilerNode.kind === SyntaxKind.PropertyDeclaration) && node.getInitializer()) return 'field-initializer'
+  if ((node?.compilerNode.kind === SyntaxKind.FunctionDeclaration) || (node?.compilerNode.kind === SyntaxKind.FunctionExpression)) return 'function'
   return null
 }
 const ownerName = (node) => {
-  if (Node.isSourceFile(node)) return '<module>'
-  if (Node.isConstructorDeclaration(node)) return 'constructor'
-  if (Node.isClassStaticBlockDeclaration?.(node)) return '<static>'
+  if ((node?.compilerNode.kind === SyntaxKind.SourceFile)) return '<module>'
+  if ((node?.compilerNode.kind === SyntaxKind.Constructor)) return 'constructor'
+  if ((node?.compilerNode.kind === SyntaxKind.ClassStaticBlockDeclaration)) return '<static>'
   return node.getName?.() || node.getParent?.()?.getName?.() || '<anonymous>'
 }
 const location = (file, node) => {
@@ -120,7 +121,7 @@ function collectSyntax(sourceFile) {
     else nextSibling[lastChild[parentIndex]] = index
     lastChild[parentIndex] = index
     stack.push(index)
-    if (Node.isIdentifier(node)) identifiers.push(node)
+    if ((node?.compilerNode.kind === SyntaxKind.Identifier)) identifiers.push(node)
   })
   return { nodes, firstChild: Int32Array.from(firstChild), nextSibling: Int32Array.from(nextSibling), identifiers }
 }
@@ -171,8 +172,8 @@ function attachRelations(sourceFile, graph, identifiers, resolveSymbol, instrume
     const start = ident.getStart(); const end = ident.getEnd(); const ownerId = ownerAt(start, end); if (ownerId === null) continue
     const fromNode = nodeAt(ownerId, start, end); if (fromNode === null) continue
     if (lookupStats) lookupStats.identifierLookups += 1
-    const parent = ident.getParent(); const grand = parent?.getParent(); const call = Node.isCallExpression(parent) && parent.getExpression() === ident || Node.isPropertyAccessExpression(parent) && parent.getNameNode() === ident && Node.isCallExpression(grand) && grand.getExpression() === parent
-    const write = Node.isBinaryExpression(parent) && parent.getLeft() === ident && assignments.has(parent.getOperatorToken().getKind())
+    const parent = ident.getParent(); const grand = parent?.getParent(); const call = (parent?.compilerNode.kind === SyntaxKind.CallExpression) && parent.getExpression() === ident || (parent?.compilerNode.kind === SyntaxKind.PropertyAccessExpression) && parent.getNameNode() === ident && (grand?.compilerNode.kind === SyntaxKind.CallExpression) && grand.getExpression() === parent
+    const write = (parent?.compilerNode.kind === SyntaxKind.BinaryExpression) && parent.getLeft() === ident && assignments.has(parent.getOperatorToken().getKind())
     relations.push({ ownerId, fromNode, targetSymbolId, kind: write ? 'write' : call ? 'call' : 'read' })
   }
   if (lookupStats) graph.lookupStats = lookupStats
@@ -196,7 +197,7 @@ function graphFromSourceFile(sourceFile, file, syntax, resolveSymbol, packed = f
     const node = { id: nodes.length, ownerId, parentId, kind, role, ...location(sourceFile, ast), symbolId: null, unreachable, ...(flags ? { flags } : {}) }; nodes.push(node); return node
   }
   const addEdge = (ownerId, from, to, kind) => { if (from !== null && to !== null) edges.push({ ownerId, from, to, kind }) }
-  const body = (statement) => Node.isBlock(statement) ? statement.getStatements() : [statement]
+  const body = (statement) => (statement?.compilerNode.kind === SyntaxKind.Block) ? statement.getStatements() : [statement]
   const buildOwner = (root, explicitParent = ownerStack.at(-1) ?? null) => {
     if (built.has(root.compilerNode)) return
     built.add(root.compilerNode)
@@ -253,34 +254,34 @@ function graphFromSourceFile(sourceFile, file, syntax, resolveSymbol, packed = f
     }
     const statements = (items, next, unreachable = false, depth = 0) => {
       const dead = []; let stopped = unreachable
-      for (const item of items) { dead.push(stopped); if (Node.isReturnStatement(item) || Node.isThrowStatement(item) || Node.isBreakStatement(item) || Node.isContinueStatement(item)) stopped = true }
+      for (const item of items) { dead.push(stopped); if ((item?.compilerNode.kind === SyntaxKind.ReturnStatement) || (item?.compilerNode.kind === SyntaxKind.ThrowStatement) || (item?.compilerNode.kind === SyntaxKind.BreakStatement) || (item?.compilerNode.kind === SyntaxKind.ContinueStatement)) stopped = true }
       let first = next
       for (let index = items.length - 1; index >= 0; index -= 1) first = statement(items[index], first, dead[index], depth)
       return first
     }
     const statement = (ast, next, unreachable, depth) => {
       if (ast !== root && executableKind(ast)) { nestedOwners.push(ast); return next }
-      if (Node.isBlock(ast)) return statements(ast.getStatements(), next, unreachable, depth)
-      if (Node.isIfStatement(ast)) {
+      if ((ast?.compilerNode.kind === SyntaxKind.Block)) return statements(ast.getStatements(), next, unreachable, depth)
+      if ((ast?.compilerNode.kind === SyntaxKind.IfStatement)) {
         const node = addNode(id, ast, 'condition', 'condition', null, unreachable); owner.nestingDepth = Math.max(owner.nestingDepth, depth + 1)
         const yes = statements(body(ast.getThenStatement()), next, unreachable, depth + 1); const otherwise = ast.getElseStatement(); const no = otherwise ? statements(body(otherwise), next, unreachable, depth + 1) : next
         addEdge(id, node.id, yes, 'true'); addEdge(id, node.id, no, 'false'); return expression(ast.getExpression(), node.id, unreachable, depth)
       }
-      if (Node.isWhileStatement(ast) || Node.isDoStatement(ast) || Node.isForStatement(ast) || Node.isForInStatement(ast) || Node.isForOfStatement(ast)) {
-        const isForLoop = Node.isForStatement(ast) || Node.isForInStatement(ast) || Node.isForOfStatement(ast)
+      if ((ast?.compilerNode.kind === SyntaxKind.WhileStatement) || (ast?.compilerNode.kind === SyntaxKind.DoStatement) || (ast?.compilerNode.kind === SyntaxKind.ForStatement) || (ast?.compilerNode.kind === SyntaxKind.ForInStatement) || (ast?.compilerNode.kind === SyntaxKind.ForOfStatement)) {
+        const isForLoop = (ast?.compilerNode.kind === SyntaxKind.ForStatement) || (ast?.compilerNode.kind === SyntaxKind.ForInStatement) || (ast?.compilerNode.kind === SyntaxKind.ForOfStatement)
         const node = addNode(id, ast, 'loop', 'condition', null, unreachable, isForLoop ? 1 : 0); owner.nestingDepth = Math.max(owner.nestingDepth, depth + 1)
         let continueTarget = node.id
-        if (Node.isForStatement(ast) && ast.getIncrementor()) continueTarget = expression(ast.getIncrementor(), node.id, unreachable, depth + 1)
+        if ((ast?.compilerNode.kind === SyntaxKind.ForStatement) && ast.getIncrementor()) continueTarget = expression(ast.getIncrementor(), node.id, unreachable, depth + 1)
         loopStack.push({ breakTarget: next, continueTarget }); const first = statements(body(ast.getStatement()), continueTarget, unreachable, depth + 1); loopStack.pop()
         addEdge(id, node.id, first, 'true'); addEdge(id, node.id, next, 'false'); return expression(ast.getExpression?.() ?? ast.getCondition?.(), node.id, unreachable, depth)
       }
-      if (Node.isSwitchStatement(ast)) {
+      if ((ast?.compilerNode.kind === SyntaxKind.SwitchStatement)) {
         const node = addNode(id, ast, 'condition', 'condition', null, unreachable); owner.nestingDepth = Math.max(owner.nestingDepth, depth + 1); let fallthrough = next; let hasDefault = false
         loopStack.push({ breakTarget: next, continueTarget: null })
-        for (const clause of [...ast.getCaseBlock().getClauses()].reverse()) { const clauseNode = addNode(id, clause, 'case', 'body', node.id, unreachable); const first = statements(clause.getStatements(), fallthrough, unreachable, depth + 1); addEdge(id, clauseNode.id, first, 'next'); addEdge(id, node.id, clauseNode.id, Node.isDefaultClause(clause) ? 'default' : 'case'); hasDefault ||= Node.isDefaultClause(clause); fallthrough = clauseNode.id }
+        for (const clause of [...ast.getCaseBlock().getClauses()].reverse()) { const clauseNode = addNode(id, clause, 'case', 'body', node.id, unreachable); const first = statements(clause.getStatements(), fallthrough, unreachable, depth + 1); addEdge(id, clauseNode.id, first, 'next'); addEdge(id, node.id, clauseNode.id, (clause?.compilerNode.kind === SyntaxKind.DefaultClause) ? 'default' : 'case'); hasDefault ||= (clause?.compilerNode.kind === SyntaxKind.DefaultClause); fallthrough = clauseNode.id }
         loopStack.pop(); if (!hasDefault) addEdge(id, node.id, next, 'false'); return expression(ast.getExpression(), node.id, unreachable, depth)
       }
-      if (Node.isTryStatement(ast)) {
+      if ((ast?.compilerNode.kind === SyntaxKind.TryStatement)) {
         const finalBlock = ast.getFinallyBlock(); const catchClause = ast.getCatchClause()
         const finalMarker = finalBlock ? addNode(id, finalBlock, 'statement', 'finalizer', null, unreachable) : null
         const finalEntry = finalBlock ? statements(finalBlock.getStatements(), finalMarker.id, unreachable, depth + 1) : next
@@ -306,24 +307,24 @@ function graphFromSourceFile(sourceFile, file, syntax, resolveSymbol, packed = f
         }
         return tryEntry
       }
-      if (Node.isReturnStatement(ast) || Node.isThrowStatement(ast)) { const kind = Node.isReturnStatement(ast) ? 'return' : 'throw'; const node = addNode(id, ast, kind, 'body', null, unreachable); addEdge(id, node.id, exit.id, kind); return expression(ast.getExpression?.(), node.id, unreachable, depth) }
-      if (Node.isBreakStatement(ast) || Node.isContinueStatement(ast)) { const kind = Node.isBreakStatement(ast) ? 'break' : 'continue'; const node = addNode(id, ast, kind, 'body', null, unreachable); const target = kind === 'break' ? loopStack.at(-1)?.breakTarget : loopStack.at(-1)?.continueTarget; addEdge(id, node.id, target ?? next, kind); return node.id }
-      if (Node.isLabeledStatement(ast)) { labelStack.push(ast.getLabel().getText()); const first = statement(ast.getStatement(), next, unreachable, depth); labelStack.pop(); return first }
+      if ((ast?.compilerNode.kind === SyntaxKind.ReturnStatement) || (ast?.compilerNode.kind === SyntaxKind.ThrowStatement)) { const kind = (ast?.compilerNode.kind === SyntaxKind.ReturnStatement) ? 'return' : 'throw'; const node = addNode(id, ast, kind, 'body', null, unreachable); addEdge(id, node.id, exit.id, kind); return expression(ast.getExpression?.(), node.id, unreachable, depth) }
+      if ((ast?.compilerNode.kind === SyntaxKind.BreakStatement) || (ast?.compilerNode.kind === SyntaxKind.ContinueStatement)) { const kind = (ast?.compilerNode.kind === SyntaxKind.BreakStatement) ? 'break' : 'continue'; const node = addNode(id, ast, kind, 'body', null, unreachable); const target = kind === 'break' ? loopStack.at(-1)?.breakTarget : loopStack.at(-1)?.continueTarget; addEdge(id, node.id, target ?? next, kind); return node.id }
+      if ((ast?.compilerNode.kind === SyntaxKind.LabeledStatement)) { labelStack.push(ast.getLabel().getText()); const first = statement(ast.getStatement(), next, unreachable, depth); labelStack.pop(); return first }
       const node = addNode(id, ast, nodeKind(ast) ?? 'statement', 'body', null, unreachable); addEdge(id, node.id, next, 'next')
       let first = node.id
-      const children = childrenOf(ast).filter((child) => !Node.isStatement(child))
+      const children = childrenOf(ast).filter((child) => !(child?.compilerNode.kind === SyntaxKind.ModuleBlock || (child?.compilerNode !== undefined && ts.isStatementOrBlock(child.compilerNode) && child.compilerNode.kind !== SyntaxKind.MissingDeclaration && child.compilerNode.kind !== SyntaxKind.NamespaceExportDeclaration)))
       for (let index = children.length - 1; index >= 0; index -= 1) first = expression(children[index], first, unreachable, depth)
       return first
     }
-    const rootBody = Node.isSourceFile(root) ? null : Node.isPropertyDeclaration(root) ? root.getInitializer() : root.getBody?.()
-    let first = Node.isSourceFile(root) ? statements(root.getStatements(), exit.id) : Node.isBlock(rootBody) ? statements(rootBody.getStatements(), exit.id) : expression(rootBody, exit.id)
+    const rootBody = (root?.compilerNode.kind === SyntaxKind.SourceFile) ? null : (root?.compilerNode.kind === SyntaxKind.PropertyDeclaration) ? root.getInitializer() : root.getBody?.()
+    let first = (root?.compilerNode.kind === SyntaxKind.SourceFile) ? statements(root.getStatements(), exit.id) : (rootBody?.compilerNode.kind === SyntaxKind.Block) ? statements(rootBody.getStatements(), exit.id) : expression(rootBody, exit.id)
     const parameterDefaults = []
     for (const parameter of root.getParameters?.() ?? []) {
       if (parameter.getInitializer?.()) parameterDefaults.push(parameter)
       const pending = [...childrenOf(parameter)].reverse()
       while (pending.length) {
         const candidate = pending.pop()
-        if (Node.isBindingElement(candidate) && candidate.getInitializer?.()) parameterDefaults.push(candidate)
+        if ((candidate?.compilerNode.kind === SyntaxKind.BindingElement) && candidate.getInitializer?.()) parameterDefaults.push(candidate)
         const nested = childrenOf(candidate)
         for (let index = nested.length - 1; index >= 0; index -= 1) pending.push(nested[index])
       }

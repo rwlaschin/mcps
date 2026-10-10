@@ -168,11 +168,14 @@ export const startMcp = ({ root, profile, diagnosticLog, spawnChild = spawn, pla
   const environment = root || diagnosticPath
     ? { ...process.env, ...(root && { CODEGRAPH_ROOT: root }), ...(diagnosticPath && { CODEGRAPH_DEBUG_POOL: '1' }) }
     : process.env
-  const service = profile ? spawnChild(process.execPath, serviceArgs, { cwd: PROJECT, env: environment, stdio: ['ignore', 'ignore', 'pipe'] }) : null
+  let service
+  try { service = profile ? spawnChild(process.execPath, serviceArgs, { cwd: PROJECT, env: environment, stdio: ['ignore', 'ignore', 'pipe'] }) : null }
+  catch (error) { closeDiagnostic(); throw error }
   const serviceClient = profile ? new QueryDaemonClient(root ?? process.cwd()) : null
+  let lifecycleActive = true
   const serviceReady = profile ? (async () => {
     while (true) {
-      if (service.exitCode !== null && service.exitCode !== undefined) throw new Error('profile service failed to bind; refusing to profile another owner')
+      if (!lifecycleActive || (service.exitCode !== null && service.exitCode !== undefined) || (service.signalCode !== null && service.signalCode !== undefined)) throw new Error('profile service failed to bind; refusing to profile another owner')
       try {
         await serviceClient.connect()
         const status = await serviceClient.request('status')
@@ -187,14 +190,18 @@ export const startMcp = ({ root, profile, diagnosticLog, spawnChild = spawn, pla
   serviceReady.catch(() => {})
   let child
   try { child = spawnChild(process.execPath, args, { cwd: PROJECT, env: environment, stdio: ['pipe', 'pipe', 'pipe'], detached: platform !== 'win32' }) }
-  catch (error) { service?.kill('SIGTERM'); void serviceClient?.close(); closeDiagnostic(); throw error }
+  catch (error) {
+    lifecycleActive = false
+    try { if (service?.exitCode === null && service.signalCode === null) service.kill('SIGTERM') }
+    finally { try { void serviceClient?.close() } finally { closeDiagnostic() } }
+    throw error
+  }
   const signalChild = (signal) => platform === 'win32' ? child.kill(signal) : killProcess(-child.pid, signal)
-  let lifecycleActive = true
   const controllerSignals = ['SIGINT', 'SIGTERM', 'SIGHUP']
-  const onControllerExit = () => { try { if (service?.exitCode === null) service.kill('SIGTERM'); if (child.exitCode === null && child.signalCode === null) signalChild('SIGTERM') } catch {} }
+  const onControllerExit = () => { try { if (service?.exitCode === null && service.signalCode === null) service.kill('SIGTERM'); if (child.exitCode === null && child.signalCode === null) signalChild('SIGTERM') } catch {} }
   const signalHandlers = new Map(controllerSignals.map((signal) => [signal, () => {
     unregisterLifecycle()
-    try { if (service?.exitCode === null) service.kill('SIGTERM'); if (child.exitCode === null && child.signalCode === null) signalChild('SIGTERM') } finally {
+    try { if (service?.exitCode === null && service.signalCode === null) service.kill('SIGTERM'); if (child.exitCode === null && child.signalCode === null) signalChild('SIGTERM') } finally {
       if (typeof controller.kill === 'function' && Number.isInteger(controller.pid)) controller.kill(controller.pid, signal)
     }
   }]))
@@ -270,17 +277,16 @@ export const startMcp = ({ root, profile, diagnosticLog, spawnChild = spawn, pla
         const status = await serviceClient.request('status')
         if (status.servicePid !== service.pid) throw new Error('profile service ownership changed; refusing shutdown')
         const exited = new Promise((resolve, reject) => { service.once('error', reject); service.once('exit', code => code === 0 ? resolve() : reject(new Error(`profile service exited ${code}`))) })
-        await serviceClient.request('shutdown'); await serviceClient.close(); await exited
+        await serviceClient.request('shutdown'); await exited
       }
       return receipt
     } catch (error) {
-      if (service?.exitCode === null) {
+      if (service?.exitCode === null && service.signalCode === null) {
         const exited = new Promise(resolve => service.once('exit', resolve))
-        service.kill('SIGTERM'); await exited
+        if (service.kill('SIGTERM')) await exited
       }
-      await serviceClient?.close()
       throw error
-    } finally { closeDiagnostic() }
+    } finally { try { await serviceClient?.close() } finally { closeDiagnostic() } }
   }
   return { timed, stop }
 }

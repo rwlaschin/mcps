@@ -1,6 +1,6 @@
 import path from 'node:path'
 import crypto from 'node:crypto'
-import { ts } from '@ts-morph/common'
+import ts from '@ts-morph/common/dist/typescript.js'
 import { ParserApartmentPool } from './parser-apartment-pool.mjs'
 import { extractCachedBindings, resolveCachedImport, visitImportBindings } from './cached-binding-resolver.mjs'
 

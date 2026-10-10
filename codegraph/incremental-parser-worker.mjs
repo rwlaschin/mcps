@@ -1,7 +1,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { parentPort, workerData } from 'node:worker_threads'
-import { ts } from '@ts-morph/common'
+import ts from '@ts-morph/common/dist/typescript.js'
 import { parseFile } from './incremental-resolver.mjs'
 
 const root = path.resolve(workerData.root)

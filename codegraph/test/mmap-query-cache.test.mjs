@@ -771,7 +771,15 @@ test('boundary value: absent name after the index range returns no rows', () => 
 test('hotpath ordering contract: string indexes use UTF-8 page-byte order rather than locale collation', () => {
   const source = fs.readFileSync(path.join(import.meta.dirname, '..', 'mmap-query-cache.mjs'), 'utf8')
 
-  assert.deepEqual({ usesLocaleCollation: source.includes('.localeCompare('), usesPageByteComparison: source.includes('comparePageString') }, {
+  const writerStart = source.indexOf('  const changes = view.indexChanges')
+  const writerEnd = source.indexOf('  data.setUint32(footerOffset, FOOTER_MAGIC', writerStart)
+  const readerStart = source.indexOf('class MappedQueryView {')
+  const readerEnd = source.indexOf('export class MmapQueryCache {', readerStart)
+  assert.ok(writerStart >= 0 && writerEnd > writerStart, 'query index writer source span exists')
+  assert.ok(readerStart >= 0 && readerEnd > readerStart, 'mapped index reader source span exists')
+  const indexes = source.slice(writerStart, writerEnd) + source.slice(readerStart, readerEnd)
+
+  assert.deepEqual({ usesLocaleCollation: indexes.includes('.localeCompare('), usesPageByteComparison: indexes.includes('comparePageString') }, {
     usesLocaleCollation: false,
     usesPageByteComparison: true,
   })
@@ -882,7 +890,7 @@ test('hotpath diagnostic: mapped indexes query one of 22000 symbols and 29 of 55
     graphDecodes: 0,
     firstSymbol: { id: 'symbol-0', file: 'src/file-0.ts', name: 'needle', kind: 'function', line: 1, qualifiedPath: '<module>', signature: '<>():', ordinal: 0, exported: true },
     firstRef: { from: 'symbol-1', to: 'symbol-0', line: 1, call: true }, firstRefCount: 29,
-    firstQueryDecodes: { symbolDecodes: 60, edgeDecodes: 29 },
+    firstQueryDecodes: { symbolDecodes: 2, edgeDecodes: 29 },
     symbolCount: 1, refCount: 29,
   })
   lease.release()

@@ -1,7 +1,6 @@
 import path from 'node:path'
-import { ts } from 'ts-morph'
-import { getLibFiles, libFolderInMemoryPath } from '@ts-morph/common'
-import { prepareSemanticProject, parsePartition, contentHash } from './parser.mjs'
+import { ts, getLibFiles, libFolderInMemoryPath } from '@ts-morph/common'
+import { prepareSemanticProject, refreshSemanticFiles, parsePartition, contentHash } from './parser.mjs'
 import { encodeInternalPartition } from './internal-graph.mjs'
 
 const bundledLibraries = new Map()
@@ -186,13 +185,42 @@ export function createOneFileSemanticSession(root, rel, options = { allowJs: tru
         const scope = node.kind === ts.SyntaxKind.Identifier && node.pos >= 0 && !(node.flags & ts.NodeFlags.Synthesized) && expressionReference(node) ? lexicalScope(this, node.parent) : null
         if (scope) {
           this.stats.lexicalEligible += 1
-          let names = this.lexicalResults.get(scope)
+          // Compiler scopes and Symbols are distinct keys; both checker-owned memos reset together.
+          let names = this.symbols.get(scope)
           if (names?.has(node.text)) { this.stats.lexicalCacheHits += 1; symbol = names.get(node.text) }
           else {
-            this.stats.lexicalCacheMisses += 1; this.stats.remainingCheckerLookups += 1
+            this.stats.lexicalCacheMisses += 1
+            let bound
+            if (this.sourceFile) for (let current = node.parent; current; current = current.parent) {
+              this.stats.binderScopeProbes += 1
+              bound = current.locals?.get(node.escapedText)
+              if (bound) break
+            }
+            const declaration = bound?.declarations?.length === 1 ? bound.declarations[0] : null
+            const ordinary = declaration && ts.isIdentifier(declaration.name) && !bound.exportSymbol &&
+              (bound.flags === ts.SymbolFlags.FunctionScopedVariable || bound.flags === ts.SymbolFlags.BlockScopedVariable || bound.flags === ts.SymbolFlags.Function)
+            let exported = false
+            if (ordinary) for (let current = declaration; current && current.kind !== ts.SyntaxKind.SourceFile; current = current.parent) {
+              if (current.modifiers?.some(modifier => modifier.kind === ts.SyntaxKind.ExportKeyword)) { exported = true; break }
+            }
+            const owned = this.lexicalResults.get(scope)?.get(node.text)
+            if (this.sourceFile && ordinary && !exported && owned?.declaration === declaration && owned.flags === bound.flags) {
+              this.stats.durableLexicalHits += 1
+              this.lookups.set(node, owned.facade)
+              if (!names) { names = new Map(); this.symbols.set(scope, names) }
+              names.set(node.text, bound)
+              return owned.facade
+            }
+            this.stats.durableLexicalMisses += 1; this.stats.remainingCheckerLookups += 1
             symbol = this.checker.getSymbolAtLocation(node)
-            if (!names) { names = new Map(); this.lexicalResults.set(scope, names) }
+            if (!names) { names = new Map(); this.symbols.set(scope, names) }
             names.set(node.text, symbol)
+            if (this.sourceFile && ordinary && !exported && symbol === bound) {
+              let facts = this.lexicalResults.get(scope)
+              if (!facts) { facts = new Map(); this.lexicalResults.set(scope, facts) }
+              const declarations = [this.wrap(declaration)]; const flags = bound.flags
+              facts.set(node.text, { declaration, flags, facade: { getFlags: () => flags, getDeclarations: () => declarations } })
+            } else this.lexicalResults.get(scope)?.delete(node.text)
           }
         } else { this.stats.remainingCheckerLookups += 1; symbol = this.checker.getSymbolAtLocation(node) }
       }
@@ -202,7 +230,7 @@ export function createOneFileSemanticSession(root, rel, options = { allowJs: tru
       return wrapped
     },
     parse(source, knownFiles = new Set([rel]), cachedPartitions = null, changeRange = null, timing = null) {
-      this.stats = { analysisCacheHits: 0, lexicalEligible: 0, lexicalCacheHits: 0, lexicalCacheMisses: 0, remainingCheckerLookups: 0, nodesCreated: 0, nodeCacheHits: 0, symbolLookups: 0, symbolCacheHits: 0, declarationCacheHits: 0, importSymbolCacheHits: 0, sourceCreates: 0, sourceUpdates: 0, programCreates: 0, checkerCreates: 0, syntaxMs: 0, programMs: 0, checkerMs: 0, partitionMs: 0, totalMs: 0 }
+      this.stats = { analysisCacheHits: 0, durableLexicalHits: 0, durableLexicalMisses: 0, binderScopeProbes: 0, lexicalEligible: 0, lexicalCacheHits: 0, lexicalCacheMisses: 0, remainingCheckerLookups: 0, nodesCreated: 0, nodeCacheHits: 0, symbolLookups: 0, symbolCacheHits: 0, declarationCacheHits: 0, importSymbolCacheHits: 0, sourceCreates: 0, sourceUpdates: 0, programCreates: 0, checkerCreates: 0, syntaxMs: 0, programMs: 0, checkerMs: 0, partitionMs: 0, totalMs: 0 }
       const started = performance.now()
       let mark = started
       const previousSource = this.sourceFile?.text
@@ -245,7 +273,7 @@ export function createOneFileSemanticSession(root, rel, options = { allowJs: tru
           return result
       }
       if (changed || this.program.getSourceFile(absolute) !== this.sourceFile) {
-        this.lookups = new WeakMap(); this.symbols = new WeakMap(); this.scopeClassifications = new WeakMap(); this.lexicalResults = new WeakMap()
+        this.lookups = new WeakMap(); this.symbols = new WeakMap(); this.scopeClassifications = new WeakMap()
         mark = performance.now()
         this.program = ts.createProgram([absolute], options, host, this.program ?? undefined)
         this.stats.programCreates += 1; this.stats.programMs = performance.now() - mark
@@ -255,7 +283,9 @@ export function createOneFileSemanticSession(root, rel, options = { allowJs: tru
       }
       mark = performance.now()
       if (timing) timing.projectCreateMs += performance.now() - started
-      const context = this.context = prepareSemanticProject(this.adapter, root, null, timing)
+      const context = this.context ??= prepareSemanticProject(this.adapter, root, null, timing)
+      context.semanticTiming = timing
+      if (context.perFile.has(absolute)) refreshSemanticFiles(context, [this.sourceWrapped])
       const result = parsePartition(rel, source, knownFiles, context, null, 'complete', true, true, cachedPartitions)
       this.analysisCache = null
       const fn = this.sourceFile.statements.at(-1)
@@ -292,7 +322,7 @@ export function createOneFileSemanticSession(root, rel, options = { allowJs: tru
 export function createRawSemanticProject(root, sources, options, fileSystem = null, { skipLoadingLibFiles = false, loadLibFiles = Boolean(fileSystem) } = {}) {
   const first = sources.keys().next().value ?? '.'
   const session = createOneFileSemanticSession(root, first, options)
-  session.stats = { lexicalEligible: 0, lexicalCacheHits: 0, lexicalCacheMisses: 0, remainingCheckerLookups: 0, nodesCreated: 0, nodeCacheHits: 0, symbolLookups: 0, symbolCacheHits: 0, declarationCacheHits: 0, importSymbolCacheHits: 0 }
+  session.stats = { durableLexicalHits: 0, durableLexicalMisses: 0, binderScopeProbes: 0, lexicalEligible: 0, lexicalCacheHits: 0, lexicalCacheMisses: 0, remainingCheckerLookups: 0, nodesCreated: 0, nodeCacheHits: 0, symbolLookups: 0, symbolCacheHits: 0, declarationCacheHits: 0, importSymbolCacheHits: 0 }
   const files = new Map()
   const roots = []
   const directories = new Set()
