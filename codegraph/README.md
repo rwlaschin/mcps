@@ -240,25 +240,28 @@ filesystem, results, and watcher or path-normalization failures in a
 <!-- codegraph-performance:start -->
 CodeGraph was tested against the 877-source-file D&D Community and Marketplace project in one production MCP lifecycle.
 
-Measured 2026-10-09 with Node 26.9.0 on AC power, compile cache enabled and three workers, without CPU or heap profiling. Source copying completed before the timer. Initial indexing and indexed queries have one sample each; one-file updates and post-update queries have five samples. Pairs show p50 / p90; single-sample pairs repeat the observation. Frozen snapshot SHA-256: `533d807befa265f8adc83c1c01e78fbb23ceeedf3b592a01688cc829d51466cc`.
+Measured 2026-10-09 with Node 26.9.0 on AC power, compile cache enabled and three workers, without CPU or heap profiling. Source copying completed before the timer. Indexed queries and MCP cold indexing have one sample each; cascade queries and updates have five samples. Pairs show p50 / p90. This run appends an exported type in src/types/index.ts; leaf updates, CLI cold indexing and full reindexing were not remeasured. Frozen snapshot SHA-256: `533d807befa265f8adc83c1c01e78fbb23ceeedf3b592a01688cc829d51466cc`.
 
 ## Metrics
 
-| Operation | Indexed | Post-update |
-| :--- | ---: | ---: |
-| References | 280.02 / 280.02 ms | 0.86 / 1.11 ms |
-| Dependencies | 3.03 / 3.03 ms | 0.86 / 1.10 ms |
-| Callers | 46.74 / 46.74 ms | 42.50 / 59.50 ms |
-| Dead exports | 52.45 / 52.45 ms | 49.22 / 50.88 ms |
-| Named-symbol query | 1.09 / 1.09 ms | 0.84 / 1.59 ms |
-| Symbol list (2,000 max) | 25.76 / 25.76 ms | 23.80 / 34.67 ms |
-| Single-symbol query | 1.01 / 1.01 ms | 0.88 / 1.03 ms |
-| Cyclomatic complexity | 4.71 / 4.71 ms | 3.29 / 3.85 ms |
+| Operation | Indexed | Leaf update | Cascade update |
+| :--- | ---: | ---: | ---: |
+| References | 280.02 / 280.02 ms | Not remeasured | 0.86 / 1.11 ms |
+| Dependencies | 3.03 / 3.03 ms | Not remeasured | 0.86 / 1.10 ms |
+| Callers | 46.74 / 46.74 ms | Not remeasured | 42.50 / 59.50 ms |
+| Dead exports | 52.45 / 52.45 ms | Not remeasured | 49.22 / 50.88 ms |
+| Named-symbol query | 1.09 / 1.09 ms | Not remeasured | 0.84 / 1.59 ms |
+| Symbol list (2,000 max) | 25.76 / 25.76 ms | Not remeasured | 23.80 / 34.67 ms |
+| Single-symbol query | 1.01 / 1.01 ms | Not remeasured | 0.88 / 1.03 ms |
+| Cyclomatic complexity | 4.71 / 4.71 ms | Not remeasured | 3.29 / 3.85 ms |
 
 | Update | p50 / p90 | Parsed files | Validated files |
 | :--- | ---: | ---: | ---: |
-| Initial index | 5737.07 / 5737.07 ms | 877 | 877 |
-| One-file update | 340.96 / 373.59 ms | 1 | 1 |
+| CLI cold index | Not remeasured | Not remeasured | Not remeasured |
+| Leaf incremental update | Not remeasured | Not remeasured | Not remeasured |
+| Cascade incremental update | 340.96 / 373.59 ms | 1 | 1 |
+| Full reindex | Not remeasured | Not remeasured | Not remeasured |
+| MCP cold index | 5737.07 / 5737.07 ms | 877 | 877 |
 <!-- codegraph-performance:end -->
 
 ### Updating Performance Metrics
