@@ -20,6 +20,7 @@ Read this if you are changing what gets indexed, what kinds of symbols exist, or
 
 ## Design Constraints
 
+- **Node compile caching precedes project imports.** MCP, CLI, direct service, visualizer, workers, and performance entry points load the builtins-only `compile-cache.mjs` before awaited project imports. The existing `NODE_COMPILE_CACHE` override or temporary `codegraph-compile-cache` directory propagates to child processes and workers; Node honors `NODE_DISABLE_COMPILE_CACHE`. Older Node releases without the optional API continue to start.
 - **Semantic parsing is worker-owned.** Every `CodeGraphEngine` sends initial `index`, persisted `hydrate`, delta `validate`, and warm `reference-overlay` work through one `SemanticCheckerWorker`.
 - **Connected owners retain the shared runtime under memory pressure.** The service owns one global heavy runtime. Its 1 GiB RSS cleanup guard now uses the existing idle predicate: no admitted owner, listener, queued job, active read, running job, or pending/running watcher work. A connected runtime can therefore exceed 1 GiB; final-owner disconnect, root/profile switching, and shutdown still dispose it. Inactive query-cache pressure cleanup is preserved.
 - **Single-file validation is changed-file-only.** A one-file change or add parses and validates exactly that file; an unlink emits exactly one tombstone and parses no source. Dependent source is never read, parsed, scanned, resolved, or validated. Retained complete partitions and indexes supply the facts needed to patch edges and report dangling references. Cold and multi-file builds remain full batches.
@@ -232,6 +233,7 @@ Tests live in `codegraph/test/`. Run `node --test test/*.test.mjs` from `codegra
 - `test/file-index.test.mjs` — id interning/release and `PagedBitSet` behavior.
 - `test/trace-profile.test.mjs` — the profiler spans emitted by `parser.mjs`.
 - `test/engine.test.mjs`, `test/boundaries.test.mjs` — end-to-end indexing over the semantic path.
+- `test/compile-cache.test.mjs` — actual cache activation, defaults, overrides, disable behavior, missing API, worker inheritance, and direct service startup.
 - `test/one-file-semantic-parity.test.mjs` — complete raw-program partition parity against the Project oracle.
 - `test/one-file-semantic-library.test.mjs` — complete partition, fingerprint, and binary parity after position shifts, binding edits, repeated edits, and numeric-return cache reuse/invalidation.
 - `test/one-file-library-integration.test.mjs` — cached imported targets and bounded dependency invalidation, numeric token boundaries, and actual worker transport parity across warm, dependency, unlink/re-add, configuration, and root transitions.

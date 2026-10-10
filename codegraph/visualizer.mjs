@@ -4,8 +4,9 @@ import fs from 'node:fs'
 import http from 'node:http'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { streamQuery } from './query-client.mjs'
-import { buildLayeredGraph, buildHeatmapData, buildSunburstData, buildChordData, buildCallTreeData, buildComplexityData, mostCalledSymbolIds, layoutCallTree } from './visualizer-graph.mjs'
+import './compile-cache.mjs'
+const { streamQuery } = await import('./query-client.mjs')
+const { buildLayeredGraph, buildHeatmapData, buildSunburstData, buildChordData, buildCallTreeData, buildComplexityData, mostCalledSymbolIds, layoutCallTree } = await import('./visualizer-graph.mjs')
 
 const args = process.argv.slice(2)
 const rootAt = args.indexOf('--root')

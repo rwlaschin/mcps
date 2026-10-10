@@ -238,30 +238,28 @@ filesystem, results, and watcher or path-normalization failures in a
 ## Performance and Product Comparison
 
 <!-- codegraph-performance:start -->
-CodeGraph was tested against the 877-source-file D&D Community and Marketplace project. The broad lifecycle table below is historical pre-fix evidence; its 395-file cascade validation does not describe the current changed-file-only path.
+CodeGraph was tested against the 877-source-file D&D Community and Marketplace project in one production MCP lifecycle.
+
+Measured 2026-10-09 with Node 26.9.0 on AC power, compile cache enabled and three workers, without CPU or heap profiling. Source copying completed before the timer. Initial indexing and indexed queries have one sample each; one-file updates and post-update queries have five samples. Pairs show p50 / p90; single-sample pairs repeat the observation. Frozen snapshot SHA-256: `533d807befa265f8adc83c1c01e78fbb23ceeedf3b592a01688cc829d51466cc`.
 
 ## Metrics
 
-| Operation | Indexed | Leaf update | Cascade update |
-| :--- | ---: | ---: | ---: |
-| References | 21612.98 / 23993.19 ms | 2.41 / 3.16 ms | 5461.53 / 10902.77 ms |
-| Dependencies | 24.11 / 37.35 ms | 2.64 / 3.84 ms | 5.34 / 43.51 ms |
-| Callers | 99.47 / 138.37 ms | 75.68 / 91.81 ms | 157.57 / 274.56 ms |
-| Dead exports | 230.94 / 335.53 ms | 256.11 / 275.02 ms | 353.55 / 582.32 ms |
-| Named-symbol query | 2.86 / 5.33 ms | 4.24 / 13.61 ms | 2.50 / 16.91 ms |
-| Symbol list (2,000 max) | 46.28 / 58.34 ms | 69.31 / 110.29 ms | 50.91 / 94.88 ms |
-| Single-symbol query | 3.37 / 6.21 ms | 3.83 / 6.34 ms | 2.62 / 7.18 ms |
-| Cyclomatic complexity | 14.66 / 16.50 ms | 10.55 / 25.82 ms | 8.62 / 22.83 ms |
+| Operation | Indexed | Post-update |
+| :--- | ---: | ---: |
+| References | 280.02 / 280.02 ms | 0.86 / 1.11 ms |
+| Dependencies | 3.03 / 3.03 ms | 0.86 / 1.10 ms |
+| Callers | 46.74 / 46.74 ms | 42.50 / 59.50 ms |
+| Dead exports | 52.45 / 52.45 ms | 49.22 / 50.88 ms |
+| Named-symbol query | 1.09 / 1.09 ms | 0.84 / 1.59 ms |
+| Symbol list (2,000 max) | 25.76 / 25.76 ms | 23.80 / 34.67 ms |
+| Single-symbol query | 1.01 / 1.01 ms | 0.88 / 1.03 ms |
+| Cyclomatic complexity | 4.71 / 4.71 ms | 3.29 / 3.85 ms |
 
 | Update | p50 / p90 | Parsed files | Validated files |
 | :--- | ---: | ---: | ---: |
-| CLI cold index | 20429.80 / 39933.92 ms | 877 | 877 |
-| Leaf incremental update | 1153.89 / 1476.76 ms | 1 | 1 |
-| Cascade incremental update | 10233.90 / 13029.95 ms | 1 | 395 |
-| Full reindex | 25927.54 / 43766.40 ms | 877 | 877 |
+| Initial index | 5737.07 / 5737.07 ms | 877 | 877 |
+| One-file update | 340.96 / 373.59 ms | 1 | 1 |
 <!-- codegraph-performance:end -->
-
-Current real-repository changed-surface receipts are separate cold and warm runs: cold initial index 44,209.01 ms; cold `src/types/index.ts` update 6,038.29 ms with 1 parsed/1 validated; warm update 5,785.94 ms with 1 parsed/1 validated.
 
 ### Updating Performance Metrics
 

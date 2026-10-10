@@ -2,10 +2,11 @@ import { Worker, isMainThread, parentPort, threadId, workerData } from 'node:wor
 import fs from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
-import { EDGE_COVERAGE } from './edge-coverage.mjs'
-import { decodeSymbolPartition, GraphStore, symbolPartitionLayout, writeSymbolPartition } from './store.mjs'
-import { deriveWorkerProfile } from './worker-profile.mjs'
-import { createCachedReferenceIndex, repairCachedReferences, updateCachedGraphFacts, cachedUnresolvedEdges, cachedPublicationEdgePatches } from './cached-binding-resolver.mjs'
+import './compile-cache.mjs'
+const { EDGE_COVERAGE } = await import('./edge-coverage.mjs')
+const { decodeSymbolPartition, GraphStore, symbolPartitionLayout, writeSymbolPartition } = await import('./store.mjs')
+const { deriveWorkerProfile } = await import('./worker-profile.mjs')
+const { createCachedReferenceIndex, repairCachedReferences, updateCachedGraphFacts, cachedUnresolvedEdges, cachedPublicationEdgePatches } = await import('./cached-binding-resolver.mjs')
 
 export { deriveWorkerProfile }
 

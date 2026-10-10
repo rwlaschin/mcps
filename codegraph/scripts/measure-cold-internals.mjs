@@ -2,8 +2,9 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { performance } from 'node:perf_hooks'
-import { createDisposableMirror } from './codegraph.performance.mjs'
-import { CodeGraphEngine } from '../tool-engine.mjs'
+import '../compile-cache.mjs'
+const { createDisposableMirror } = await import('./codegraph.performance.mjs')
+const { CodeGraphEngine } = await import('../tool-engine.mjs')
 
 if (!process.argv[2]) throw new Error('usage: measure-cold-internals.mjs <repository>')
 const sourceRoot = path.resolve(process.argv[2])

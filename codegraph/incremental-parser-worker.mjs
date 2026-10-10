@@ -1,8 +1,9 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { parentPort, workerData } from 'node:worker_threads'
-import ts from '@ts-morph/common/dist/typescript.js'
-import { parseFile } from './incremental-resolver.mjs'
+import './compile-cache.mjs'
+const { default: ts } = await import('@ts-morph/common/dist/typescript.js')
+const { parseFile } = await import('./incremental-resolver.mjs')
 
 const root = path.resolve(workerData.root)
 const realRoot = fs.realpathSync(root)

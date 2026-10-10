@@ -1,12 +1,13 @@
 #!/usr/bin/env node
-import { QueryDaemonClient } from '../query-daemon.mjs'
 import { spawn, spawnSync } from 'node:child_process'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
-import { deriveWorkerProfile } from '../parser-apartment-pool.mjs'
+import '../compile-cache.mjs'
+const { QueryDaemonClient } = await import('../query-daemon.mjs')
+const { deriveWorkerProfile } = await import('../parser-apartment-pool.mjs')
 
 export { deriveWorkerProfile }
 

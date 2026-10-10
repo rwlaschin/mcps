@@ -3,6 +3,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import readline from 'node:readline'
 import { once } from 'node:events'
+import './compile-cache.mjs'
 
 const args = process.argv.slice(2)
 const rootAt = args.indexOf('--root')

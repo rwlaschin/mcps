@@ -5,7 +5,8 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { execFileSync } from 'node:child_process'
-import { isFrameworkExport } from './framework-exports.mjs'
+import './compile-cache.mjs'
+const { isFrameworkExport } = await import('./framework-exports.mjs')
 
 const argRoot = (() => {
   const i = process.argv.indexOf('--root')

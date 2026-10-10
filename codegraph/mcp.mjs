@@ -1,13 +1,9 @@
 #!/usr/bin/env node
-import module from 'node:module'
-import os from 'node:os'
 import path from 'node:path'
 import readline from 'node:readline'
-import { connectQueryDaemon } from './query-daemon.mjs'
+import './compile-cache.mjs'
+const { connectQueryDaemon } = await import('./query-daemon.mjs')
 
-const dir = process.env.NODE_COMPILE_CACHE || path.join(os.tmpdir(), 'codegraph-compile-cache')
-process.env.NODE_COMPILE_CACHE = dir
-module.enableCompileCache?.(dir)
 const root = process.env.CODEGRAPH_ROOT ? path.resolve(process.env.CODEGRAPH_ROOT) : null
 let client = null, reconnecting = null, paused = false, ended = false, finishing = false, reloadReady = null, resumeReload = null
 const held = [], active = new Map(), inFlight = new Set()
