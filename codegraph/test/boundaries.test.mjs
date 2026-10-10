@@ -2,6 +2,9 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import path from 'node:path'
+import os from 'node:os'
+import { CodeGraphEngine } from '../tool-engine.mjs'
+import { createService } from '../mcp-server.mjs'
 import { qualifiedQuery } from '../query-target.mjs'
 
 const typescriptQueryMetadata = { extensions: ['.ts', '.tsx', '.js', '.jsx', '.mts', '.cts', '.mjs', '.cjs'] }
@@ -110,3 +113,32 @@ test('documentation contract: CodeGraph performance and cache rules remain compl
 
   assert.deepEqual(required.filter((phrase) => !source.includes(phrase)), [])
 })
+
+// All-pairs/domain analysis: metadata compatibility × qualified/unqualified target.
+for (const { name, cacheKey, symbol, text, isError, engineFactory } of [
+  { name: 'matching metadata with an unqualified target serves pinned references', cacheKey: 'typescript-2', symbol: 'value', text: 'consumer.ts:1 -> value.ts:1', isError: false, engineFactory: async root => new CodeGraphEngine(root) },
+  { name: 'matching metadata with a qualified target serves pinned references', cacheKey: 'typescript-2', symbol: 'value.ts:value', text: 'consumer.ts:1 -> value.ts:1', isError: false, engineFactory: async root => new CodeGraphEngine(root) },
+  { name: 'stale metadata with an unqualified target reconciles before serving references', cacheKey: 'typescript-0', symbol: 'value', text: 'error: admission reconciliation required', isError: true, engineFactory: async () => ({ reconcile: async () => { throw new Error('admission reconciliation required') }, dispose: async () => {} }) },
+  { name: 'stale metadata with a qualified target reconciles before serving references', cacheKey: 'typescript-0', symbol: 'value.ts:value', text: 'error: admission reconciliation required', isError: true, engineFactory: async () => ({ reconcile: async () => { throw new Error('admission reconciliation required') }, dispose: async () => {} }) },
+]) {
+  test(`analyzer admission: ${name}`, async () => {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cg-analyzer-admission-')))
+    fs.writeFileSync(path.join(root, 'value.ts'), 'export const value = 41\n')
+    fs.writeFileSync(path.join(root, 'consumer.ts'), "import { value } from './value'; export function read(){ return value }\n")
+    const engine = new CodeGraphEngine(root)
+    await engine.build()
+    await engine.snapshotComplete()
+    const manifest = engine.readGeneration()
+    const manifestPath = path.join(root, '.codegraph/generations', `${manifest.generation}.json`)
+    fs.writeFileSync(manifestPath, JSON.stringify({ ...manifest, analyzers: { typescript: cacheKey } }))
+    await engine.dispose()
+    const service = createService({ workerCount: 1, engineFactory })
+    try {
+      const reply = await service.handle({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'codegraph_refs', arguments: { root, symbol } } }, { owner: {} })
+      assert.deepEqual({ text: reply.result.content[0].text, isError: reply.result.isError === true }, { text, isError })
+    } finally {
+      await service.close()
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+}

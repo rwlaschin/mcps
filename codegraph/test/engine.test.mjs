@@ -1025,7 +1025,7 @@ test('error guessing: disk-backed validation retains its captured source snapsho
   await engine.dispose()
 })
 
-test('error guessing: a background semantic validation failure leaves the provisional revision queryable and preserves prior CURRENT', async () => {
+test('error guessing: a background semantic validation failure leaves the last validated revision queryable and preserves prior CURRENT', async () => {
   const root = fixture()
   const failure = new Error('semantic validation failed')
   const engine = trackedEngine(root, { validationWorkerFactory: () => ({ validate: async () => { throw failure }, dispose: async () => {} }) })
@@ -1035,10 +1035,10 @@ test('error guessing: a background semantic validation failure leaves the provis
   const refreshed = engine.applyChanges([{ type: 'change', path: 'src/b.ts', source: 'export function b(){ return 9 }\n' }])
   await assert.rejects(refreshed.validation, (error) => error === failure)
 
-  assert.deepEqual({ current: engine.readGeneration().generation, manifest: manifestBytes(engine), revision: engine.provisionalSnapshot().revision, freshness: engine.provisionalSnapshot().freshness }, { current: built.generation, manifest: before, revision: 1, freshness: 'provisional' })
+  assert.deepEqual({ current: engine.readGeneration().generation, manifest: manifestBytes(engine), revision: engine.provisionalSnapshot().revision, freshness: engine.provisionalSnapshot().freshness }, { current: built.generation, manifest: before, revision: 0, freshness: 'validated' })
 })
 
-test('error guessing: a background publish failure preserves prior CURRENT while leaving the provisional revision queryable', async () => {
+test('error guessing: a background publish failure preserves prior CURRENT while leaving the last validated revision queryable', async () => {
   const root = fixture()
   const engine = trackedEngine(root)
   const built = await engine.build()
@@ -1048,7 +1048,7 @@ test('error guessing: a background publish failure preserves prior CURRENT while
   const refreshed = engine.applyChanges([{ type: 'change', path: 'src/b.ts', source: 'export function b(){ return 9 }\n' }])
   await assert.rejects(refreshed.validation, /permission denied publishing generation/)
 
-  assert.deepEqual({ current: engine.readGeneration().generation, manifest: manifestBytes(engine), revision: engine.provisionalSnapshot().revision, freshness: engine.provisionalSnapshot().freshness }, { current: built.generation, manifest: before, revision: 1, freshness: 'provisional' })
+  assert.deepEqual({ current: engine.readGeneration().generation, manifest: manifestBytes(engine), revision: engine.provisionalSnapshot().revision, freshness: engine.provisionalSnapshot().freshness }, { current: built.generation, manifest: before, revision: 0, freshness: 'validated' })
 })
 
 test('domain analysis: unchanged source blob IDs are reused across a one-file incremental generation', async () => {
@@ -1101,7 +1101,7 @@ test('error guessing: concurrent direct change incrementals serialize without lo
   await clean.dispose()
 })
 
-test('error guessing: concurrent build and incremental operations retain clean equivalence and successful provisional and validation profiles', async () => {
+test('error guessing: concurrent build and incremental operations retain clean equivalence and successful build and validation profiles', async () => {
   const root = fixture()
   const tracePath = path.join(root, 'concurrent-profile.json')
   const engine = trackedEngine(root, { profile: tracePath, sourceReaderDeps: { readFile: async (file, encoding) => { await new Promise((resolve) => setTimeout(resolve, 10)); return fsp.readFile(file, encoding) } } })
@@ -1116,7 +1116,7 @@ test('error guessing: concurrent build and incremental operations retain clean e
 
   assert.deepEqual(
     { graph: canon(engine.snapshot()), operationNames: operations.map((event) => event.name), statuses: operations.map((event) => event.args.status) },
-    { graph: canon(clean.snapshot()), operationNames: ['codegraph.build', 'codegraph.build', 'codegraph.provisional-refresh', 'codegraph.background-validation'], statuses: ['ok', 'ok', 'ok', 'ok'] },
+    { graph: canon(clean.snapshot()), operationNames: ['codegraph.build', 'codegraph.build', 'codegraph.background-validation'], statuses: ['ok', 'ok', 'ok'] },
   )
   await clean.dispose()
 })
@@ -1143,7 +1143,7 @@ test('error guessing: engine disposal waits for an in-flight reference overlay b
   )
 })
 
-test('domain analysis: latest queries observe a provisional revision while validated and pinned queries remain on the prior v3 generation', async () => {
+test('domain analysis: latest validated and pinned queries remain on the prior v3 generation', async () => {
   const root = fixture()
   const pending = []
   const engine = trackedEngine(root, { validationWorkerFactory: () => ({ validate: (snapshot) => new Promise((resolve) => { pending.push({ snapshot, resolve }) }), dispose: async () => {} }) })
@@ -1159,7 +1159,7 @@ test('domain analysis: latest queries observe a provisional revision while valid
 
   assert.deepEqual(
     { refresh: { revision: refreshed.revision, freshness: refreshed.freshness, coverage: refreshed.coverage, validatedGeneration: refreshed.validatedGeneration }, latestCalls: latest.length, validatedCalls: validated.length, pinnedCalls: pinned.length, workerRevision: pending[0].snapshot.revision },
-    { refresh: { revision: 1, freshness: 'provisional', coverage: 'module-linked-syntax', validatedGeneration: built.generation }, latestCalls: 0, validatedCalls: 1, pinnedCalls: 1, workerRevision: 1 },
+    { refresh: { revision: 1, freshness: 'validated', coverage: 'complete', validatedGeneration: built.generation }, latestCalls: 1, validatedCalls: 1, pinnedCalls: 1, workerRevision: 1 },
   )
 })
 
@@ -1226,7 +1226,7 @@ test('error guessing: an active stale validation is discarded before its newer p
 
   assert.deepEqual(
     { workerRevisions: pending.map(({ snapshot }) => snapshot.revision), firstResult, generationAfterStaleResult: engine.readGeneration().generation, latestRevision: engine.provisionalSnapshot().revision },
-    { workerRevisions: [1, 2], firstResult: null, generationAfterStaleResult: built.generation, latestRevision: 2 },
+    { workerRevisions: [1, 2], firstResult: null, generationAfterStaleResult: built.generation, latestRevision: 0 },
   )
 
   pending[1].release()
@@ -1254,7 +1254,7 @@ test('boundary and concurrency: 120 rapid changes keep one active validation and
 
   assert.deepEqual(
     { provisionalRevision: engine.provisionalSnapshot().revision, workerCallCountWhileStalled: workerCalls.length, activeWorkerRevision: workerCalls[0]?.snapshot.revision },
-    { provisionalRevision: 120, workerCallCountWhileStalled: 1, activeWorkerRevision: 1 },
+    { provisionalRevision: 0, workerCallCountWhileStalled: 1, activeWorkerRevision: 1 },
   )
 
   workerCalls[0].release()
@@ -1299,8 +1299,8 @@ test('hotpath boundary: 120 coalesced edits materialize validation payloads only
   }
 
   assert.deepEqual(
-    { provisionalRevision: engine.provisionalSnapshot().revision, materializedRevisionsWhileStalled: materializedPayloads.map(({ revision }) => revision), workerPayloadsWhileStalled: workerCalls.map(({ payload }) => ({ revision: payload.revision, changedFiles: payload.changedFiles, changes: payload.changes })) },
-    { provisionalRevision: 120, materializedRevisionsWhileStalled: [1], workerPayloadsWhileStalled: [{ revision: 1, changedFiles: ['src/b.ts'], changes: [{ type: 'change', path: 'src/b.ts', source: 'export function b(){ return 1 }\n' }] }] },
+    { provisionalRevision: engine.provisionalSnapshot().revision, materializedRevisionsWhileStalled: materializedPayloads.map(({ revision }) => revision), workerPayloadsWhileStalled: workerCalls.map(({ payload }) => ({ revision: payload.revision, changes: payload.changes })) },
+    { provisionalRevision: 0, materializedRevisionsWhileStalled: [1], workerPayloadsWhileStalled: [{ revision: 1, changes: [{ type: 'change', path: 'src/b.ts', source: 'export function b(){ return 1 }\n', expectedDigest: '64a8293ca4f3a0a2df864de9e7985a8c29a5678e816842d689a294ae1a82276b' }] }] },
   )
 
   workerCalls[0].release()
@@ -1308,8 +1308,8 @@ test('hotpath boundary: 120 coalesced edits materialize validation payloads only
   while (workerCalls.length < 2) await new Promise((resolve) => setImmediate(resolve))
 
   assert.deepEqual(
-    { materializedRevisionsAfterRelease: materializedPayloads.map(({ revision }) => revision), workerPayloadsAfterRelease: workerCalls.map(({ payload }) => ({ revision: payload.revision, changedFiles: payload.changedFiles, changes: payload.changes })) },
-    { materializedRevisionsAfterRelease: [1, 120], workerPayloadsAfterRelease: [{ revision: 1, changedFiles: ['src/b.ts'], changes: [{ type: 'change', path: 'src/b.ts', source: 'export function b(){ return 1 }\n' }] }, { revision: 120, changedFiles: ['src/b.ts'], changes: [{ type: 'change', path: 'src/b.ts', source: 'export function b(){ return 120 }\n' }] }] },
+    { materializedRevisionsAfterRelease: materializedPayloads.map(({ revision }) => revision), workerPayloadsAfterRelease: workerCalls.map(({ payload }) => ({ revision: payload.revision, changes: payload.changes })) },
+    { materializedRevisionsAfterRelease: [1, 120], workerPayloadsAfterRelease: [{ revision: 1, changes: [{ type: 'change', path: 'src/b.ts', source: 'export function b(){ return 1 }\n', expectedDigest: '64a8293ca4f3a0a2df864de9e7985a8c29a5678e816842d689a294ae1a82276b' }] }, { revision: 120, changes: [{ type: 'change', path: 'src/b.ts', source: 'export function b(){ return 120 }\n', expectedDigest: '71ffcf6e80dd74e9aed4a18dfe77530d9563a3ea147650a5e1a74b68dc303467' }] }] },
   )
 
   workerCalls[1].release()
@@ -1324,7 +1324,7 @@ test('hotpath boundary: 120 coalesced edits materialize validation payloads only
   )
 })
 
-test('error guessing: background validation failure preserves the prior validated generation while provisional results remain honestly labeled', async () => {
+test('error guessing: background validation failure preserves the prior validated generation while query results remain honestly labeled', async () => {
   const root = fixture()
   const failure = new Error('validation worker failed')
   const engine = trackedEngine(root, { validationWorkerFactory: () => ({ validate: async () => { throw failure }, dispose: async () => {} }) })
@@ -1333,27 +1333,34 @@ test('error guessing: background validation failure preserves the prior validate
   const refreshed = engine.applyChanges([{ type: 'change', path: 'src/b.ts', source: 'export function b(){ return 4 }\n' }])
   await assert.rejects(refreshed.validation, (error) => error === failure)
 
-  assert.deepEqual({ generation: engine.readGeneration().generation, revision: engine.provisionalSnapshot().revision, freshness: engine.provisionalSnapshot().freshness, coverage: engine.provisionalSnapshot().coverage }, { generation: built.generation, revision: 1, freshness: 'provisional', coverage: 'module-linked-syntax' })
+  assert.deepEqual({ generation: engine.readGeneration().generation, revision: engine.provisionalSnapshot().revision, freshness: engine.provisionalSnapshot().freshness, coverage: engine.provisionalSnapshot().coverage }, { generation: built.generation, revision: 0, freshness: 'validated', coverage: 'complete' })
 })
 
-test('error guessing: engine disposal terminates the validation worker and rejects refresh after disposal', async () => {
+test('error guessing: engine disposal terminates semantic and structural workers and rejects refresh after disposal', async () => {
   const root = fixture()
+  const checker = new SemanticCheckerWorker()
   let validationDisposed = 0
   let parserDisposed = 0
-  const parserPool = { parse: async () => assert.fail('parser pool parse was not expected'), snapshot: () => ({ workerCount: 1, queued: 0, inFlight: 0, latestRevisionByFile: {} }), dispose: async () => { parserDisposed += 1 } }
-  const engine = trackedEngine(root, { parserPool, validationWorkerFactory: () => ({ validate: async (snapshot) => snapshot, dispose: async () => { validationDisposed += 1 } }) })
+  const engine = trackedEngine(root, { validationWorkerFactory: () => ({
+    index: (payload, onProgress) => checker.index(payload, onProgress),
+    advanceGeneration: (expectedGeneration, generation) => checker.advanceGeneration(expectedGeneration, generation),
+    dispose: async () => { validationDisposed += 1; await checker.dispose() },
+  }) })
   await engine.build()
+  const disposeParserPool = checker.parserPool.dispose.bind(checker.parserPool)
+  checker.parserPool.dispose = async () => { parserDisposed += 1; await disposeParserPool() }
 
   await engine.dispose()
 
   assert.throws(() => engine.applyChanges([{ type: 'change', path: 'src/b.ts', source: 'export function b(){ return 5 }\n' }]), /disposed|closed/i)
-  assert.deepEqual({ validationDisposed, parserDisposed }, { validationDisposed: 1, parserDisposed: 1 })
+  assert.deepEqual({ validationDisposed, parserDisposed, semanticClosed: checker.closed, structuralClosed: checker.parserPool.closed }, { validationDisposed: 1, parserDisposed: 1, semanticClosed: true, structuralClosed: true })
 })
 
 test('error guessing: an unexpected semantic worker error rejects the current and future validation promptly and dispose settles', async () => {
-  const worker = new SemanticCheckerWorker()
+  const worker = new SemanticCheckerWorker({ structuralCount: 0 })
   const failure = new Error('semantic worker channel failed')
-  const current = worker.validate({ revision: 1, root: '/repo', sources: [] })
+  const current = worker.validate({ revision: 1, root: '/repo', changes: [{ type: 'change', path: 'src/a.ts', source: 'export const a = 1' }], partitionPool: new SharedArrayBuffer(4096 + 300 * 65536) }, () => {})
+  while (!worker.worker) await new Promise((resolve) => setImmediate(resolve))
   worker.worker.emit('error', failure)
 
   await assert.rejects(current, (error) => error === failure)
@@ -1362,8 +1369,9 @@ test('error guessing: an unexpected semantic worker error rejects the current an
 })
 
 test('error guessing: an unexpected semantic worker exit rejects the current and future validation promptly and dispose settles', async () => {
-  const worker = new SemanticCheckerWorker()
-  const current = worker.validate({ revision: 1, root: '/repo', sources: [] })
+  const worker = new SemanticCheckerWorker({ structuralCount: 0 })
+  const current = worker.validate({ revision: 1, root: '/repo', changes: [{ type: 'change', path: 'src/a.ts', source: 'export const a = 1' }], partitionPool: new SharedArrayBuffer(4096 + 300 * 65536) }, () => {})
+  while (!worker.worker) await new Promise((resolve) => setImmediate(resolve))
   worker.worker.emit('exit', 17)
 
   await assert.rejects(current, /exited with code 17/i)
@@ -1372,8 +1380,9 @@ test('error guessing: an unexpected semantic worker exit rejects the current and
 })
 
 test('error guessing: an unexpected clean semantic worker exit rejects current and future validation promptly and dispose settles', async () => {
-  const worker = new SemanticCheckerWorker()
-  const current = worker.validate({ revision: 1, root: '/repo', sources: [] })
+  const worker = new SemanticCheckerWorker({ structuralCount: 0 })
+  const current = worker.validate({ revision: 1, root: '/repo', changes: [{ type: 'change', path: 'src/a.ts', source: 'export const a = 1' }], partitionPool: new SharedArrayBuffer(4096 + 300 * 65536) }, () => {})
+  while (!worker.worker) await new Promise((resolve) => setImmediate(resolve))
   worker.worker.emit('exit', 0)
 
   await assert.rejects(Promise.race([current, new Promise((_, reject) => setTimeout(() => reject(new Error('current validation did not reject after clean exit')), 100))]), /worker.*exit|unavailable|closed/i)
@@ -1412,7 +1421,7 @@ test('regression: unchanged cold reconcile hydrates latest validated generation 
   const rows = []
   for await (const row of latest.rows) rows.push(row)
 
-  assert.deepEqual({ metadata: latest.metadata, files: rows[0].files }, { metadata: { revision: null, freshness: 'validated', coverage: 'calls', validatedGeneration: built.generation }, files: ['src/a.ts', 'src/b.ts'] })
+  assert.deepEqual({ metadata: latest.metadata, files: rows[0].files }, { metadata: { revision: null, freshness: 'validated', coverage: 'complete', validatedGeneration: built.generation }, files: ['src/a.ts', 'src/b.ts'] })
   await cold.dispose()
 })
 
@@ -1435,11 +1444,11 @@ test('domain analysis: latest query rows retain one atomic revision and validate
 
   assert.deepEqual(
     { first: { revision: first.value.revision, generation: first.value.validatedGeneration, freshness: first.value.freshness }, second: { revision: second.value.revision, generation: second.value.validatedGeneration, freshness: second.value.freshness } },
-    { first: { revision: 0, generation: built.generation, freshness: 'provisional' }, second: { revision: 0, generation: built.generation, freshness: 'provisional' } },
+    { first: { revision: null, generation: built.generation, freshness: 'validated' }, second: { revision: null, generation: built.generation, freshness: 'validated' } },
   )
 })
 
-test('domain analysis: latest graph query returns complete provisional revision and validated-generation metadata', async () => {
+test('domain analysis: latest graph query returns complete validated-generation metadata', async () => {
   const root = fixture()
   const engine = trackedEngine(root, { validationWorkerFactory: () => ({ validate: async (snapshot) => snapshot, dispose: async () => {} }) })
   const built = await engine.build()
@@ -1449,7 +1458,7 @@ test('domain analysis: latest graph query returns complete provisional revision 
 
   assert.deepEqual(
     { revision: rows[0].revision, freshness: rows[0].freshness, coverage: rows[0].coverage, validatedGeneration: rows[0].validatedGeneration, files: rows[0].files },
-    { revision: 0, freshness: 'provisional', coverage: 'module-linked-syntax', validatedGeneration: built.generation, files: ['src/a.ts', 'src/b.ts'] },
+    { revision: null, freshness: 'validated', coverage: 'complete', validatedGeneration: built.generation, files: ['src/a.ts', 'src/b.ts'] },
   )
 })
 
@@ -1581,6 +1590,7 @@ test('adding a previously unresolved module returns the provisional added file a
   fs.writeFileSync(path.join(root, 'src', 'later.ts'), 'export function later(){ return 4 }')
   const result = await engine.incremental([{ type: 'add', path: 'src/later.ts' }])
   assert.deepEqual(result.parsedFiles, ['src/later.ts'])
+  await result.validation
   const graph = engine.snapshot(); const later = graph.symbols.find((s) => s.name === 'later')
   assert.ok(graph.edges.some((edge) => edge.to === later.id))
 })
@@ -1616,7 +1626,7 @@ test('error guessing: reconcile reads a changed source once and incremental reus
 
   const result = await engine.reconcile()
 
-  assert.deepEqual({ reads, parsedFiles: result.parsedFiles }, { reads: ['src/a.ts', 'src/b.ts'], parsedFiles: ['src/a.ts'] })
+  assert.deepEqual({ reads, parsedFiles: result.parsedFiles }, { reads: ['src/a.ts'], parsedFiles: ['src/a.ts'] })
 })
 
 test('equivalence partition: disabled profiling performs async reads without touching the profiler clock', async () => {
@@ -1660,10 +1670,12 @@ test('domain analysis: delete then new add preserves the public graph and does n
   const engine = trackedEngine(root)
   await engine.build()
   fs.unlinkSync(path.join(root, 'src', 'a.ts'))
-  await engine.incremental([{ type: 'unlink', path: 'src/a.ts' }])
+  const deleted = await engine.incremental([{ type: 'unlink', path: 'src/a.ts' }])
+  await deleted.validation
   fs.writeFileSync(path.join(root, 'src', 'replacement.ts'), 'export function replacement(){ return 3 }\n')
 
-  await engine.incremental([{ type: 'add', path: 'src/replacement.ts' }])
+  const added = await engine.incremental([{ type: 'add', path: 'src/replacement.ts' }])
+  await added.validation
 
   const manifest = engine.readGeneration()
   assert.deepEqual({ graphFiles: engine.snapshot().files, hasFileIds: Object.hasOwn(manifest, 'fileIds'), hasNextFileId: Object.hasOwn(manifest, 'nextFileId') }, { graphFiles: ['src/b.ts', 'src/replacement.ts'], hasFileIds: false, hasNextFileId: false })
@@ -1676,7 +1688,7 @@ test('domain analysis: numeric file IDs do not alter persisted partition symbol 
   const manifest = engine.readGeneration()
   const aPartition = engine.store.readPartition(manifest.partitions['src/a.ts'])
 
-  assert.deepEqual({ manifestKeys: Object.keys(manifest).sort(), partitionFile: aPartition.file, symbolFile: aPartition.symbols[0].file, edgeKeys: Object.keys(engine.store.readPartition(manifest.partitions['src/b.ts']).edges[0]).sort() }, { manifestKeys: ['controlHashes', 'createdAt', 'edgeCoverage', 'generation', 'internalPartitions', 'partitionHashes', 'partitions', 'root', 'sources', 'version'], partitionFile: 'src/a.ts', symbolFile: 'src/a.ts', edgeKeys: ['call', 'from', 'line', 'to'] })
+  assert.deepEqual({ manifestKeys: Object.keys(manifest).sort(), partitionFile: aPartition.file, symbolFile: aPartition.symbols[0].file, edgeKeys: Object.keys(engine.store.readPartition(manifest.partitions['src/b.ts']).edges[0]).sort() }, { manifestKeys: ['analyzers', 'controlHashes', 'createdAt', 'edgeCoverage', 'generation', 'internalPartitions', 'partitionHashes', 'partitions', 'root', 'sourceMetadata', 'sources', 'unresolvedEdges', 'version'], partitionFile: 'src/a.ts', symbolFile: 'src/a.ts', edgeKeys: ['call', 'from', 'line', 'to'] })
 })
 
 test('domain analysis: incremental tsconfig change rebuilds and publishes the changed control hash', async () => {
@@ -1708,7 +1720,7 @@ test('error guessing: reconcile upgrades a legacy current manifest without contr
 
   assert.deepEqual(
     { generationChanged: reconciled.generation !== built.generation, tsconfigHash: current.controlHashes['tsconfig.json'], edgeCoverage: reconciled.edgeCoverage },
-    { generationChanged: true, tsconfigHash: 'b6074ef1d796c9bacd315a7d8933e7aedb7ebe1922532d6e5dec666d7e8573c5', edgeCoverage: 'calls' },
+    { generationChanged: true, tsconfigHash: 'b6074ef1d796c9bacd315a7d8933e7aedb7ebe1922532d6e5dec666d7e8573c5', edgeCoverage: 'complete' },
   )
 })
 
@@ -2217,6 +2229,7 @@ test('domain boundary: a warmed pinned generation remains correct and performs z
   for await (const ignored of engine.query({ type: 'symbols', generation: old.generation, limit: 200 })) void ignored
   fs.writeFileSync(path.join(root, 'src', 'c.ts'), 'export const c = 3\n')
   const advanced = await engine.incremental([{ type: 'add', path: 'src/c.ts' }])
+  await advanced.validation
   const reads = { generation: 0, partition: 0, overlay: 0 }
   const readGeneration = engine.store.readGeneration.bind(engine.store)
   const readPartition = engine.store.readPartition.bind(engine.store)
@@ -2234,7 +2247,7 @@ test('domain boundary: a warmed pinned generation remains correct and performs z
   )
 })
 
-test('domain analysis: a new provisional revision invalidates only the provisional view and leaves the warmed validated view resident', async () => {
+test('domain analysis: a pending revision leaves latest and pinned validated views resident', async () => {
   const root = fixture()
   const engine = trackedEngine(root, { validationWorkerFactory: () => ({ validate: () => new Promise(() => {}), dispose: async () => {} }) })
   const built = await engine.build()
@@ -2256,7 +2269,7 @@ test('domain analysis: a new provisional revision invalidates only the provision
 
   assert.deepEqual(
     { before: before.map(({ name }) => name), after: after.map(({ name }) => name), validated: validated.map(({ name }) => name), reads },
-    { before: ['a', 'b'], after: ['a', 'changed'], validated: ['a', 'b'], reads: { generation: 0, partition: 0, overlay: 0 } },
+    { before: ['a', 'b'], after: ['a', 'b'], validated: ['a', 'b'], reads: { generation: 0, partition: 0, overlay: 0 } },
   )
 })
 
@@ -2600,6 +2613,7 @@ test('combinatorial integration: a corrupt mapped page falls back with identical
         { id: '6d1f36a6e18b5f8677635dc0', file: 'src/b.ts', name: 'b', kind: 'function', line: 1, qualifiedPath: '<module>', signature: '<>():', ordinal: 0, exported: true },
       ],
       edges: [{ from: '6d1f36a6e18b5f8677635dc0', to: '3bdd027f2bd7f1dadf7f2e4a', line: 1, call: true }],
+      unresolvedEdges: [],
     }],
   })
 })
@@ -2711,7 +2725,7 @@ test('worker ownership: a persistent clean build indexes once in the worker, ret
   const worker = {
     index: async (payload, onProgress) => { requests.index.push(payload); return checker.index(payload, onProgress) },
     hydrate: async (payload) => { requests.hydrate.push(payload); return checker.hydrate(payload) },
-    validate: async (payload) => { requests.validate.push(payload); return checker.validate(payload) },
+    validate: async (payload, onProgress) => { requests.validate.push(payload); return checker.validate(payload, onProgress) },
     referenceOverlay: (payload) => checker.referenceOverlay(payload),
     advanceGeneration: (expectedGeneration, generation) => checker.advanceGeneration(expectedGeneration, generation),
     dispose: () => checker.dispose(),
@@ -2729,7 +2743,7 @@ test('worker ownership: a persistent clean build indexes once in the worker, ret
     indexRequests: requests.index.length,
     hydrateRequests: requests.hydrate.length,
     indexSources: requests.index[0]?.sources.map(([file]) => file),
-    retainedWorkspace: persistent.workspace !== null,
+    retainedWorkspace: persistent.workspace != null,
     graph: canon(persistent.snapshot(persistentBuild.generation)),
     localGraph: canon(local.snapshot(localBuild.generation)),
     validationMode: changed.validationMode,
@@ -3360,7 +3374,7 @@ test('shared delta persistence: validated transport bytes are persisted once wit
   })
 })
 
-test('worker ownership: persistent reconcile hydrates exactly once and the first edit uses the adopted worker state', async () => {
+test('worker ownership: persistent metadata reconcile defers adoption and the first edit supplies exact retained worker state', async () => {
   const root = fixture()
   const builder = trackedEngine(root, { cacheDir: '.persisted' })
   await builder.build()
@@ -3368,9 +3382,9 @@ test('worker ownership: persistent reconcile hydrates exactly once and the first
   const checker = new SemanticCheckerWorker()
   const requests = { index: 0, hydrate: [], validate: [] }
   const worker = {
-    index: async (payload) => { requests.index += 1; return checker.index(payload) },
+    index: async (payload, onProgress) => { requests.index += 1; return checker.index(payload, onProgress) },
     hydrate: async (payload) => { requests.hydrate.push(payload); return checker.hydrate(payload) },
-    validate: async (payload) => { requests.validate.push(payload); return checker.validate(payload) },
+    validate: async (payload, onProgress) => { requests.validate.push(payload); return checker.validate(payload, onProgress) },
     referenceOverlay: (payload) => checker.referenceOverlay(payload),
     advanceGeneration: (expectedGeneration, generation) => checker.advanceGeneration(expectedGeneration, generation),
     dispose: () => checker.dispose(),
@@ -3382,19 +3396,25 @@ test('worker ownership: persistent reconcile hydrates exactly once and the first
   const changed = await engine.incremental([{ type: 'change', path: 'src/b.ts' }])
   await changed.validation
 
-  assert.deepEqual({ indexRequests: requests.index, hydrateRequests: requests.hydrate.length, hydrateSources: requests.hydrate[0]?.sources.map(([file]) => file), retainedWorkspace: engine.workspace !== null, reusedFiles: reconciled.reusedFiles, validationMode: changed.validationMode, validationFiles: changed.validatedFiles, validationHasBasePartitionIds: Object.hasOwn(requests.validate[0] ?? {}, 'basePartitionIds') }, { indexRequests: 0, hydrateRequests: 1, hydrateSources: ['src/a.ts', 'src/b.ts'], retainedWorkspace: false, reusedFiles: ['src/a.ts', 'src/b.ts'], validationMode: 'delta', validationFiles: ['src/b.ts'], validationHasBasePartitionIds: false })
+  assert.deepEqual({ indexRequests: requests.index, hydrateRequests: requests.hydrate.length, adoptionSources: Object.keys(requests.validate[0]?.baseSourceBlobs ?? {}), retainedWorkspace: engine.workspace != null, reusedFiles: reconciled.reusedFiles, validationMode: changed.validationMode, validationFiles: changed.validatedFiles, validationHasBasePartitionIds: Object.hasOwn(requests.validate[0] ?? {}, 'basePartitionIds') }, { indexRequests: 0, hydrateRequests: 0, adoptionSources: ['src/a.ts', 'src/b.ts'], retainedWorkspace: false, reusedFiles: ['src/a.ts', 'src/b.ts'], validationMode: 'delta', validationFiles: ['src/b.ts'], validationHasBasePartitionIds: true })
 })
 
-test('worker ownership boundary: a default short-lived engine never calls worker index or hydrate', async () => {
+test('worker ownership boundary: a default short-lived engine indexes in its worker and metadata-only reconcile does not hydrate', async () => {
   const root = fixture()
+  const checker = new SemanticCheckerWorker()
   let indexRequests = 0
   let hydrateRequests = 0
-  const engine = trackedEngine(root, { validationWorkerFactory: () => ({ index: async () => { indexRequests += 1; throw new Error('unexpected index') }, hydrate: async () => { hydrateRequests += 1; throw new Error('unexpected hydrate') }, validate: async () => { throw new Error('unexpected validate') }, dispose: async () => {} }) })
+  const engine = trackedEngine(root, { validationWorkerFactory: () => ({
+    index: (payload, onProgress) => { indexRequests += 1; return checker.index(payload, onProgress) },
+    hydrate: (payload) => { hydrateRequests += 1; return checker.hydrate(payload) },
+    advanceGeneration: (expectedGeneration, generation) => checker.advanceGeneration(expectedGeneration, generation),
+    dispose: () => checker.dispose(),
+  }) })
 
   const built = await engine.build()
   const reconciled = await engine.reconcile()
 
-  assert.deepEqual({ indexRequests, hydrateRequests, buildFiles: Object.keys(engine.readGeneration(built.generation).sources), reconciledGeneration: reconciled.generation, retainedWorkspace: engine.workspace !== null }, { indexRequests: 0, hydrateRequests: 0, buildFiles: ['src/a.ts', 'src/b.ts'], reconciledGeneration: built.generation, retainedWorkspace: true })
+  assert.deepEqual({ indexRequests, hydrateRequests, buildFiles: Object.keys(engine.readGeneration(built.generation).sources), reconciledGeneration: reconciled.generation, retainedWorkspace: engine.workspace != null }, { indexRequests: 1, hydrateRequests: 0, buildFiles: ['src/a.ts', 'src/b.ts'], reconciledGeneration: built.generation, retainedWorkspace: false })
 })
 
 test('worker ownership error guessing: a rejected first index preserves absent CURRENT and a retry starts a fresh successful index', async () => {
@@ -3412,7 +3432,7 @@ test('worker ownership error guessing: a rejected first index preserves absent C
   const currentAfterFailure = fs.existsSync(path.join(root, '.codegraph', 'CURRENT'))
   const built = await engine.build()
 
-  assert.deepEqual({ attempts, currentAfterFailure, currentAfterRetry: engine.readGeneration().generation, builtGeneration: built.generation, retainedWorkspace: engine.workspace !== null }, { attempts: 2, currentAfterFailure: false, currentAfterRetry: built.generation, builtGeneration: built.generation, retainedWorkspace: false })
+  assert.deepEqual({ attempts, currentAfterFailure, currentAfterRetry: engine.readGeneration().generation, builtGeneration: built.generation, retainedWorkspace: engine.workspace != null }, { attempts: 2, currentAfterFailure: false, currentAfterRetry: built.generation, builtGeneration: built.generation, retainedWorkspace: false })
 })
 
 test('worker ownership equivalence partition: malformed index source membership cannot publish CURRENT', async () => {
@@ -3428,24 +3448,13 @@ test('worker ownership durability: an existing wrong-file worker receipt cannot 
   const root = fixture()
   const checker = new SemanticCheckerWorker()
   let engine
+  let firstPartitionId
+  let firstInternalPartitionId
   engine = trackedEngine(root, { cacheDir: '.wrong-worker-receipt', validationWorkerFactory: () => ({
     index: async (payload, onProgress) => {
-      const result = await checker.index(payload, (progress) => {
-        const mainChunks = progress.chunks.filter(({ file }) => file === 'src/a.ts')
-        const rejectedChunks = progress.chunks.filter(({ file }) => file === 'src/b.ts')
-        if (mainChunks.length) onProgress({ ...progress, chunks: mainChunks })
-        for (const { slot } of rejectedChunks) {
-          const metadata = new Int32Array(payload.partitionPool, 0, 1024)
-          const boundary = Atomics.load(metadata, 3)
-          Atomics.store(metadata, 4 + boundary, slot)
-          Atomics.store(metadata, 304 + slot, 0)
-          Atomics.store(metadata, 3, boundary + 1)
-          Atomics.add(metadata, 1, 1)
-          Atomics.notify(metadata, 1, 1)
-        }
-      })
-      const partitionId = fs.readdirSync(engine.store.partitions).find((name) => name.endsWith('.json')).slice(0, -5)
-      const internalPartitionId = fs.readdirSync(engine.store.internalPartitions).find((name) => name.endsWith('.bin')).slice(0, -4)
+      const result = await checker.index(payload, onProgress)
+      const partitionId = firstPartitionId
+      const internalPartitionId = firstInternalPartitionId
       result.partitionReceipts = result.partitionReceipts.map((receipt) => receipt.file === 'src/b.ts' ? { ...receipt, writer: 'worker', partitionId, internalPartitionId, chunkCount: 0, symbolChunkCount: 0, internalChunkCount: 0 } : receipt)
       return result
     },
@@ -3453,6 +3462,11 @@ test('worker ownership durability: an existing wrong-file worker receipt cannot 
     advanceGeneration: (expectedGeneration, generation) => checker.advanceGeneration(expectedGeneration, generation),
     hydrate: (payload) => checker.hydrate(payload), validate: (payload, onProgress) => checker.validate(payload, onProgress), referenceOverlay: (payload) => checker.referenceOverlay(payload), dispose: () => checker.dispose(),
   }) })
+
+  const writePacked = engine.store.writePackedPartitionRange.bind(engine.store)
+  engine.store.writePackedPartitionRange = (...args) => { const id = writePacked(...args); if (args[3] === 'src/a.ts') firstPartitionId = id; return id }
+  const writeInternal = engine.store.writeInternalPartitionRange.bind(engine.store)
+  engine.store.writeInternalPartitionRange = (...args) => { const id = writeInternal(...args); if (firstPartitionId && !firstInternalPartitionId) firstInternalPartitionId = id; return id }
 
   const outcome = await engine.build().then(() => ({ rejected: false, durableMismatch: false }), (error) => ({ rejected: true, durableMismatch: /file|source|fingerprint|receipt|durable|mismatch/i.test(error.message) }))
 
@@ -3649,7 +3663,7 @@ test('worker ownership atomicity: a prepared index is invisible until publicatio
   assert.deepEqual({ queryWhilePrepared, currentAfterFailure, indexRequests, overlayRequests, rows: rows.map(({ fromSymbol, toSymbol, line, call }) => ({ fromFile: fromSymbol.file, toFile: toSymbol.file, line, call })), mainThreadWorkspaceAbsent: engine.workspace === undefined }, { queryWhilePrepared: 'unavailable', currentAfterFailure: false, indexRequests: 2, overlayRequests: 0, rows: [{ fromFile: 'src/b.ts', toFile: 'src/a.ts', line: 1, call: true }], mainThreadWorkspaceAbsent: true })
 })
 
-test('worker ownership recovery: failed persisted hydration preserves CURRENT and read queries then retries hydration without a main workspace', async () => {
+test('worker ownership recovery: failed first-edit persisted adoption preserves CURRENT and read queries then retries adoption without a main workspace', async () => {
   const root = fixture()
   const builder = trackedEngine(root, { cacheDir: '.hydrate-retry' })
   const built = await builder.build()
@@ -3657,26 +3671,30 @@ test('worker ownership recovery: failed persisted hydration preserves CURRENT an
   const currentBefore = fs.readFileSync(currentPath)
   await builder.dispose()
   const checker = new SemanticCheckerWorker()
-  let hydrateRequests = 0
+  let adoptionRequests = 0
   const worker = {
-    index: (payload) => checker.index(payload),
-    hydrate: async (payload) => { hydrateRequests += 1; if (hydrateRequests === 1) throw new Error('worker hydrate rejected'); return checker.hydrate(payload) },
-    validate: (payload, onProgress) => checker.validate(payload, onProgress),
+    index: (payload, onProgress) => checker.index(payload, onProgress),
+    hydrate: (payload) => checker.hydrate(payload),
+    validate: (payload, onProgress) => { adoptionRequests += 1; assert.equal(Object.hasOwn(payload, 'basePartitionIds'), true); if (adoptionRequests === 1) return Promise.reject(new Error('worker hydrate rejected')); return checker.validate(payload, onProgress) },
     referenceOverlay: (payload) => checker.referenceOverlay(payload),
     advanceGeneration: (expectedGeneration, generation) => checker.advanceGeneration(expectedGeneration, generation),
     dispose: () => checker.dispose(),
   }
   const engine = trackedEngine(root, { cacheDir: '.hydrate-retry', validationWorkerFactory: () => worker })
 
-  await assert.rejects(engine.reconcile(), /hydrate rejected/)
+  await engine.reconcile()
+  fs.writeFileSync(path.join(root, 'src', 'b.ts'), 'export function b(){ return 9 }\n')
+  const failed = await engine.incremental([{ type: 'change', path: 'src/b.ts' }])
+  await assert.rejects(failed.validation, /hydrate rejected/)
   const rowsAfterFailure = await engine.queryBatch({ type: 'symbols', name: 'a', generation: built.generation })
   const currentAfterFailure = fs.readFileSync(currentPath)
-  const retried = await engine.reconcile()
+  const retried = await engine.incremental([{ type: 'change', path: 'src/b.ts' }])
+  await retried.validation
 
-  assert.deepEqual({ hydrateRequests, currentUnchanged: currentAfterFailure.equals(currentBefore), rowsAfterFailure: rowsAfterFailure.map(({ name, file, line }) => ({ name, file, line })), retryGeneration: retried.generation, retainedWorkspace: engine.workspace !== null }, { hydrateRequests: 2, currentUnchanged: true, rowsAfterFailure: [{ name: 'a', file: 'src/a.ts', line: 1 }], retryGeneration: built.generation, retainedWorkspace: false })
+  assert.deepEqual({ adoptionRequests, currentUnchanged: currentAfterFailure.equals(currentBefore), rowsAfterFailure: rowsAfterFailure.map(({ name, file, line }) => ({ name, file, line })), retryAdvanced: retried.generation !== built.generation, retainedWorkspace: engine.workspace != null }, { adoptionRequests: 2, currentUnchanged: true, rowsAfterFailure: [{ name: 'a', file: 'src/a.ts', line: 1 }], retryAdvanced: true, retainedWorkspace: false })
 })
 
-test('worker ownership storage boundary: a fresh persistent build never rereads partitions returned by worker index', async () => {
+test('worker ownership storage boundary: a fresh persistent build adopts exactly the two completed partitions without a main workspace', async () => {
   const root = fixture()
   const checker = new SemanticCheckerWorker()
   let partitionReads = 0
@@ -3686,7 +3704,7 @@ test('worker ownership storage boundary: a fresh persistent build never rereads 
 
   const built = await engine.build()
 
-  assert.deepEqual({ partitionReads, generation: engine.readGeneration().generation, builtGeneration: built.generation, retainedWorkspace: engine.workspace !== null }, { partitionReads: 0, generation: built.generation, builtGeneration: built.generation, retainedWorkspace: false })
+  assert.deepEqual({ partitionReads, generation: engine.readGeneration().generation, builtGeneration: built.generation, retainedWorkspace: engine.workspace != null }, { partitionReads: 2, generation: built.generation, builtGeneration: built.generation, retainedWorkspace: false })
 })
 
 test('internal publication contract: one validated generation atomically identifies symbol and internal partitions for every file', async () => {
@@ -3975,7 +3993,7 @@ test('retained pending update: latest mapped rows remain on the validated genera
   await pending.validation
 
   assert.deepEqual({ metadata: latest.metadata, names: rows.map(({ name }) => name) }, {
-    metadata: { revision: null, freshness: 'validated', coverage: 'calls', validatedGeneration: built.generation },
+    metadata: { revision: null, freshness: 'validated', coverage: 'complete', validatedGeneration: built.generation },
     names: ['a', 'b'],
   })
 })

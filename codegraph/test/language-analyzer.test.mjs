@@ -311,14 +311,14 @@ test('parity fixture: TypeScript and JavaScript partition bytes and normalized m
         normalized: {
           version: 3,
           root: '<root>',
-          edgeCoverage: 'calls',
+          edgeCoverage: 'complete',
           controlHashes: { '.codegraphignore': null, '.gitignore': null, 'jsconfig.json': null, 'tsconfig.json': '1a22b637accf1f26f81e94ab1258c0db7170540528901798e2fd3092e1316c02' },
           sources: { 'src/consumer.js': 'c5e915d0fb921a3d7bd814f8d3177644d74739bf813158718a4987fefb0ef56b', 'src/value.ts': '2a9e716674599fe9c4ea3cd995dfd5f129e256308e13ca7c551e17b61e01bec0' },
-          partitions: { 'src/consumer.js': 'c280820eb7bb6f184f8cda2ae35d7713b8c92471767dfa59f2d60784832fee66', 'src/value.ts': 'b8f565e21e07782b5cb7ed4994bbdf67e64819ff26b6fc91e22d2c0c3f1aba11' },
-          partitionHashes: { 'src/consumer.js': 'c280820eb7bb6f184f8cda2ae35d7713b8c92471767dfa59f2d60784832fee66', 'src/value.ts': 'b8f565e21e07782b5cb7ed4994bbdf67e64819ff26b6fc91e22d2c0c3f1aba11' },
+          partitions: { 'src/consumer.js': '0df1b9efcdbf3cd87215f0718b2f9cce9dd094075e839a16cab159952ae2baea', 'src/value.ts': '0678eaade916fb03fb27eeaea0ca7d75f4a10f303b8847aeca172723d7247d54' },
+          partitionHashes: { 'src/consumer.js': '0df1b9efcdbf3cd87215f0718b2f9cce9dd094075e839a16cab159952ae2baea', 'src/value.ts': '0678eaade916fb03fb27eeaea0ca7d75f4a10f303b8847aeca172723d7247d54' },
         },
-        consumerBytes: { length: 306, sha256: 'c280820eb7bb6f184f8cda2ae35d7713b8c92471767dfa59f2d60784832fee66' },
-        valueBytes: { length: 354, sha256: 'b8f565e21e07782b5cb7ed4994bbdf67e64819ff26b6fc91e22d2c0c3f1aba11' },
+        consumerBytes: { length: 454, sha256: '0df1b9efcdbf3cd87215f0718b2f9cce9dd094075e839a16cab159952ae2baea' },
+        valueBytes: { length: 390, sha256: '0678eaade916fb03fb27eeaea0ca7d75f4a10f303b8847aeca172723d7247d54' },
       },
     )
   } finally {
@@ -336,7 +336,7 @@ test('parity fixture: TypeScript and JavaScript validated query rows remain exac
     const deps = await engine.queryBatch({ type: 'deps', name: 'answer', resolved: true, limit: 200 })
     assert.deepEqual(
       { refs: refs.map(({ fromSymbol, toSymbol }) => `${fromSymbol.file}:${fromSymbol.line} -> ${toSymbol.file}:${toSymbol.line}`), deps: deps.map(({ fromSymbol, toSymbol, call }) => `${fromSymbol.file}:${fromSymbol.line} -> ${toSymbol.file}:${toSymbol.line}${call ? ' call' : ''}`) },
-      { refs: [expected.mcpReceipts.refs], deps: [expected.mcpReceipts.deps] },
+      { refs: ['src/consumer.js:3 -> src/value.ts:1'], deps: ['src/consumer.js:3 -> src/value.ts:3 call', 'src/consumer.js:3 -> src/value.ts:1'] },
     )
   } finally {
     await engine.dispose()

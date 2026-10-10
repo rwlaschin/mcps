@@ -53,7 +53,8 @@
     "visualize": "node visualizer.mjs",
     "visualize:watch": "node --watch-path=visualizer.mjs --watch-path=visualizer-graph.mjs --watch-path=indexer.mjs --watch-path=query-client.mjs --watch-path=tool.mjs visualizer.mjs",
     "dev": "node --watch-path=visualizer.mjs --watch-path=visualizer-graph.mjs --watch-path=indexer.mjs --watch-path=query-client.mjs --watch-path=tool.mjs visualizer.mjs",
-    "test": "node --test",
+    "test": "node --test test",
+    "test:planned": "node --test planned-tests",
     "performance": "node scripts/codegraph.performance.mjs"
   },
   "dependencies": {

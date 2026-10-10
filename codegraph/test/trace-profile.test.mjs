@@ -336,7 +336,7 @@ test('equivalence partition and hotpath regression: disabling identifier profili
       { name: 'subject', kind: 'function', exported: true },
       { name: 'dependency', kind: 'variable', exported: true },
     ],
-    edges: [],
+    edges: [{ line: 2, call: false }],
   })
 })
 
@@ -528,6 +528,12 @@ test('domain analysis: cold refs records one enrichment phase while warm refs re
   const tracePath = path.join(root, 'profile.json')
   const engine = new CodeGraphEngine(root, { profile: tracePath })
   await engine.build()
+  const complete = engine.readGeneration()
+  const partitions = Object.fromEntries(Object.entries(complete.partitions).map(([file, id]) => {
+    const partition = engine.store.readPartition(id)
+    return [file, engine.store.writePartition({ ...partition, edges: partition.edges.filter(({ call }) => call) })]
+  }))
+  engine.store.publish({ ...complete, edgeCoverage: 'calls', partitions, partitionHashes: partitions })
 
   for await (const ignored of engine.query({ type: 'refs', name: 'value' })) void ignored
   for await (const ignored of engine.query({ type: 'refs', name: 'value' })) void ignored

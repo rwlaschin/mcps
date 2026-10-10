@@ -208,18 +208,21 @@ test('domain analysis: a watcher build advancing CURRENT cannot change an alread
   fs.mkdirSync(path.join(root, 'src'))
   fs.writeFileSync(path.join(root, 'src', 'value.ts'), 'export const value = 41\n')
   fs.writeFileSync(path.join(root, 'src', 'consumer.ts'), "import { value } from './value'\nexport function read(){ return value }\n")
-  const runtime = new McpProjectRuntime(root, { debounceMs: 1 })
+  const runtime = new McpProjectRuntime(root, { debounceMs: 1, nativeWatch: () => Object.assign(new EventEmitter(), { close() {} }) })
   await runtime.start()
   try {
     const pinned = runtime.engine.readGeneration().generation
+    const incremental = runtime.engine.incremental.bind(runtime.engine)
+    runtime.engine.incremental = async events => { const result = await incremental(events); await result.validation; return result }
     fs.writeFileSync(path.join(root, 'src', 'consumer.ts'), 'export function read(){ return 0 }\n')
     runtime.queue.push({ type: 'change', path: 'src/consumer.ts' })
+    await runtime.queue.idle()
 
     const rows = []
     for await (const row of runtime.engine.query({ type: 'refs', name: 'value', generation: pinned })) rows.push(row)
     const overlay = runtime.engine.store.readOverlay(pinned)
 
-    assert.deepEqual({ rows: rows.map(({ call, line }) => ({ call, line })), overlayGeneration: overlay.generation }, { rows: [{ call: false, line: 2 }], overlayGeneration: pinned })
+    assert.deepEqual({ rows: rows.map(({ call, line }) => ({ call, line })), overlay, pinnedCoverage: runtime.engine.readGeneration(pinned).edgeCoverage, advanced: runtime.engine.readGeneration().generation !== pinned }, { rows: [{ call: false, line: 2 }], overlay: null, pinnedCoverage: 'complete', advanced: true })
   } finally {
     await runtime.close()
   }

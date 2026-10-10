@@ -195,7 +195,7 @@ export class CodeGraphEngine {
     try {
     const scan = this.profiler?.begin('scan', undefined, { memory: true })
     const files = this.policy.scan(); this.#synchronizeFileIds(files); const partitions = {}; const internalPartitions = {}; const parsedFiles = []
-    if (files.length) this.validationWorker ??= this.validationWorkerFactory()
+    this.validationWorker ??= this.validationWorkerFactory()
     if (scan) this.profiler.end(scan)
     const sources = await this.#readSources(files, profile)
     const sourceBlobs = Object.fromEntries([...sources].map(([file, source]) => [file, this.store.writeSource(source)]))
@@ -683,7 +683,9 @@ export class CodeGraphEngine {
     return this.#validatedQueryView(this.validatedGeneration, EDGE_COVERAGE.CALLS)
   }
   #overlayReuseKeys(manifest) {
-    return new Map(this.#readPartitions(manifest).map((partition) => [partition.file, partition.sourceHash]))
+    const keys = new Map(this.#readPartitions(manifest).map((partition) => [partition.file, partition.sourceHash]))
+    for (const patch of manifest.edgePatches ?? []) keys.set(patch.file, `${keys.get(patch.file)}\0${JSON.stringify(patch)}`)
+    return keys
   }
   async #buildReferenceOverlay(manifest) {
     this.instrument?.({ phase: 'reference-overlay', generation: manifest.generation })

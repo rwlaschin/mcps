@@ -25,15 +25,16 @@ test('boundary value and domain analysis: a nested relative specifier yields the
 test('architecture contract: parser resolver and TypeScript analyzer import the single module candidate owner', () => {
   const parser = fs.readFileSync(path.join(import.meta.dirname, '..', 'parser.mjs'), 'utf8')
   const resolver = fs.readFileSync(path.join(import.meta.dirname, '..', 'incremental-resolver.mjs'), 'utf8')
+  const bindings = fs.readFileSync(path.join(import.meta.dirname, '..', 'cached-binding-resolver.mjs'), 'utf8')
   const analyzer = fs.readFileSync(path.join(import.meta.dirname, '..', 'typescript-language-analyzer.mjs'), 'utf8')
 
   assert.deepEqual(
     {
       parserImportsOwner: /from ['"]\.\/module-candidates\.mjs['"]/.test(parser),
-      resolverImportsOwner: /from ['"]\.\/module-candidates\.mjs['"]/.test(resolver),
+      resolverImportsOwner: /from ['"]\.\/cached-binding-resolver\.mjs['"]/.test(resolver) && /from ['"]\.\/module-candidates\.mjs['"]/.test(bindings),
       analyzerImportsOwner: /from ['"]\.\/module-candidates\.mjs['"]/.test(analyzer),
-      duplicateCandidateExtensionLists: [parser, resolver, analyzer].filter((source) => /\['\.ts', '\.tsx', '\.js', '\.jsx', '\.mts', '\.cts', '\.mjs', '\.cjs'\]/.test(source)).length,
-      duplicateIndexCandidateLists: [parser, resolver, analyzer].filter((source) => /\['\/index\.ts', '\/index\.tsx', '\/index\.js', '\/index\.jsx'\]/.test(source)).length,
+      duplicateCandidateExtensionLists: [parser, resolver, analyzer, bindings].filter((source) => /\['\.ts', '\.tsx', '\.js', '\.jsx', '\.mts', '\.cts', '\.mjs', '\.cjs'\]/.test(source)).length,
+      duplicateIndexCandidateLists: [parser, resolver, analyzer, bindings].filter((source) => /\['\/index\.ts', '\/index\.tsx', '\/index\.js', '\/index\.jsx'\]/.test(source)).length,
     },
     {
       parserImportsOwner: true,

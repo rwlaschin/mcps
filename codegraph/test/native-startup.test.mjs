@@ -55,10 +55,10 @@ test('error guessing: a failed native rebuild is fatal instead of enabling the G
   )
 })
 
-test('domain analysis: MCP verifies the active-runtime addon before spawning its server worker', () => {
-  const source = fs.readFileSync(path.join(projectRoot, 'mcp.mjs'), 'utf8')
+test('domain analysis: shared daemon verifies the active-runtime addon before creating the service', () => {
+  const source = fs.readFileSync(path.join(projectRoot, 'query-daemon.mjs'), 'utf8')
   const verification = source.indexOf('await ensureNativeMmap()')
-  const workerSpawn = source.lastIndexOf('\nspawn()')
+  const workerSpawn = source.indexOf('this.engine = createService()')
 
   assert.deepEqual({ verificationPresent: verification >= 0, workerSpawnPresent: workerSpawn >= 0, verificationFirst: verification >= 0 && verification < workerSpawn }, { verificationPresent: true, workerSpawnPresent: true, verificationFirst: true })
 })

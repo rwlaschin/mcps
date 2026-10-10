@@ -634,6 +634,8 @@ test('combinatorial concurrency: mapped MCP queries return unchanged while one s
   fs.writeFileSync(path.join(root, 'src', 'calls.ts'), 'export function target() { return 1 }\nexport function caller() { return target() }\n')
   const indexed = spawnSync(process.execPath, ['cli.mjs', 'index', '--root', root], { cwd: path.resolve(import.meta.dirname, '..'), encoding: 'utf8' })
   const primed = spawnSync(process.execPath, ['tool.mjs', 'query', JSON.stringify({ type: 'deps', name: 'caller', limit: 200 }), '--root', root], { cwd: path.resolve(import.meta.dirname, '..'), encoding: 'utf8' })
+  assert.equal(indexed.status, 0, indexed.stderr)
+  assert.equal(primed.status, 0, primed.stderr)
   const validatedGeneration = fs.readFileSync(path.join(root, '.codegraph', 'CURRENT'), 'utf8').trim()
   const loaderPath = path.join(loaderRoot, 'stall-runtime-loader.mjs')
   fs.writeFileSync(loaderPath, `
@@ -662,20 +664,29 @@ export async function load(url, context, nextLoad) {
   const secondRequest = JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'codegraph_deps', arguments: { root, target: 'caller' } } }) + '\n'
 
   try {
-    child.stdin.write(firstRequest + secondRequest)
-    let observationFinished = false
-    const observed = await Promise.race([
-      new Promise((resolve) => {
-        const inspect = () => {
-          if (observationFinished) return
-          const responses = stdout.trim().split('\n').filter(Boolean)
-          if (responses.length === 2 && stderr.includes('HYDRATION_STARTED')) { observationFinished = true; resolve({ responses, stderr }) }
-          else setImmediate(inspect)
+    const observed = await new Promise((resolve, reject) => {
+      const cleanup = () => {
+        child.stdout.off('data', inspect)
+        child.stderr.off('data', inspect)
+        child.off('error', fail)
+        child.off('exit', exited)
+      }
+      const fail = error => { cleanup(); reject(error) }
+      const exited = (code, signal) => fail(new Error(`Hydration fixture exited before replies: ${code}/${signal}; ${stderr}`))
+      const inspect = () => {
+        const responses = stdout.trim().split('\n').filter(Boolean)
+        if (responses.length === 2 && stderr.includes('HYDRATION_STARTED')) {
+          cleanup()
+          resolve({ responses, stderr })
         }
-        inspect()
-      }),
-      new Promise((resolve) => setTimeout(() => { observationFinished = true; resolve({ responses: stdout.trim().split('\n').filter(Boolean), stderr }) }, 500)),
-    ])
+      }
+      child.stdout.on('data', inspect)
+      child.stderr.on('data', inspect)
+      child.once('error', fail)
+      child.once('exit', exited)
+      child.stdin.write(firstRequest + secondRequest)
+      inspect()
+    })
     const responses = observed.responses.map((line) => JSON.parse(line))
     const output = `${JSON.stringify({ revision: null, freshness: 'validated', coverage: 'calls', validatedGeneration })}\nsrc/calls.ts:2 -> src/calls.ts:1 call`
 
@@ -684,8 +695,10 @@ export async function load(url, context, nextLoad) {
       { indexedStatus: 0, primedStatus: 0, runtimeCreations: 1, hydrationStarted: true, responses: [{ id: 1, isError: undefined, text: output }, { id: 2, isError: undefined, text: output }] },
     )
   } finally {
-    child.kill('SIGKILL')
-    await once(child, 'exit').catch(() => {})
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill('SIGKILL')
+      await once(child, 'exit').catch(() => {})
+    }
   }
 })
 

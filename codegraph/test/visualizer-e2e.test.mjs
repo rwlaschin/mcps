@@ -20,16 +20,18 @@ async function ownedSubscriptionVisualizer(t) {
     endpoint: { host: '127.0.0.1', port: 0 }, tokenPath: path.join(root, 'token'),
     serviceFactory: () => service,
   })
+  const owner = {}
   let server, subscription
   t.after(async () => {
     await server?.watcher?.close()
     server?.emit('close')
     await subscription
+    await service.release(root, owner)
     await daemon.close()
     fs.rmSync(root, { recursive: true, force: true })
   })
   await daemon.start()
-  const built = await service.mutate(root, 'build')
+  const built = await service.mutate(root, 'build', {}, { owner })
   const watcher = new EventEmitter()
   watcher.close = async () => { const release = await subscription; await release?.() }
   server = createVisualizerServer(root, {
@@ -44,6 +46,7 @@ async function ownedSubscriptionVisualizer(t) {
     },
   })
   await subscription
+  await service.release(root, owner)
   return { server, watcher, sourcePath, root, generation: built.generation }
 }
 

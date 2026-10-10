@@ -341,6 +341,10 @@ async function drain() {
 }
 async function queryEngineFor(root) {
   const item = descriptor(root)
+  if (!item.query && fs.existsSync(path.join(root, '.codegraph', 'CURRENT'))) {
+    const manifest = new GraphStore(root).readGeneration()
+    if (!analyzersFor(root).isManifestCompatible(manifest, Object.keys(manifest.sources ?? {}))) await enqueue(item, 'reconcile')
+  }
   if (!item.query) item.query = new DaemonQueryEngine(root, {
     cache: queryCacheFor(root), disposeFallback: false,
     engineFactory: async () => ({

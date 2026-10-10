@@ -3,6 +3,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
+import { spawnSync } from 'node:child_process'
 
 import { ts } from '@ts-morph/common'
 
@@ -13,6 +14,55 @@ import { SemanticCheckerWorker } from '../semantic-checker-worker.mjs'
 import { CodeGraphEngine } from '../tool-engine.mjs'
 
 const partitionPool = () => new SharedArrayBuffer(4096 + 300 * 65536)
+
+// Test-only preload observes real filesystem calls in every worker isolate.
+const observeWorkerFilesystem = (context, root, operation) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-fs-observation-'))
+  context.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const preload = path.join(directory, 'observe.cjs')
+  const log = path.join(directory, 'calls.jsonl')
+  fs.writeFileSync(preload, String.raw`
+const fs = require('node:fs')
+const { threadId, workerData } = require('node:worker_threads')
+const { syncBuiltinESMExports } = require('node:module')
+const append = fs.appendFileSync.bind(fs)
+const record = (entry) => append(process.env.CODEGRAPH_TEST_FS_LOG, JSON.stringify({ threadId, ...entry }) + '\n')
+record({ loaded: true, semantic: workerData?.semanticChecker === true })
+for (const method of ['readFileSync', 'readFile', 'openSync', 'open', 'existsSync', 'statSync', 'stat', 'lstatSync', 'lstat']) {
+  const original = fs[method]
+  fs[method] = function (file, ...args) {
+    const target = file instanceof URL ? require('node:url').fileURLToPath(file) : typeof file === 'string' ? file : ''
+    if (target.startsWith(process.env.CODEGRAPH_TEST_FS_ROOT + require('node:path').sep)) record({ method, file: target })
+    return original.call(this, file, ...args)
+  }
+}
+syncBuiltinESMExports()
+const control = require('node:path').join(process.env.CODEGRAPH_TEST_FS_ROOT, '__observer_probe__')
+fs.existsSync(control)
+try { fs.readFileSync(control) } catch (error) { if (error.code !== 'ENOENT') throw error }
+`)
+  const child = spawnSync(process.execPath, ['--input-type=module', '-e', `
+import { SemanticCheckerWorker } from './semantic-checker-worker.mjs'
+const root = process.env.CODEGRAPH_TEST_FS_ROOT
+const worker = new SemanticCheckerWorker()
+const partitionPool = () => new SharedArrayBuffer(4096 + 300 * 65536)
+try {
+${operation}
+process.stdout.write(JSON.stringify({ semanticTraversalSummary: result.semanticTraversalSummary }))
+} finally { await worker.dispose() }
+`], {
+    cwd: path.resolve(import.meta.dirname, '..'), encoding: 'utf8',
+    env: { ...process.env, NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --require=${preload}`, CODEGRAPH_TEST_FS_LOG: log, CODEGRAPH_TEST_FS_ROOT: root, CODEGRAPH_DEBUG_POOL: '1' },
+  })
+  assert.equal(child.status, 0, child.stderr)
+  const calls = fs.readFileSync(log, 'utf8').trim().split('\n').map((line) => JSON.parse(line))
+  assert.equal(calls.some(({ semantic, threadId }) => semantic === true && threadId > 0), true, 'preload must execute in the semantic worker despite its explicit execArgv')
+  const semanticThread = calls.find(({ semantic }) => semantic === true).threadId
+  const control = path.join(root, '__observer_probe__')
+  assert.equal(calls.some(({ threadId, method, file }) => threadId === semanticThread && file === control && method === 'existsSync'), true, 'observer must detect an actual existence probe')
+  assert.equal(calls.some(({ threadId, method, file }) => threadId === semanticThread && file === control && method === 'readFileSync'), true, 'observer must detect an actual source read')
+  return { calls: calls.filter(({ file }) => file !== control), ...JSON.parse(child.stdout) }
+}
 
 test('domain analysis: a cold four-file semantic batch dispatches four jobs through the retained worker', async (context) => {
   process.env.CODEGRAPH_DEBUG_POOL = '1'
@@ -86,14 +136,11 @@ test('boundary analysis: a one-file semantic delta dispatches exactly one worker
   assert.equal(result.poolDiagnostics?.jobsDispatched, 1)
 })
 
-test('error guessing: an inline one-file semantic delta performs zero worker reads or existence probes against unchanged workspace source', async (context) => {
-  process.env.CODEGRAPH_DEBUG_POOL = '1'
-  const { SemanticCheckerWorker } = await import('../semantic-checker-worker.mjs')
+test('error guessing: an inline one-file semantic delta performs zero worker reads or existence probes against unchanged workspace source', (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-semantic-no-unchanged-source-'))
-  const worker = new SemanticCheckerWorker()
-  context.after(async () => { await worker.dispose(); fs.rmSync(root, { recursive: true, force: true }) })
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }))
   fs.mkdirSync(path.join(root, '.codegraph', 'sources'), { recursive: true })
-
+  const observed = observeWorkerFilesystem(context, root, String.raw`
   await worker.index({
     root,
     cacheDir: '.codegraph',
@@ -122,37 +169,34 @@ test('error guessing: an inline one-file semantic delta performs zero worker rea
     changes: [{ type: 'change', path: 'src/a.ts', source: 'export const a = 10\n' }],
     partitionPool: partitionPool(),
   }, () => {})
-
+`)
   assert.deepEqual(
-    {
-      unchangedWorkspaceSourceReads: result.poolDiagnostics?.unchangedWorkspaceSourceReads,
-      unchangedWorkspaceSourceExistenceProbes: result.poolDiagnostics?.unchangedWorkspaceSourceExistenceProbes,
-    },
-    { unchangedWorkspaceSourceReads: 0, unchangedWorkspaceSourceExistenceProbes: 0 },
+    observed.calls.filter(({ file }) => file === path.join(root, 'src', 'b.ts')),
+    [],
   )
 })
 
-test('state-transition analysis: a warm semantic benchmark publishes an unmeasured mutation before measuring a distinct second mutation', async (context) => {
+test('state-transition analysis: two retained benchmark samples publish distinct mutations in generation order', async (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-warm-semantic-prime-'))
   context.after(() => fs.rmSync(root, { recursive: true, force: true }))
   fs.mkdirSync(path.join(root, 'src', 'types'), { recursive: true })
   fs.writeFileSync(path.join(root, 'src', 'types', 'index.ts'), 'export type Id = string\n')
   const events = []
 
-  const [sample] = await benchmark.captureLifecycle('/frozen/repository', {
-    phase: 'changed-surface',
-    temperature: 'warm',
+  const [first, second] = await benchmark.captureLifecycle('/frozen/repository', {
+    samples: 2,
     withMirror: async (_source, operation) => operation(root),
-    coldBuild: async () => ({ ms: 10, generation: 'g1', parsedFiles: 4, validatedFiles: 4 }),
     start: () => ({
       timed: async (method, params) => {
         if (method === 'initialize') return { message: { result: {} }, ms: 1 }
+        if (params.name === 'codegraph_index') return { message: { result: { content: [{ text: '{"generation":"g1","parsedFiles":["a.ts","b.ts","c.ts","d.ts"]}' }] } }, ms: 10 }
         if (params.name === 'codegraph_refresh') { events.push('semantic-refresh'); return { message: { result: { content: [{ text: '{}' }] } }, ms: 1 } }
-        throw new Error(`unexpected tool call: ${params.name}`)
+        return { message: { result: { content: [{ text: 'src/query/event.ts useSessionEvent src/pages/game/storyArcState.ts fetchSessionStoryArcState export(s) {"name":"useSessionEvent","record":"metrics","cyclomatic":1}' }] } }, ms: 1 }
       },
       stop: async () => {},
     }),
     watcherUpdate: async ({ root: target, state, mutationIndex, previousGeneration }) => {
+      assert.equal(state, 'update')
       benchmark.applyStateMutation(target, state, mutationIndex)
       const generation = mutationIndex === 1 ? 'g2' : 'g3'
       events.push(`${mutationIndex === 1 ? 'prime' : 'measured'}:${previousGeneration}->${generation}`)
@@ -162,23 +206,21 @@ test('state-transition analysis: a warm semantic benchmark publishes an unmeasur
   })
 
   assert.deepEqual(
-    { events, source: fs.readFileSync(path.join(root, 'src', 'types', 'index.ts'), 'utf8'), measuredRevision: sample.measuredRevision, update: sample.updates.semantic },
+    { events, source: fs.readFileSync(path.join(root, 'src', 'types', 'index.ts'), 'utf8'), firstUpdate: first.updates.update, update: second.updates.update },
     {
       events: ['semantic-refresh', 'prime:g1->g2', 'measured:g2->g3'],
       source: 'export type Id = string\nexport type CodeGraphPerformanceSurface1 = Id\nexport type CodeGraphPerformanceSurface2 = Id\n',
-      measuredRevision: 2,
+      firstUpdate: { ms: 50, generation: 'g2', parsedFiles: 1, validatedFiles: 1, parsedFileSet: ['src/types/index.ts'], validatedFileSet: ['src/types/index.ts'] },
       update: { ms: 5, generation: 'g3', parsedFiles: 1, validatedFiles: 1, parsedFileSet: ['src/types/index.ts'], validatedFileSet: ['src/types/index.ts'] },
     },
   )
 })
 
-test('domain analysis: a cold in-memory semantic receipt counts every cache decode rematerialization read and AST traversal work unit', async (context) => {
-  process.env.CODEGRAPH_DEBUG_POOL = '1'
-  const { SemanticCheckerWorker } = await import('../semantic-checker-worker.mjs')
+test('domain analysis: a cold in-memory semantic batch performs zero cache or workspace source reads and exactly one traversal per file', (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-semantic-work-counters-'))
-  const worker = new SemanticCheckerWorker()
-  context.after(async () => { await worker.dispose(); fs.rmSync(root, { recursive: true, force: true }) })
-
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  fs.mkdirSync(path.join(root, '.codegraph', 'sources'), { recursive: true })
+  const observed = observeWorkerFilesystem(context, root, String.raw`
   const result = await worker.index({
     root,
     cacheDir: '.codegraph',
@@ -193,26 +235,14 @@ test('domain analysis: a cold in-memory semantic receipt counts every cache deco
     },
     partitionPool: partitionPool(),
   }, () => {})
-
+`)
   assert.deepEqual(
     {
-      cachedSymbolPartitionsOpened: result.poolDiagnostics?.cachedSymbolPartitionsOpened,
-      cachedSymbolPartitionsDecoded: result.poolDiagnostics?.cachedSymbolPartitionsDecoded,
-      cachedInternalPartitionsOpened: result.poolDiagnostics?.cachedInternalPartitionsOpened,
-      cachedInternalPartitionsDecoded: result.poolDiagnostics?.cachedInternalPartitionsDecoded,
-      graphRecordsRematerialized: result.poolDiagnostics?.graphRecordsRematerialized,
-      workerSourceReads: result.poolDiagnostics?.workerSourceReads,
-      astTraversals: result.poolDiagnostics?.astTraversals,
+      cacheReads: observed.calls.filter(({ file, method }) => file?.startsWith(path.join(root, '.codegraph') + path.sep) && ['readFileSync', 'readFile', 'openSync', 'open'].includes(method)),
+      workspaceSourceReads: observed.calls.filter(({ file, method }) => file?.startsWith(path.join(root, 'src') + path.sep) && ['readFileSync', 'readFile', 'openSync', 'open'].includes(method)),
+      traversals: observed.semanticTraversalSummary,
     },
-    {
-      cachedSymbolPartitionsOpened: 0,
-      cachedSymbolPartitionsDecoded: 0,
-      cachedInternalPartitionsOpened: 0,
-      cachedInternalPartitionsDecoded: 0,
-      graphRecordsRematerialized: 0,
-      workerSourceReads: 0,
-      astTraversals: 2,
-    },
+    { cacheReads: [], workspaceSourceReads: [], traversals: { completedFiles: 2, remainingFiles: 0, maximumTraversalsPerFile: 1 } },
   )
 })
 
@@ -374,6 +404,7 @@ test('legacy overlay dependency invalidation: a changed re-export rebuilds its u
   const engine = new CodeGraphEngine(root, { validationWorkerFactory: () => ({
     index: (payload, onProgress) => checker.index(payload, onProgress),
     hydrate: (payload) => checker.hydrate(payload),
+    advanceGeneration: (expected, generation) => checker.advanceGeneration(expected, generation),
     validate: (payload, onProgress) => checker.validate(payload, onProgress),
     referenceOverlay: (payload) => { overlayRequests.push(payload.staleFiles); return checker.referenceOverlay(payload) },
     dispose: () => checker.dispose(),
@@ -417,17 +448,14 @@ test('semantic profile report: main and worker CPU and heap plus trace and diagn
   const workerHeap = path.join(directory, 'semantic.worker-semantic.heapprofile')
 
   const [sample] = await benchmark.captureLifecycle('/frozen/repository', {
-    phase: 'changed-surface',
-    temperature: 'cold',
     profile: { cpu, heap, trace },
     diagnosticLog,
     withMirror: async (_source, operation) => operation('/private/tmp/codegraph-performance/project'),
-    coldBuild: async () => { throw new Error('profiled lifecycle used external cold build') },
     start: () => ({
       timed: async (method, params) => {
         if (method === 'initialize') return { message: { result: {} }, ms: 1 }
         if (params.name === 'codegraph_index') return { message: { result: { content: [{ text: '{"generation":"g1","parsedFiles":["a.ts","b.ts","c.ts","d.ts"],"validatedFiles":["a.ts","b.ts","c.ts","d.ts"]}' }] } }, ms: 10 }
-        return { message: { result: { content: [{ text: '{}' }] } }, ms: 1 }
+        return { message: { result: { content: [{ text: 'src/query/event.ts useSessionEvent src/pages/game/storyArcState.ts fetchSessionStoryArcState export(s) {"name":"useSessionEvent","record":"metrics","cyclomatic":1}' }] } }, ms: 1 }
       },
       stop: async () => {
         fs.writeFileSync(cpu, JSON.stringify({ nodes: [], startTime: 0, endTime: 0, samples: [], timeDeltas: [] }))
