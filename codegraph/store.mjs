@@ -80,7 +80,7 @@ export function writeSymbolPartition(partition, layout, target) {
     offset += SYMBOL_BINDING_BYTES
   }
   for (const row of layout.references) {
-    u(offset, layout.indexes.get(row.from)); u(offset + 4, layout.indexes.get(row.specifier)); u(offset + 8, row.remote == null ? NONE : layout.indexes.get(row.remote)); u(offset + 12, row.property == null ? NONE : layout.indexes.get(row.property)); u(offset + 16, row.line); u(offset + 20, (row.call ? 1 : 0) | (row.namespace ? 2 : 0)); offset += SYMBOL_REFERENCE_BYTES
+    u(offset, layout.indexes.get(row.from)); u(offset + 4, layout.indexes.get(row.specifier)); u(offset + 8, row.remote == null ? NONE : layout.indexes.get(row.remote)); u(offset + 12, row.property == null ? NONE : layout.indexes.get(row.property)); u(offset + 16, row.line); u(offset + 20, (row.call ? 1 : 0) | (row.namespace ? 2 : 0) | (row.instance ? 4 : 0)); offset += SYMBOL_REFERENCE_BYTES
   }
   for (let index = 0; index < stringOffsets.length; index += 1) stringOffsets[index] = stringOffsets[index]
   // Records store string-table indexes; rewrite them to byte offsets once, in place.
@@ -115,12 +115,12 @@ export function decodeSymbolPartition(input, offset = 0, length = input.byteLeng
   const candidates = Array.from({ length: counts.candidates }, () => { const value = stringAt(u(cursor)); cursor += 4; return value })
   const bindings = Array.from({ length: counts.bindings }, () => {
     const kind = decodeCode(BINDING_KINDS, u(cursor), 'binding kind'); const name = u(cursor + 4) === NONE ? undefined : stringAt(u(cursor + 4)); const target = stringAt(u(cursor + 8)); const remote = u(cursor + 12) === NONE ? undefined : stringAt(u(cursor + 12)); cursor += SYMBOL_BINDING_BYTES
-    if (kind === 'symbol') return { kind, name, target }
+    if (kind === 'symbol') return remote === undefined ? { kind, name, target } : { kind, name, target, remote }
     if (kind === 'reexport') return { kind, name, specifier: target, remote }
     if (kind === 'namespace') return { kind, name, specifier: target }
     return { kind, specifier: target }
   })
-  const references = Array.from({ length: counts.references }, () => { const flags = u(cursor + 20); const row = { from: stringAt(u(cursor)), specifier: stringAt(u(cursor + 4)), remote: u(cursor + 8) === NONE ? undefined : stringAt(u(cursor + 8)), namespace: Boolean(flags & 2), property: u(cursor + 12) === NONE ? null : stringAt(u(cursor + 12)), line: u(cursor + 16), call: Boolean(flags & 1) }; cursor += SYMBOL_REFERENCE_BYTES; return row })
+  const references = Array.from({ length: counts.references }, () => { const flags = u(cursor + 20); const row = { from: stringAt(u(cursor)), specifier: stringAt(u(cursor + 4)), remote: u(cursor + 8) === NONE ? undefined : stringAt(u(cursor + 8)), namespace: Boolean(flags & 2), property: u(cursor + 12) === NONE ? null : stringAt(u(cursor + 12)), line: u(cursor + 16), call: Boolean(flags & 1) }; if (flags & 4) row.instance = true; cursor += SYMBOL_REFERENCE_BYTES; return row })
   return { file: packed.file, sourceHash: packed.sourceHash, symbols, edges, dependencies, unresolved: unresolvedRows.map(({ specifier, start, count }) => ({ specifier, candidates: candidates.slice(start, start + count) })), ...(bindings.length ? { bindings } : {}), ...(references.length ? { references } : {}) }
 }
 

@@ -117,7 +117,7 @@ export function advanceJournalPointer(state) {
 
 const assertPoolActive = (metadata) => { if (Atomics.load(metadata, POOL_CANCELLED)) throw new Error('semantic partition pool cancelled') }
 const reserveJobCounter = (metadata) => { const write = Atomics.load(metadata, POOL_WRITE_SEQUENCE); if (write - Atomics.load(metadata, POOL_READ_SEQUENCE) >= POOL_JOB_COUNT) return -1; Atomics.store(metadata, POOL_WRITE_SEQUENCE, write + 1); return write % POOL_JOB_COUNT }
-const openPartitionPool = (buffer) => {
+export const openPartitionPool = (buffer) => {
   if (!(buffer instanceof SharedArrayBuffer) || buffer.byteLength !== POOL_BYTES) throw new Error('malformed semantic partition pool')
   const metadata = new Int32Array(buffer, 0, POOL_HEADER_BYTES / 4); const payload = new Uint8Array(buffer, POOL_HEADER_BYTES)
   return { buffer, metadata, payload, memoryBuffer: payload, insertionPointer: metadata[POOL_WRITE_CURSOR], oldestActivePartition: 0 }
@@ -194,14 +194,14 @@ function ownedSnapshot(request, hydrate = false) {
   return { mode: 'full', sourceBlobs, partitions }
 }
 
-function createBatchWriter(id, pool, traversalSummary, diagnostics) {
+export function createBatchWriter(id, pool, traversalSummary, diagnostics, publish = (progress) => parentPort.postMessage({ id, progress })) {
   let partitions = []; let startedAt = 0; let first = true; let batchId = 0
   const flush = (final = false, initial = false) => {
     if (!partitions.length) return
     batchId += 1
     const poolBatch = { requestId: id, poolId: pool.debugId, batchId, final: final || !initial && traversalSummary.remainingFiles === 0, partitionCount: partitions.length, slotCount: partitions.length }
     debugPool('Worker Publish Batch', id, pool.debugId, poolBatch)
-    parentPort.postMessage({ id, progress: { partitions, semanticTraversalSummary: { ...traversalSummary }, ...(DEBUG_POOL ? { poolBatch } : {}) } })
+    publish({ partitions, semanticTraversalSummary: { ...traversalSummary }, ...(DEBUG_POOL ? { poolBatch } : {}) })
     partitions = []; startedAt = 0
   }
   const writePartition = (file, ordinal, symbolPartition, internalBytes) => {
@@ -235,7 +235,7 @@ function createBatchWriter(id, pool, traversalSummary, diagnostics) {
   return { writePartition, flush, flushElapsed }
 }
 
-function persistWorkerPartition(store, file, sourceHash, symbolPartition, internalBytes, internalFingerprint) {
+export function persistWorkerPartition(store, file, sourceHash, symbolPartition, internalBytes, internalFingerprint) {
   const partitionId = store.writePartition(symbolPartition); const internalPartitionId = store.writeInternalPartition(internalBytes)
   const symbolLength = fs.statSync(path.join(store.partitions, `${partitionId}.bin`)).size
   return { file, sourceHash, writer: 'worker', partitionId, internalPartitionId, serializedLength: symbolLength + internalBytes.byteLength, chunkCount: 0, symbolLength, internalLength: internalBytes.byteLength, symbolChunkCount: 0, internalChunkCount: 0, internalFingerprint }

@@ -6,7 +6,7 @@ export function createTypeScriptLanguageAnalyzer(root) {
   return {
     id: 'typescript', extensions: typescriptSourceExtensions, controlFiles: ['tsconfig.json', 'jsconfig.json'], cacheKey: 'typescript-2',
     createSourceMatcher: (analyzerRoot = root) => createSourcePolicy(analyzerRoot),
-    createSemanticWorker: () => new SemanticCheckerWorker(),
+    createSemanticWorker: (options) => new SemanticCheckerWorker(options),
     createProvisionalResolver(analyzerRoot = root, options = {}) {
       let current = null
       const load = async () => {

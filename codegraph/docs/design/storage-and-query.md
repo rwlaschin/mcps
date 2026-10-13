@@ -1,5 +1,5 @@
 ---
-modified: 2026-09-12
+modified: 2026-10-13
 dependencies:
   - parsing-and-resolution.md
   - mcp-and-cli.md
@@ -12,27 +12,27 @@ This subsystem is CodeGraph's persistence and read path: the on-disk generation 
 
 **Who needs to read this:** anyone changing what a symbol or edge record carries, anyone adding a query type or a field to the daemon wire messages, and anyone debugging a stale/absent query result or a daemon that will not start.
 
-**When to consult it:** before touching the binary layout or the socket protocol (both are unversioned or hard-coded in ways detailed under Sensitive Areas), and when tracing where a query result came from — the mapped page or the fallback engine.
+**When to consult it:** before touching the versioned binary layout or the socket protocol, and when tracing where a query result came from — an immutable mapped root or the fallback engine.
 
 Parsing/resolution produces the graph this subsystem stores ([parsing-and-resolution.md](parsing-and-resolution.md)); the MCP server and CLI are its main callers ([mcp-and-cli.md](mcp-and-cli.md)); the visualizer reads through the same daemon client ([visualizer.md](visualizer.md)).
 
 ## Sensitive Areas
 
-- **The binary page layout is fixed-width and its header offsets are hard-coded in the reader.** `SYMBOL_BYTES = 40` and `EDGE_BYTES = 16` (`mmap-query-cache.mjs:11-12`) are compile-time constants written into the page header (`:62-63`) and used as multipliers by both writer (`:72`, `:80`) and reader (`:119`, `:129`). The reader also reads header fields by literal offset with no symbolic constant: generation string offset at 56 and coverage at 60 (`:105-106`, and again in `MmapQueryCache.acquire` at `:239`), edges base at 28 (`:129`), symbol count at 20 and edge count at 32 (`:144`, `:109`), and the name/file/incoming index offsets at 40/44/48 (`:138-141`, `:157-159`). Any change to the header field order silently mis-reads rather than failing loudly.
-- **The header is CRC-protected, so layout changes must be coherent.** `#writeHeader` stores `crc32` of bytes `0..252` at `HEADER_CHECKSUM_OFFSET = 252` (`:16`, `:277`), and `#readHeader` rejects the whole file if magic, `VERSION`, capacity, root fingerprint, the CRC, `HEADER_BYTES`/`SCRATCH_BYTES` echo, or the page-offset expectations do not match (`:264-269`). A partial layout edit does not corrupt data — it makes the cache appear absent, and every query silently degrades to the fallback engine.
+- **Version-4 roots reference immutable records.** Payload storage is separate from byte-prefix lookup directory/chunk records within the same sparse mmap. `RecordWriter` copies only affected committed lookup pages; its own unpublished pages can change until commit. `ImmutableQueryView` captures one root, so committed offsets are never reused. Five indexes share symbol/edge payloads; unresolved occurrences have a sixth index.
+- **Integrity covers the header and each traversed record.** The 256-byte header has a CRC at offset 252. Record headers carry payload length, type, and CRC; `RecordReader.record` checks current mapped bytes on every read. Root descriptors and allocator bounds are checked before acquisition. Publication computes CRCs only for appended records, not the whole graph.
 - **The daemon wire protocol has no version field, no handshake, and no capability negotiation.** A request is a bare `{op, id, query, maxQueue}` object (`query-daemon.mjs:299`) and validation accepts only that shape (`:143-149`). A newer client talking to an older running daemon has no way to detect the mismatch; the daemon answers with `{error: 'invalid request', done: true}` at best, or misinterprets an unknown field as absent at worst. The daemon is also long-lived and detached (`:34-37`), so a stale binary can keep serving after the source is upgraded.
 - **The query vocabulary is closed.** `#queryMapped` handles exactly `symbols`, `refs`, `deps`, `graph` and otherwise throws `unknown query type: ${request.type}` (`daemon-query-engine.mjs:108-112`). New query types are not additive at the read layer — they need a branch here (or they fall through to the exception, which reaches the client as `{id, error, done}`).
 - **The socket path is derived, not registered.** `daemonSocketPath` hashes the resolved root (`query-daemon.mjs:16-20`); two clients that disagree about the root's canonical form (symlink, different casing) get different sockets and each spawns its own daemon. `QueryDaemon.start()` probes an existing socket file and deletes it if nothing answers (`:104-112`) — a live daemon whose socket file was removed out from under it is unreachable and undetectable.
-- **The publish path writes through a scratch region and can leave a lease-blocked page.** `publish` copies the payload in `SCRATCH_BYTES` chunks via the scratch area before landing it at the target page (`:217-220`) and refuses to write a page that has outstanding leases (`:213`), returning `false`. A reader that never calls `release()` permanently pins one of the two pages.
+- **Capacity is consumed by immutable appends.** A delta never detaches old roots, rewrites retained rows, or compacts storage. Cold prefix partitioning leaves abandoned staging chunks allocated but unreachable; they consume tail space and are not reclaimed. Capacity exhaustion returns `false`; committed roots and pinned views remain readable. Disposal detaches still-live views before unmapping, which can copy a large retained allocation outside the edit path.
 - **The native bridge is macOS-only and optional.** `binding.gyp` sets `"type": "none"` for `OS!='mac'`, and `native/mmap-adapter.mjs:7` swallows the `require` failure so `nativeMmapAdapter` is `null`. Every `mmap` benefit disappears silently on any other platform or any failed build; correctness is preserved only because the fallback path exists.
 - **`package.json` declares `"main": "query-client.mjs"` with no `"exports"` map, and there is no workspace manifest at the monorepo root** (`/Users/mac/Documents/Projects/mcps/` contains no `package.json`). Every other module in this subsystem is reachable only by deep relative path, and nothing at the repo root hoists or links the package.
 
 ## Design Constraints
 
-- **A new `kind` value is free; a new per-record field is not.** `kind` is written as an interned string offset (`mmap-query-cache.mjs:74`, read at `:122`), so any new symbol kind costs nothing but string bytes. Adding any NEW PER-RECORD FIELD requires widening `SYMBOL_BYTES` or `EDGE_BYTES`, bumping `VERSION` (`:6`), and changing the CRC'd header layout that carries the record widths and the chained section offsets — the symbol record is fully packed at 40 bytes (fields at 0,4,8,12,16,20,24,28,32 with `exported` last, `:73-77`) and the edge record is fully packed at 16 bytes (from, to, line, call at 0,4,8,12 — `:81-82`) with **no spare field** in either.
-- **Version gating is exact-match, not range.** Both `#readHeader` (`:264`) and `acquire` (`:237`) compare against `VERSION` with `!==`; there is no forward or backward compatibility window. `VERSION` is currently `2`.
-- **Capacity is fixed at open time.** `MmapQueryCache` defaults to `capacityBytes = 1024 * 1024 * 1024` (`:192`), clamps to a 1024-byte minimum, stores the capacity in the header, and rejects a header whose capacity field disagrees (`:264`). Page A starts at `floor(capacity/2) + 2048` and page B occupies the space between the scratch region and page A (`:252-255`); a payload larger than its target page's capacity is refused (`:215`).
-- **A page is only served if generation AND coverage match exactly.** `acquire({generation, coverage})` compares both interned strings and skips the page otherwise (`:239`). The one relaxation is in the engine: a `symbols` request that misses on `calls` coverage retries with `complete` (`daemon-query-engine.mjs:50`).
+- **Record layouts and schema changes require coherent migration.** The schema integer remains 4. Authenticated root tag 7 selects partitioned lookup; genuine older version-4 root/node tags 6/5 retain their AVL reader. Valid version-3 pages and AVL version-4 roots migrate from cached bytes without source parsing or a cache-miss rebuild.
+- **Legacy compatibility is explicit.** `LegacyQueryView` decodes version 3 independently of `CACHE_SCHEMA_VERSION = 4`. Opening the cache attempts migration of both valid retained roots, preserving generation, coverage and occurrence order. AVL migration reuses existing keys/payload offsets. Version 2 retains its prior rejection behavior. Insufficient space leaves genuine legacy reads available; publication returns `false` while unmigrated roots remain, instead of migrating during an edit.
+- **Capacity is fixed at open time.** The default is 1 GiB and the header capacity must match. A short mapping is resized and remapped once at open. Version-4 appends use committed writable intervals and a cursor; migration permanently excludes both legacy payloads and the upper page's 2048-byte checksum guard. There is no automatic compaction or resizing on an edit.
+- **A root is served only for an exact generation and coverage match.** `acquire({generation, coverage})` tries the active descriptor then the other. A symbol request missing calls coverage retries complete coverage in `DaemonQueryEngine`.
 - **Transport is local-only.** A Unix domain socket under `os.tmpdir()` (`query-daemon.mjs:19`) — no TCP, no port, no bind address, no authentication beyond filesystem permissions on the socket.
 - **Messages are newline-delimited JSON, one message per line, in both directions** (`readline` with `crlfDelay: Infinity`, `:137`, `:227`; every write is `${JSON.stringify(...)}\n`). A row containing a literal newline is impossible because `JSON.stringify` escapes it, but the framing gives no length prefix and no way to resynchronize mid-message.
 - **The store's directory contract is `<root>/.codegraph`** with `partitions/`, `generations/`, `sources/`, `overlays/`, and a `CURRENT` pointer file (`store.mjs:11-17`, `:58`). `DaemonQueryEngine` reads `CURRENT` directly rather than through `GraphStore` (`daemon-query-engine.mjs:86`).
@@ -46,14 +46,16 @@ Queries against a code graph are read-dominated and latency-sensitive: an MCP to
 Three mechanisms address that, and all three are present:
 
 1. **A content-addressed, generation-stamped store** (`store.mjs`). Partitions and sources are keyed by SHA-256 of their bytes, so re-indexing an unchanged file is a no-op `existsSync` check. A generation is a published manifest with an id of `<base36 time>-<12 hex of manifest digest>-<12 hex random>` (`:55`), and `CURRENT` names the newest one. Nothing is ever mutated in place; readers see either the old file or the new one.
-2. **A memory-mapped binary query view** (`mmap-query-cache.mjs` + `native/mmap_bridge.c`). The graph is encoded once into a fixed-width, string-interned page with five precomputed sorted indexes, written into one of two pages inside a single mapped file. A reader decodes only the records a query touches — `symbol()` and `edge()` are per-index accessors (`:117`, `:127`), and `graph` (`:180`) is the only path that materializes everything. Publishing is double-buffered with per-page CRC and a serial counter, so a reader either sees a fully-valid page or falls back.
+2. **A memory-mapped binary query view** (`mmap-query-cache.mjs` + `native/mmap_bridge.c`). The native file reserves sparse backing at fixed logical capacity. Separate lookup records partition composite key bytes through 256-way directories with common-prefix hints and unsorted chunks of at most 64 key/payload-offset pairs. Cold construction directly fills six unpublished chunk chains, then partitions overflowing chains by common-prefix and byte-scatter passes; it performs no incremental lookup insertion or sorting. A one-file delta visits changed symbols and affected edge/status groups, reuses identical payloads, and copies affected chunks and prefix paths. Lookup depth follows encoded key length rather than graph size. Calls/complete publications share the same work. Queries decode and order requested results; graph materialization is explicit read work.
 3. **A per-root query daemon** (`query-daemon.mjs`). Clients pay one Unix-socket connect instead of a Node startup plus a graph load. The daemon keeps a `DaemonQueryEngine` alive, which keeps the mapping alive.
 
-The fallback is what makes the fast path safe to be strict. `DaemonQueryEngine.#pinFallback` (`daemon-query-engine.mjs:95-103`) lazily constructs the full `CodeGraphEngine` and answers from it whenever the mapped page is unavailable, stale, wrong-coverage, or the caller asked for `consistency: 'latest'`. Because every failure in the mmap path returns `null`/`false` rather than throwing (`:206`, `:227`, `:248`, and the `try {} catch {}` around `acquire` at `:49-51`), a broken or absent cache costs speed, never correctness.
+`DaemonQueryEngine.#pinFallback` lazily constructs the full `CodeGraphEngine` when acquisition is unavailable, stale, wrong-coverage, or bypassed by `consistency: 'latest'`. Acquisition failures return `null`; publication failures return `false`. Corruption encountered while reading a mapped row throws instead of returning unchecked data, and the daemon reports that query error.
 
-Validated incremental publication reuses the pinned generation's unchanged partition ids. A single-file delta is accepted only when it contains exactly the changed/add partition or unlink tombstone. The coordinator verifies it against the pinned base, patches exact edges and dangling-reference status from retained complete partitions, then publishes a complete manifest from the one replacement plus unchanged ids. It never computes a reverse dependency closure or reads dependent source. Any stale base, malformed result, failed write, or failed publication is rejected before `CURRENT` changes.
+Validated incremental publication reuses the pinned generation's unchanged partition ids. A single-file delta is accepted only when it contains exactly the changed/add partition or unlink tombstone. The coordinator verifies it against the pinned base, patches exact edges and dangling-reference status from retained complete partitions, then publishes a complete manifest from the one replacement plus unchanged ids. It never computes a reverse dependency closure or reads dependent source. Stale bases, malformed results, and failed partition writes are rejected before manifest publication. The mapped-cache publication follows the manifest; a cache failure retains the existing fallback query route.
 
 Validated generations publish content-addressed binary internal partitions beside their symbol partitions. The same atomic manifest publication binds control flow and complexity data to the matching symbol generation.
+
+TypeScript-only, Go-only, and mixed repositories use the same partition and query layouts. `LanguageSemanticWorker` combines language-owned receipts into one atomic generation with no inferred cross-language edges. `PublicationFacts` retains keyed unresolved rows and edge patches and applies only touched publication groups on a one-file edit; unchanged partition ids and pinned mmap reads remain valid.
 
 ## Architecture
 
@@ -63,7 +65,7 @@ indexer/resolver  ──►  GraphStore (store.mjs)
                                                 │
                                                 ▼
                               MmapQueryCache.publish()  ──►  .codegraph/query-view-cache.bin
-                                                                (256B header | 4KB scratch | page B | page A)
+                                                                (256B header | reserved 4KB scratch | immutable records)
                                                                         │ acquire()
 QueryDaemonClient ──unix socket──►  QueryDaemon  ──►  DaemonQueryEngine ─┤
   (query-client.mjs)   NDJSON       (per-root)         (#queryMapped)    └─► CodeGraphEngine  (fallback)
@@ -72,13 +74,13 @@ QueryDaemonClient ──unix socket──►  QueryDaemon  ──►  DaemonQuer
 Components:
 
 - **`GraphStore`** — filesystem layer only. No caching, no in-memory state beyond four path strings. Optionally reports timings to an injected profiler on the partition write path (`store.mjs:23-30`).
-- **`encodePage` / `MappedQueryView` / `MmapQueryCache`** — writer, reader, and file/page manager. `MmapQueryCache` owns the native handle and mapping, the two-page header, and the per-page lease counters (`this.leases = [0, 0]`, `:194`).
+- **`RecordReader` / `RecordWriter` / `ImmutableQueryView` / `MmapQueryCache`** — checked record access, partitioned lookup updates, generation-pinned query methods, and mapping/transaction ownership. `LegacyQueryView` is the retained version-3 decoder; `RecordReader.node` retains authentic AVL version-4 reads. The cache tracks views weakly for disposal detachment.
 - **`nativeMmapAdapter`** (`native/mmap-adapter.mjs`) — thin wrapper over the compiled binding, or `null`. It creates the parent directory before `open` and otherwise forwards `open/resize/map/flush/unmap/close/pageSize` verbatim.
 - **`mmap_bridge.c`** — N-API module `codegraph_mmap`. `open` does `open(O_RDWR|O_CREAT, 0600)` plus `ftruncate` up to capacity if the file is short; `map` does `mmap(PROT_READ|PROT_WRITE, MAP_SHARED)` over the whole file and returns a `Uint8Array` over an external `ArrayBuffer`, stashing the mapping state on the typed array as a non-enumerable-by-convention `__mmapState` external; `flush` page-aligns the requested range down/up and calls `msync(MS_SYNC)`; `unmap` `munmap`s then `napi_detach_arraybuffer`. Finalizers on both the handle and the mapping close/unmap if JS drops them first.
 - **`DaemonQueryEngine`** — the routing brain. Decides mapped-vs-fallback, holds leases in a `Set` so `dispose()` can release them, and exposes `pinQuery`, `queryBatch`, and an async-generator `query`.
 - **`QueryDaemon`** — `net.createServer` over the derived socket path; tracks live sockets and in-flight requests keyed `<socketUUID>:<requestId>` so a `cancel` op or a socket close aborts exactly the right `AbortController`s (`:135`, `:151`).
 - **`QueryDaemonClient` / `connectQueryDaemon` / `streamQuery`** — client side. `streamQuery` (`query-client.mjs`) is the package's `main` export: connect, stream, close.
-- **`qualifiedQuery`** (`query-target.mjs`) — the only query-parsing helper: turns `file:name`, a bare filename, or a bare name into `{file, name}` / `{file}` / `{name}`, recognizing `.js/.jsx/.ts/.tsx/.cjs/.mjs/.cts/.mts` via `/\.[cm]?[jt]sx?$/`.
+- **`qualifiedQuery`** (`query-target.mjs`) — turns `file:name`, a recognized filename, or a bare name into `{file, name}`, `{file}`, or `{name}` using registered analyzer extensions, including `.go`.
 
 Process topology: one daemon per canonical root, spawned detached and `unref`'d by `defaultStartDaemon` running `tool.mjs daemon --root <root>` (`query-daemon.mjs:33-43`). Concurrent spawn attempts within one process are deduplicated by `startupBySocket`, a socket-path-keyed promise map (`:10`, `:64-76`). Startup waits up to `STARTUP_TIMEOUT_MS = 15000` with backoff from 10ms toward 50ms plus jitter (`:11-14`, `:49-62`); each individual connect attempt times out at `CONNECT_TIMEOUT_MS = 500` (`:25`).
 
@@ -100,20 +102,21 @@ Process topology: one daemon per canonical root, spawned detached and `unref`'d 
 
 **`mmap-query-cache.mjs`**
 
-- `encodePage({generation, coverage, view})` — the writer. Interns every string (generation, coverage, file paths, and per-symbol id/file/name/kind/qualifiedPath/signature, plus edge endpoint ids) into a deduplicated NUL-terminated region starting at `STRING_PREFIX_BYTES = 64`; computes the chained section offsets; writes the 64-byte page header; writes the symbol and edge records; builds the five sorted indexes; writes the 16-byte footer (`FOOTER_MAGIC`, id-index offset, symbol count). Returns the finished `Uint8Array`.
-- `MappedQueryView.string(offset)` — reads a NUL-terminated UTF-8 string, bounded by the string region's end, with a `fatal: true` decoder.
-- `MappedQueryView.symbol(index)` / `.edge(index)` — decode one fixed-width record. Both notify the optional `decodeObserver`. `edge()` resolves its two `u32` symbol indexes back into full symbols just to take their `id`s.
-- `MappedQueryView.matchingSymbols(request = {})` — the `symbols` query. With `request.id`, binary-searches the id index and post-filters on name/file. Otherwise intersects the name-index and file-index candidate sets (falling back to all symbol indexes when neither is given) and re-checks every predicate on the decoded symbol. File matching is exact-or-suffix (`symbol.file.endsWith(request.file)`).
-- `MappedQueryView.relationships(request, direction)` — resolves the request to symbol indexes via the id index, then numeric-binary-searches the incoming (offset 48) or outgoing (offset 52) edge index for each, returning decoded edges.
-- `MappedQueryView.#stringIndex(start, end, key)` / `#numericIndex(start, end, key)` — lower-bound binary search over 16-byte `(key, payload)` entries, then a forward scan collecting every equal key. Duplicate keys are expected and returned as a list.
-- `MappedQueryView.#footerOffset()` / `#idIndexOffset()` / `#lookupId(id)` — footer-derived id-index location, degrading to "id index absent" (id index = footer offset, an empty range) when the footer magic is wrong.
-- `MappedQueryView.graph` (getter) — materializes `{generation, edgeCoverage, files, symbols, edges}`, i.e. decodes every record.
-- `MmapQueryCache.constructor({filePath, root, adapter, capacityBytes, decodeObserver})` — fingerprints the root (first 4 LE bytes of its SHA-256), opens and maps the file, resizes and remaps once if the mapping came back shorter than capacity, and on any failure releases the native resources and leaves `this.mapping === null` (permanently degraded, never throwing).
-- `MmapQueryCache.publish({generation, coverage, view}, {signal})` — reads (or synthesizes) the header, picks the non-active page (page 0 on a virgin file), refuses if that page is leased, encodes, refuses if the payload overflows the page, saves the prior header bytes, copies the payload through scratch, `msync`s the page, updates `length`/`checksum`/`serial` and flips `active`, writes and `msync`s the header, and on a header-flush failure restores the prior header. Returns `true` only on a complete success; every other outcome, including any thrown error, is `false`.
-- `MmapQueryCache.acquire({generation, coverage})` — tries the active page then the other one; skips a page with zero/overflowing length, a CRC mismatch, wrong page magic, wrong `VERSION`, or a generation/coverage mismatch. On success increments that page's lease, and returns `{value, release}` where `value` exposes a lazy `graph` getter and a non-enumerable `mappedView`. `release` is idempotent.
-- `MmapQueryCache.dispose()` — one-shot; unmaps and closes.
-- `MmapQueryCache.#pageChecksum(descriptor)` — CRC over the page bytes, extended 2048 bytes backwards for the upper page so the guard gap is covered.
-- `MmapQueryCache.#emptyHeader()` / `#readHeader()` / `#writeHeader(header)` — described under Design Constraints and Models.
+- `RecordReader.record(offset, type)` — validates aligned offsets, payload bounds, record type, and current payload CRC. `lookup` checks fixed chunk/directory layouts, counts, and hints. `range` follows prefix hints and chunk entries without decoding strings; legacy AVL traversal remains bounded for genuine old roots. `root` dispatches authenticated root tags 6/7.
+- `RecordWriter.append` / `writeRoot` — append aligned records within committed writable intervals. `update` changes one unsorted chunk and its byte-prefix path; `split` partitions a full chunk plus one new key at their first differing byte. `writable` copies a committed page once per transaction; unpublished pages are reused in place. `finalize` clears every new chunk's temporary link, including abandoned staging chunks, then computes lookup CRCs once before flushing. Only the writer bypasses pending CRCs on its own unpublished lookup pages; public readers always validate.
+- `RecordWriter.stageCold` / `finishCold` / `#ownedKey` — directly write key/value pairs into six chunk chains with fixed head/tail/count slots and tail DataViews. A single chunk remains its own final leaf. Larger chains use one common-prefix pass and one scatter pass, then recursively finish child chains using fixed 256-entry scratch. Private owned-key reads validate type and bounds without rechecking newly encoded key CRCs. This path performs no `update`, `lookup`, or public `key` calls; genuine AVL startup conversion retains its separate incremental index conversion path.
+- `coldState(writer, graph, legacy)` — encodes the caller's graph and original occurrence/sequence metadata. Migration retains encoded duplicate-ID endpoint identities.
+- `patchSymbols`, `patchEdges`, `patchUnresolved` — patch keyed changed-file symbols and exact affected groups. Identical rows reuse their existing payloads and roots. Raw/missing counts are updated from changed groups.
+- `ImmutableQueryView.matchingSymbols(request)` — looks up exact ID/name/file ranges, preserves current result order, and applies requested predicates. Suffix-only file matching retains the existing scan fallback.
+- `ImmutableQueryView.relationships(request, direction)` — resolves selected symbols to their first ID occurrence and reads only the corresponding endpoint range. Cold duplicate-ID edges retain the legacy last-occurrence encoding rule.
+- `ImmutableQueryView.graph` — materializes symbols, edges, and optional unresolved rows. Files derive from symbol paths. Cold/migrated graphs retain caller order; changed roots use canonical symbol/group order. Ordering is requested-row read work, never publication work.
+- `ImmutableQueryView.detach()` — copies its retained mapping prefix once and releases its lease. Used for disposal, not one-file publication or immutable-view eviction.
+- `MmapQueryCache.constructor` — opens the fixed mapping, handles a short mapping once, and attempts lossless version-3 or AVL version-4 migration before edits. Missing adapter/open failures leave the existing unavailable-cache behavior.
+- `MmapQueryCache.publish({generation, coverage, view}, {signal})` — accepts a full graph for cold publication or a retained immutable parent plus changed file/partition/groups for a delta. Validates the parent, appends only changed records and root metadata, flushes those ranges, and commits the fixed header last. Shared `publicationState` avoids duplicate calls/complete encoding. Errors, aborts, or capacity exhaustion return `false`.
+- `MmapQueryCache.cloneGeneration` — appends a new generation root sharing existing immutable indexes; no full-page copy.
+- `MmapQueryCache.acquire({generation, coverage})` — validates root metadata, matches exact identity, and returns `{value, release}` with a lazy graph and non-enumerable `mappedView`. Release is idempotent and does not invalidate the immutable view.
+- `MmapQueryCache.#migrate` / `#migrateAvl` — migrate both retained roots during open. Version-3 migration encodes cached rows in protected writable intervals; version-4 migration traverses each authentic AVL index once and reuses key/payload offsets beyond the maximum committed cursor. Both publish tagged partition roots with the header last; failed conversion preserves legacy reads and blocks new publication without a source rebuild.
+- `MmapQueryCache.dispose()` — detaches live weakly tracked views, then unmaps/closes once. Old views remain readable after disposal.
 
 **`daemon-query-engine.mjs` — `DaemonQueryEngine`**
 
@@ -155,93 +158,49 @@ Process topology: one daemon per canonical root, spawned detached and `unref`'d 
 
 **Overlay** (`store.mjs:48-53`) — an arbitrary object required to carry `generation` matching its filename, stored as `overlays/<generation>.json`.
 
-**Cache file layout** (capacity `C`, default 1 GiB):
+**Version-4 cache file layout** (fixed capacity, default 1 GiB):
 
-| Region | Offset | Size |
+| Region | Offset | Purpose |
 | --- | --- | --- |
-| File header | `0` | `HEADER_BYTES = 256` |
-| Scratch | `256` | `SCRATCH_BYTES = 4096` |
-| Page 1 (page B) | `4352` | `floor(C/2) + 2048 - 4352` |
-| Page 0 (page A) | `floor(C/2) + 2048` | `C - (floor(C/2) + 2048)` |
+| File header | 0, 256 bytes | Identity, serial, two committed root descriptors, header CRC |
+| Reserved scratch | 256, 4096 bytes | Retained header contract; excluded from appends |
+| Record regions | Aligned offsets from 4352 | Separate key/payload storage and lookup chunks/directories, plus immutable generation roots |
 
-**File header** (all little-endian `u32`, `mmap-query-cache.mjs:274-277`):
+Migrated files retain their original version-3 payload regions and the upper checksum guard as permanently excluded intervals. Root allocation state stores writable interval bounds, the active interval, and committed cursor across restart. Exhausted intervals are empty; they are not writable gaps.
+
+**File header** (little-endian `u32`):
 
 | Offset | Field |
 | --- | --- |
-| 0 | `FILE_MAGIC = 0x43474d4d` |
-| 4 | `VERSION` (2) |
-| 8 | capacity |
-| 12 | root fingerprint — first 4 LE bytes of `sha256(root)` |
-| 16 | active page index (0 or 1) |
-| 20 | global serial |
-| 24 | `HEADER_BYTES` echo |
-| 28 | `SCRATCH_BYTES` echo |
-| 32 + 16*i | page `i`: offset, length, checksum, serial |
+| 0 / 4 | `FILE_MAGIC = 0x43474d4d` / schema version 4 |
+| 8 / 12 | Fixed capacity / root fingerprint |
+| 16 / 20 | Active root descriptor (0 or 1) / global serial |
+| 24 / 28 | Header size 256 / reserved scratch size 4096 |
+| 32 + 16*i | Root descriptor `i`: offset, record length, payload CRC, serial |
 | 252 | `crc32(header[0..252])` |
 
-Page capacity is *not* stored — it is recomputed from `#emptyHeader()` and the stored offset is required to match it exactly (`:269`).
+**Record header — 16 bytes:** `type`, payload byte length, payload CRC32, reserved zero. Record allocations are 8-byte aligned. Type codes are key=1, symbol=2, edge=3, unresolved=4, legacy AVL node=5, legacy AVL root=6, partition root=7, directory=8, lookup chunk=9. Numeric payload fields are little-endian; strings carry a length followed by UTF-8 bytes.
 
-**Page header** (64 bytes, `:60-66`):
-
-| Offset | Field |
+| Payload | Stored data |
 | --- | --- |
-| 0 | `PAGE_MAGIC = 0x43515047` |
-| 4 | `VERSION` |
-| 8 | string region base (`PAGE_HEADER_BYTES = 64`) |
-| 12 | string region byte length |
-| 16 / 20 / 24 | symbols offset / count / record width (40) |
-| 28 / 32 / 36 | edges offset / count / record width (16) |
-| 40 / 44 | name index offset / file index offset |
-| 48 / 52 | incoming edge index offset / outgoing edge index offset |
-| 56 / 60 | generation string offset / coverage string offset |
+| Key | Composite byte key: escaped, zero-terminated UTF-8 components and big-endian numeric components |
+| Symbol | Sequence, occurrence, line, ordinal, exported; ID, file, name, kind, qualified path, signature |
+| Edge | Sequence, from/to symbol occurrences, group occurrence, line, call; from/to IDs |
+| Unresolved | Sequence, kind, group occurrence, line; from/to IDs and reason |
+| Legacy AVL node | Key/value offsets, left/right offsets, height, subtree count (24 bytes); retained reader only |
+| Directory | Branch depth, hint-key offset, total live subtree entry count, reserved zero, then 256 child offsets (1040-byte payload) |
+| Lookup chunk | Count, reserved zero, 64 unsorted key/value offset pairs; unused pairs zero (520-byte payload). The reserved word temporarily links writer-owned cold staging chunks and is zeroed before CRC/commit. |
+| Root | Six index roots, next symbol occurrence, unresolved presence, ordering mode, allocation state, raw count/original boundary; generation and coverage; tag 6 or 7 identifies representation |
 
-**String region** — starts at page offset 64, with the first `STRING_PREFIX_BYTES = 64` reserved (interning begins at 64), each entry NUL-terminated, fully deduplicated by value.
+Five partitioned indexes select ID, name, file, incoming endpoint, and outgoing endpoint. Incoming/outgoing entries share one edge payload. Unresolved occurrences use a primary `(kind, from, to, line, occurrence)` index. Directory hints skip common key bytes; selecting a child strictly increases traversal depth. The 65th chunk entry splits only that local set; deletions leave neighboring records unchanged and empty children become zero. There is no automatic merging or compaction. Cold/migrated unresolved kind 2 preserves original sequence; the first delta captures the original raw boundary. Later deltas change current raw counts without reclassifying untouched cold missing rows.
 
-**Symbol record — exactly 40 bytes** (`:73-77` write, `:120-125` read):
+**Generation and atomicity model.**
 
-| Offset | Type | Field |
-| --- | --- | --- |
-| 0 | u32 | `id` (string offset) |
-| 4 | u32 | `file` (string offset) |
-| 8 | u32 | `name` (string offset) |
-| 12 | u32 | `kind` (string offset) |
-| 16 | i32 | `line` |
-| 20 | u32 | `qualifiedPath` (string offset, `''` when absent) |
-| 24 | u32 | `signature` (string offset, `''` when absent) |
-| 28 | i32 | `ordinal` (0 when absent) |
-| 32 | u32 | `exported` (0/1, decoded as `Boolean`) |
-| 36 | — | end of record at 40; bytes 36–39 are not written or read |
-
-**Edge record — exactly 16 bytes, fully occupied** (`:80-82` write, `:130` read):
-
-| Offset | Type | Field |
-| --- | --- | --- |
-| 0 | u32 | `from` — symbol **index**, `0xffffffff` if unresolvable |
-| 4 | u32 | `to` — symbol **index**, `0xffffffff` if unresolvable |
-| 8 | i32 | `line` |
-| 12 | u32 | `call` (0/1, decoded as `Boolean`) |
-
-Decoded edges expose `from`/`to` as symbol **id strings**, not indexes — `edge()` decodes each endpoint symbol to read its id.
-
-**Index entries — 16 bytes each** (`INDEX_BYTES = 16`), written as a `u32` key at +0 and a `u32` payload at +4; bytes 8–15 are unwritten padding. Five indexes, in file order, with offsets chained by arithmetic from the end of the previous section (`:51-56`):
-
-| Index | Key | Payload | Entry count |
-| --- | --- | --- | --- |
-| name | `name` string offset | symbol index | `symbols.length` |
-| file | `file` string offset | symbol index | `symbols.length` |
-| incoming | `to` symbol index | edge index | `edges.length` |
-| outgoing | `from` symbol index | edge index | `edges.length` |
-| id | `id` string offset | symbol index | `symbols.length` |
-
-Sort order: string-keyed indexes by `key.localeCompare` with the original array index as tiebreak; numeric-keyed indexes by key then index. Total index bytes are therefore `3 * symbols.length * 16 + 2 * edges.length * 16`.
-
-**Page footer — 16 bytes** (`:91`): `FOOTER_MAGIC = 0x58444951` at +0, id-index offset at +4, symbol count at +8; bytes 12–15 unwritten. The footer exists because the page header (fixed at 64 bytes with fields through offset 60) has no room left for the id-index offset; `#idIndexOffset()` treats a wrong magic as "no id index".
-
-**Generation and atomicity model.** Two independent atomicity layers:
-
-- *Store level:* every file is written to a pid-and-random-suffixed temp path and `rename`d over the target, so a reader of `CURRENT` or of a generation file never sees a torn write. Publishing writes the generation file **before** `CURRENT`, so `CURRENT` never names a file that does not exist; the reverse ordering is what `readGeneration`'s repair path (`store.mjs:65-71`) exists to handle for pre-existing damage.
-- *Cache level:* a strict double-buffer. `publish` only ever writes the non-active page, guarded by that page's lease count. The page's CRC (`#pageChecksum`, covering the page bytes plus a 2048-byte backwards guard for the upper page) and its `length` are committed in the same header write that flips `active`, and that header write is itself CRC-covered and rolled back to the prior header bytes if its `msync` fails. Readers therefore see either the previous page or the new one, never a mixture — `acquire` verifies CRC, magic, `VERSION`, generation, and coverage before handing out a lease, and tries the inactive page as a second chance.
-- *Freshness:* identity, not recency. A page is valid only for the exact `(generation, coverage)` pair it was written with, so an out-of-date page can never be mistaken for a current one. `consistency: 'latest'` bypasses the cache entirely.
+- *Store level:* atomic temp-file rename publishes the manifest before `CURRENT`. This persisted manifest work is separate from bounded cache publication.
+- *Cache level:* changed payloads, lookup chunks and prefix paths append without modifying committed records. Transaction-owned lookup pages remain mutable until temporary cold links clear and their CRCs finalize. This includes unreachable staging chunks left by cold partitioning; committed chunk reserved words remain zero. Appended ranges flush before root descriptors and the CRC-protected fixed header commit. Header flush failure restores prior header bytes; failed tail records remain unreachable and are ignored on reopen.
+- *Pinned reads:* a view captures immutable roots. Later appends, descriptor replacement, engine eviction, and lease release do not change its rows. Before unmapping, disposal detaches still-live views. No automatic compaction reclaims committed records.
+- *Freshness:* exact `(generation, coverage)` identity. The header retains two discoverable roots; older acquired roots remain valid through their retained view. `consistency: 'latest'` retains its existing fallback routing.
+- *Migration:* open-time conversion preserves both valid version-3 pages or genuine AVL version-4 roots without rebuilding from source. Protected legacy bytes and immutable offsets remain intact if conversion cannot fit or fails before header commit; their readers remain available, and later edits do not trigger a full migration.
 
 **Wire messages** (newline-delimited JSON):
 
@@ -252,7 +211,7 @@ Sort order: string-keyed indexes by `key.localeCompare` with the original array 
 
 **`pinQuery` result:** `{metadata: {revision, freshness, coverage, validatedGeneration}, graph, rows}`. On the mapped path `revision` is always `null` and `freshness` always `'validated'`.
 
-**Graph shape** (`MappedQueryView.graph`): `{generation, edgeCoverage, files: string[], symbols: Symbol[], edges: Edge[]}`, where `files` is the deduplicated sorted set of symbol file paths.
+**Graph shape** (`ImmutableQueryView.graph`): `{generation, edgeCoverage, files: string[], symbols: Symbol[], edges: Edge[], unresolvedEdges?: UnresolvedEdge[]}`, where `files` is the deduplicated sorted set of symbol file paths.
 
 **Generation internals:** `internalPartitions` maps each source file to the binary internal-partition id published with that generation.
 
@@ -266,7 +225,7 @@ Sort order: string-keyed indexes by `key.localeCompare` with the original array 
 
 **Actors:** An MCP tool or CLI invocation acting through `streamQuery`/`QueryDaemonClient`; the `QueryDaemon`; the `DaemonQueryEngine`; the `MmapQueryCache`.
 
-**Preconditions:** `<root>/.codegraph/CURRENT` exists and names a generation. `query-view-cache.bin` holds a page for that generation with matching coverage, whose CRC and `VERSION` validate. The native mmap adapter loaded. A daemon for the canonical root is running, or can be started.
+**Preconditions:** `<root>/.codegraph/CURRENT` exists and names a generation. `query-view-cache.bin` holds a root for that generation with matching coverage, whose metadata and record CRCs validate. The native mmap adapter loaded. A daemon for the canonical root is running, or can be started.
 
 **Postconditions:** The caller holds the matching rows. No lease is outstanding. The cache file is unmodified.
 
@@ -277,8 +236,8 @@ Sort order: string-keyed indexes by `key.localeCompare` with the original array 
 4. `QueryDaemon.#accept`'s line handler parses the JSON, confirms `op` is supported and `query` is a plain object, and dispatches `#run`.
 5. `#run` registers an `AbortController` under `<socketUUID>:<id>` and awaits `engine.queryBatch`.
 6. `DaemonQueryEngine.pinQuery` reads `CURRENT`, derives coverage `calls` for a `symbols` request, and calls `cache.acquire({generation, coverage})`.
-7. `acquire` validates the active page's length, CRC, page magic, `VERSION`, generation, and coverage; increments its lease; returns `{value, release}`.
-8. `#queryMapped` calls `view.matchingSymbols(request)`, which binary-searches the name index (offset 40) and decodes only the matching 40-byte symbol records.
+7. `acquire` validates the active root descriptor, payload CRC, schema, allocator bounds, generation, and coverage; increments its lease; returns `{value, release}`.
+8. `#queryMapped` calls `view.matchingSymbols(request)`, which follows the name index's byte-prefix hints, filters matching chunk entries, validates each traversed record, and decodes requested symbol rows.
 9. The row limit is applied and the rows are returned; `pinQuery` releases the lease in its `finally`.
 10. `#run` writes `{id, rows, done: true, cancelled: false}`.
 11. The client's line handler calls `pending.setRows` then `pending.finish`, resolving `queryBatch`; `query` yields each row.
@@ -287,12 +246,13 @@ Sort order: string-keyed indexes by `key.localeCompare` with the original array 
 **Alternate Flows:**
 - *No live daemon.* `client.connect()` rejects; `connectQueryDaemon` catches and calls `connectAfterStart`, which spawns a detached daemon (deduplicated per socket path), polls until it accepts a connection, then connects. The postcondition is unchanged.
 - *Coverage miss on a `symbols` query.* `acquire` on `calls` returns `null`; `pinQuery` immediately retries with coverage `complete` (`daemon-query-engine.mjs:50`) and proceeds from step 8.
-- *Id-selected query.* With `request.id`, `matchingSymbols` uses the footer-located id index instead of the name/file indexes and post-filters on name/file.
+- *Id-selected query.* With `request.id`, `matchingSymbols` uses the ID lookup prefix instead of the name/file prefixes and post-filters on name/file.
 - *Streaming op.* A caller sending `op: 'query'` gets one `{id, row}` line per row plus a terminal `{id, done}`, with backpressure handled by `await once(socket, 'drain')`.
 
 **Exceptions:**
 - *`CURRENT` missing or unreadable.* `#currentGeneration()` returns `null`; `pinQuery` routes to `#pinFallback` (see UC-2).
-- *Page invalid, absent, or leased-out generation mismatch.* `acquire` returns `null` (or throws and is swallowed by the `try {}` at `:49-51`); `#pinFallback` answers instead.
+- *Root invalid, absent, or generation mismatch.* `acquire` returns `null` (or throws and is swallowed by the `try {}` at `:49-51`); `#pinFallback` answers instead.
+- *Corrupt record during a mapped lookup.* Record validation throws; the lease releases in `finally` and the daemon reports the query error.
 - *Unknown `type`.* `#queryMapped` throws `unknown query type: <type>`; `#run` catches it and writes `{id, error, done: true}`; the client rejects `queryBatch` with that message.
 - *Malformed request line.* Unparseable JSON gets `{error: 'invalid JSON', done: true}`; a wrong-shaped object gets `{id, error: 'invalid request', done: true}`.
 - *Connection dies mid-request.* The daemon's socket-close handler aborts the request's controller; the client's close handler fails every pending record bound to that socket with `CodeGraph daemon connection closed`. `queryBatch` retries once when `startDaemon` is available and the message matches `/connection|EPIPE|ECONN/`.
@@ -330,47 +290,39 @@ Sort order: string-keyed indexes by `key.localeCompare` with the original array 
 - *`engineFactory` rejects.* The rejection propagates out of `pinQuery` to `#run`, which writes `{id, error, done: true}`. The memoized `this.fallback` retains the rejected promise, so subsequent fallback queries fail the same way until the engine is recreated; `dispose()` guards against it with `.catch(() => null)`.
 - *No generation exists at all.* The fallback's own read path raises (`GraphStore.readGeneration` throws `no codegraph generation; run build`), which reaches the client as that error message.
 
-### 3. Publish a new generation and its memory-mapped query page
+### 3. Publish a new generation and its immutable query root
 
-**Goal:** The indexer makes a freshly built graph queryable without interrupting in-flight readers.
+**Goal:** Make a validated change queryable while existing readers retain their generation.
 
-**Stakeholders:** Readers mid-query (must not see a torn or mixed page); the next reader (must get the new generation).
+**Stakeholders:** Readers holding old roots; callers awaiting the new validated graph.
 
-**Actors:** The indexer/resolver ([parsing-and-resolution.md](parsing-and-resolution.md)) as `GraphStore` caller; `GraphStore`; `MmapQueryCache`; the `mmap_bridge` native module.
+**Actors:** The indexer/resolver, `GraphStore`, `MmapQueryCache`, and the native mapping adapter.
 
-**Preconditions:** `<root>/.codegraph` is writable. The graph view to encode is in hand. For the cache write, the mapping is live and `capacity >= HEADER_BYTES + SCRATCH_BYTES + 2`.
+**Preconditions:** The store is writable and the mapping is live. Cold publication has a graph; a delta has the validated parent root, changed partition/tombstone, and exact affected groups.
 
-**Postconditions:** `generations/<generation>.json` exists and `CURRENT` names it. On a `true` return, the cache header's active page holds the new generation with a valid CRC and an incremented serial, and the previously active page is intact as the other buffer.
+**Postconditions:** The manifest exists and `CURRENT` names it. On cache success, the header names the new immutable generation/coverage root and earlier acquired roots remain readable.
 
 **Basic Course of Events:**
-1. The caller writes each partition via `writePartition`, which content-addresses it and skips the write when `partitions/<id>.json` already exists.
-2. The caller calls `store.publish(manifest)`.
-3. `publish` mints `<base36 time>-<digest12>-<random12>`, stamps `createdAt`, and atomically writes `generations/<generation>.json`.
-4. `publish` atomically overwrites `CURRENT` with the generation id and returns the completed manifest.
-5. The caller calls `cache.publish({generation, coverage, view})`.
-6. `#readHeader` validates the existing header, or `#emptyHeader()` supplies the virgin two-page geometry.
-7. The target page is chosen: page 0 when `serial === 0`, otherwise `1 - active`.
-8. If that page's lease count is above zero, `publish` returns `false` and the generation stays queryable only through the fallback.
-9. `encodePage` builds the page bytes; if they exceed the target page's capacity, `publish` returns `false`.
-10. The prior 256-byte header is copied aside.
-11. The payload is copied into the page in `SCRATCH_BYTES` chunks, each chunk staged at the scratch offset and then copied to its final position.
-12. `adapter.flush` `msync`s the page range (the bridge widens it to page boundaries).
-13. The descriptor's `length`, `checksum` (`#pageChecksum`) and `serial` are set, the global serial is incremented, and `active` is flipped to the target.
-14. `#writeHeader` writes the 256-byte header with its trailing CRC, and `adapter.flush` `msync`s it.
-15. `publish` returns `true`. The next `acquire` for that `(generation, coverage)` succeeds.
+1. The caller persists changed content-addressed partitions and publishes the generation manifest through `GraphStore`.
+2. The caller passes that generation and its cold graph or bounded delta inputs to `cache.publish`.
+3. The cache validates the header, committed allocator, and delta parent generation.
+4. Cold publication fills six unsorted chunk chains directly, then partitions overflowing chains into prefix directories without incremental insertion; delta publication reuses unchanged records and appends changed payloads and copied lookup pages.
+5. The cache appends a root carrying generation, coverage, and committed allocation metadata.
+6. The adapter flushes appended ranges, then the cache updates and flushes the fixed header.
+7. Acquisition for the new generation/coverage succeeds. Existing pins continue reading unchanged records.
 
 **Alternate Flows:**
-- *Virgin file.* `#readHeader` returns `null`, `#emptyHeader()` is used, page 0 is the target, and `serial` becomes 1.
-- *Short mapping at open.* The constructor unmaps, `resize`s the file to capacity, and remaps once before any publish happens.
-- *Both `refs`/`graph` and call-only coverage wanted.* Separate `publish` calls with different `coverage` strings occupy the two pages; `acquire` matches on coverage, and a `symbols` request accepts either via the `complete` retry.
+- *Calls and complete coverage.* Two root publications share the encoded graph or delta index work through one publication view.
+- *Unchanged graph under a new generation.* `cloneGeneration` appends only root metadata.
+- *Valid version-3 cache.* Startup migrates both pages before committing the version-4 header. A filled legacy lower interval is skipped without overwriting its payload or checksum guard.
+- *Genuine AVL version-4 cache.* Startup migrates both retained roots to tagged partition roots, reusing key/payload offsets; the numerical version remains 4.
+- *Short mapping.* Opening resizes and remaps once before publication.
 
 **Exceptions:**
-- *Target page leased.* Step 8 returns `false`; nothing is written. Retrying after the reader releases succeeds.
-- *Payload too large for the page.* Step 9 returns `false`; the existing page remains valid and active.
-- *Abort signal fires.* Checked before encoding (`:209`), after encoding (`:215`), and after the page flush (`:222`); an abort returns `false` before `active` is flipped, so the old page stays authoritative.
-- *Header `msync` fails.* The saved prior header bytes are written back and re-flushed (best-effort), and `false` is returned — the page data may be new but the header still points at the old active page, so readers keep seeing the previous generation.
-- *Any thrown error inside `publish`.* Caught and turned into `false` (`:227`); no exception escapes into the indexer.
-- *`overlay.generation` mismatch on `writeOverlay`.* Throws `overlay generation mismatch` before writing.
+- *Capacity exhausted, aborted publication, or record flush failure.* Publication returns `false`; prior committed roots remain queryable and tail writes are unreachable.
+- *Header flush failure.* Prior header bytes are restored and best-effort flushed; publication returns `false`.
+- *Stale parent or invalid committed metadata.* Publication returns `false` rather than replacing retained records.
+- *Insufficient migration space or migration failure.* Protected version-3 payloads or genuine AVL version-4 roots remain readable; publication returns `false` without attempting a repository-sized conversion during an edit.
 
 ### 4. Bring up a query daemon for a repository root
 
@@ -413,13 +365,15 @@ Sort order: string-keyed indexes by `key.localeCompare` with the original array 
 
 Node's built-in test runner (`npm test` → `node --test`), tests under `codegraph/test/`. The end-to-end benchmark runs separately with `npm run performance`. Directly covering this subsystem:
 
-- `test/mmap-query-cache.test.mjs` — page encode/decode, header and CRC validation, double-buffered publish, leases.
+- `test/mmap-query-cache.test.mjs` — authenticated version-3 and genuine AVL version-4 fixtures; partitioned publication and bounded writes; chunk splits/hints; exact ordering/duplicates/unresolved transitions; live pins; record/header integrity; flush rollback; fixed capacity; lossless startup migration, protected intervals, and native reopen.
 - `test/daemon-query-engine.test.mjs` — mapped-vs-fallback routing, coverage retry, query types, limits, `resolved` projection.
 - `test/query-daemon.test.mjs` — socket path derivation, startup/deduplication, the NDJSON protocol, cancel, invalid requests.
 - `test/query-client-import.test.mjs` — the `query-client.mjs` entry point imports cleanly.
 - `test/boundaries.test.mjs` — cross-module boundary checks.
 
 `GraphStore` (`store.mjs`) has no dedicated test file; it is exercised indirectly through `test/engine.test.mjs` and the daemon/engine tests. The native bridge has no C-level test suite — it is covered only through `mmap-query-cache.test.mjs` when a build is present, and its absence is the fallback path those tests also cover.
+
+The [direct cold-build report](../../profiles/direct-cold-build-2026-10-10/REPORT.md) records matched real 877-file cold/warm profiles, exact output and bounded-work receipts, and staging-space costs. Its independent `reproduce/direct-build-proof.mjs` checks zero cold incremental/public-key calls, 129/257-entry chains, single-chunk offset reuse, and zero reserved links on all appended chunks. The [earlier publication report](../../profiles/publication-2026-10-10/REPORT.md) retains the prior AVL measurements. Both separate initial indexing, first-query cache construction and warmed edits; lifecycle heap sampling does not measure warm allocation volume.
 
 ## UI/UX
 
@@ -434,7 +388,7 @@ No UI/UX required — this subsystem exposes no interface to a person. Its consu
 
 ## Diagrams
 
-The component and data-flow diagram is inline under Architecture; the file, header, page, record, and index layouts are tabulated under Models. No further diagram is maintained.
+The component and data-flow diagram is inline under Architecture; the file, header, record, and root layouts are tabulated under Models. No further diagram is maintained.
 
 ## References
 

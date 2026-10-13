@@ -2,7 +2,6 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { availableParallelism } from 'node:os'
 import { Worker } from 'node:worker_threads'
-import { parseFile } from './incremental-resolver.mjs'
 import { deriveWorkerProfile } from './worker-profile.mjs'
 
 export { deriveWorkerProfile }
@@ -55,6 +54,8 @@ export class ParserApartmentPool {
     this.readFileSync = options.readFileSync ?? fs.readFileSync; this.realpathSync = options.realpathSync ?? fs.realpathSync
     this.workerFactory = options.workerFactory ?? ((url, workerOptions) => new Worker(url, workerOptions))
     this.baseExecArgv = options.baseExecArgv ?? process.execArgv
+    this.workerURL = options.workerURL ?? new URL('./incremental-parser-worker.mjs', import.meta.url)
+    this.parseSource = options.parseSource
     this.latestRevisionByFile = new Map(); this.affinityByFile = new Map(); this.nextRequestId = 1; this.closed = false
     this.workers = []
     this.budgeted = options.workerFactory === undefined
@@ -71,7 +72,7 @@ export class ParserApartmentPool {
   }
   #newApartment(index) { const apartment = { index, worker: null, queue: [], active: null, replacing: null, terminated: false, requiresRequestId: false }; this.#installWorker(apartment); return apartment }
   #installWorker(apartment) {
-    const worker = this.workerFactory(new URL('./incremental-parser-worker.mjs', import.meta.url), { workerData: { root: this.root }, execArgv: deriveWorkerProfile(this.baseExecArgv, apartment.index).execArgv }); apartment.worker = worker; apartment.terminated = false
+    const worker = this.workerFactory(this.workerURL, { workerData: { root: this.root }, execArgv: deriveWorkerProfile(this.baseExecArgv, apartment.index).execArgv }); apartment.worker = worker; apartment.terminated = false
     worker.on('message', (message) => { if (apartment.worker === worker) this.#onMessage(apartment, message) })
     worker.on('error', (error) => { if (apartment.worker === worker) this.#replaceAfterFailure(apartment, error) })
     worker.on('exit', (code) => { if (!this.closed && apartment.worker === worker) this.#replaceAfterFailure(apartment, new Error(`parser worker exited with code ${code}`)) })
@@ -89,6 +90,7 @@ export class ParserApartmentPool {
     this.latestRevisionByFile.set(identity, revision)
     if (request.mode === 'structural' && typeof request.source !== 'string') return Promise.reject(new TypeError('structural parser source must be supplied'))
     if (this.workerCount === 0) {
+      if (request.mode === 'structural' && this.parseSource) return Promise.resolve(this.parseSource({ file: normalizedPath, source: request.source, compilerOptions: request.compilerOptions }))
       if (request.mode === 'structural') return import('./internal-graph.mjs').then(({ buildInternalGraph }) => buildInternalGraph({ file: normalizedPath, source: request.source, compilerOptions: request.compilerOptions }))
       try {
         const lexicalTarget = path.resolve(this.root, normalizedPath); let target = lexicalTarget
@@ -97,7 +99,8 @@ export class ParserApartmentPool {
         try { realRoot = this.realpathSync(this.root) } catch (error) { if (error?.code !== 'ENOENT') throw error }
         const relative = path.relative(realRoot, target)
         if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw new Error(`parser path escapes root through symbolic link: ${normalizedPath}`)
-        return Promise.resolve(parseFile(normalizedPath, this.readFileSync(target, 'utf8'), undefined, { includeSource: false }))
+        const source = this.readFileSync(target, 'utf8')
+        return import('./incremental-resolver.mjs').then(({ parseFile }) => parseFile(normalizedPath, source, undefined, { includeSource: false }))
       } catch (error) { return Promise.reject(error) }
     }
     this.#ensureWorkers()

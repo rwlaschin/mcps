@@ -6,7 +6,7 @@ import os from 'node:os'
 import path from 'node:path'
 
 const projectRoot = path.resolve(import.meta.dirname, '..')
-const failureFixtures = path.resolve(import.meta.dirname, 'fixtures/go-language-analyzer')
+const failureFixtures = path.resolve(import.meta.dirname, '../test/fixtures/go-language-analyzer')
 const loadGoAnalyzer = () => import('../go-language-analyzer.mjs')
 const oneSource = [['main.go', 'package main\nfunc main() {}\n']]
 const manySources = [['main.go', 'package main\nfunc main() { helper() }\n'], ['helper.go', 'package main\nfunc helper() {}\n'], ['value.go', 'package main\nconst value = 1\n']]
@@ -108,7 +108,8 @@ test('error guessing: mismatched grammar identity fails before publication and p
 
 test('architecture contract: Go runtime has no network process toolchain native helper download or compilation path', () => {
   const source = fs.readFileSync(path.join(projectRoot, 'go-language-analyzer.mjs'), 'utf8')
-  assert.deepEqual({ network: /\bfetch\s*\(|https?\.|node:(?:http|https|net|tls|dgram)/.test(source), process: /node:child_process|\b(?:spawn|exec|fork)\s*\(/.test(source), toolchain: /\bgo\s+(?:run|build|install|env|list)\b/.test(source), native: /node-gyp|\.node['"]|native helper/i.test(source), download: /download|curl|wget|npm install/i.test(source), compile: /compileStreaming|WebAssembly\.compile|build.*wasm/i.test(source) }, { network: false, process: false, toolchain: false, native: false, download: false, compile: false })
+  // RegExp.exec is local parsing; child-process imports and bare exec remain forbidden.
+  assert.deepEqual({ network: /\bfetch\s*\(|https?\.|node:(?:http|https|net|tls|dgram)/.test(source), process: /node:child_process|\b(?:spawn|fork)\s*\(|(?<![\w.])exec\s*\(/.test(source), toolchain: /\bgo\s+(?:run|build|install|env|list)\b/.test(source), native: /node-gyp|\.node['"]|native helper/i.test(source), download: /download|curl|wget|npm install/i.test(source), compile: /compileStreaming|WebAssembly\.compile|build.*wasm/i.test(source) }, { network: false, process: false, toolchain: false, native: false, download: false, compile: false })
 })
 
 test('error guessing: parsing performs zero network calls', async () => {

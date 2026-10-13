@@ -20,6 +20,11 @@ export function createSourcePolicy(root, metadata = {}) {
   const extensions = metadata.analyzers?.flatMap((analyzer) => analyzer.extensions) ?? metadata.extensions ?? []
   const controlFiles = metadata.analyzers?.flatMap((analyzer) => analyzer.controlFiles) ?? metadata.controlFiles ?? []
   const sourceExtensions = new Set(extensions)
+  const sourceMatchers = new Map()
+  for (const analyzer of metadata.analyzers ?? []) if (analyzer.sourceMembership) {
+    const matcher = analyzer.createSourceMatcher(root)
+    for (const extension of analyzer.extensions) sourceMatchers.set(extension, matcher)
+  }
   const controls = new Set([...CORE_CONTROL_FILES, ...controlFiles])
   const symlinkDirs = new Set()
   const normalize = (file) => posix(path.relative(root, path.resolve(file)))
@@ -80,7 +85,12 @@ export function createSourcePolicy(root, metadata = {}) {
     }
     return ignored
   }
-  const sourceCandidateRelative = (rel) => configured(rel) && sourceExtensions.has(path.extname(rel).toLowerCase())
+  const sourceCandidateRelative = (rel) => {
+    const extension = path.extname(rel).toLowerCase()
+    const matcher = sourceMatchers.get(extension)
+    return sourceExtensions.has(extension) && (matcher ? matcher.isSourceRelative(rel) : configured(rel))
+  }
+  const acceptsSource = (rel, source) => sourceMatchers.get(path.extname(rel).toLowerCase())?.acceptsSource?.(rel, source) ?? true
   const sourceRelative = (rel) => !ignoredRelative(rel) && sourceCandidateRelative(rel)
   const controlRelative = (rel) => controls.has(rel)
 
@@ -96,7 +106,7 @@ export function createSourcePolicy(root, metadata = {}) {
         if (ignoredRelative(rel)) continue
         if (entry.isSymbolicLink()) { if (entry.isDirectory() || safeDirectory(absolute)) symlinkDirs.add(rel); continue }
         if (entry.isDirectory()) visit(absolute, rel)
-        else if (entry.isFile() && !controlRelative(rel) && sourceCandidateRelative(rel)) found.push(rel)
+        else if (entry.isFile() && !controlRelative(rel) && sourceCandidateRelative(rel) && acceptsSource(rel)) found.push(rel)
       }
     }
     if (fs.existsSync(root)) visit(root)
@@ -116,5 +126,5 @@ export function createSourcePolicy(root, metadata = {}) {
     }
     return true
   }
-  return { root, scan, acceptWatchPath, isSourceRelative: sourceRelative, isControlRelative: controlRelative, isIgnoredRelative: ignoredRelative, normalize }
+  return { root, scan, acceptsSource, acceptWatchPath, isSourceRelative: sourceRelative, isControlRelative: controlRelative, isIgnoredRelative: ignoredRelative, normalize }
 }

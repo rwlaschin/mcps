@@ -1,5 +1,5 @@
 ---
-modified: 2026-10-08
+modified: 2026-10-13
 dependencies:
   - parsing-and-resolution.md
   - storage-and-query.md
@@ -37,14 +37,7 @@ policy, and before trusting `codegraph_dead` output. For how symbols and edges a
   goes through `queryEngineFor`/`runtimeFor` in-process. `mcp.mjs:326-329` nonetheless exits the
   server with status 1 if `cli.mjs` is missing, so the server has a hard startup dependency on a
   file it never executes.
-- **Watched-file set is hardcoded.** `SOURCE_EXTENSIONS` (`source-policy.mjs:8`) is a closed set:
-  `.ts .tsx .js .jsx .mts .cts .mjs .cjs`. There is no registration hook, option, or env var to
-  extend it. Every watch path in both runtimes funnels through `policy.acceptWatchPath`
-  (`mcp-runtime.mjs:77`, `mcp-runtime.mjs:95`, `mcp.mjs:156`, `mcp.mjs:174`), so `.sql`, `.prisma`,
-  `.json` (other than the control files below), `.vue`, `.svelte` and `.py` are never watched and
-  never indexed. Only `.codegraphignore`, `.gitignore`, `jsconfig.json`, `tsconfig.json`
-  (`source-policy.mjs:9`) are accepted as non-source paths, and a change to one forces a full
-  rebuild (`tool-engine.mjs:115`).
+- **Watch membership follows registered analyzers.** The default source policy recognizes TypeScript/JavaScript and Go. Language controls include `tsconfig.json`, `jsconfig.json`, `go.mod`, `go.work`, and `go.sum`, alongside ignore files. Control changes rebuild the generation; ordinary Go file edits validate only that file and repair affected cached relationships.
 - **Symlinked directories are silently excluded from watching.** `acceptWatchPath`
   (`source-policy.mjs:98-108`) walks every parent directory and returns `false` if any is a
   symlink, and returns `false` if `lstatSync` throws. Files under a symlinked directory can be
@@ -127,6 +120,8 @@ untrustworthy was the least likely to be seen (`cli.mjs:23-25`).
 
 `tool.mjs` is the unadorned engine harness the CLI shells out to for builds, and the process
 entry point for the query daemon and the line-oriented `serve` protocol.
+
+Go activates through the existing index, refresh, symbol, reference, dependency, caller, dead-export, and internals requests. A repository root containing `go.mod` or `go.work` supplies local Go package paths; `.go` qualified targets use the same file/name request shape. The packaged WASM runtime initializes only for Go work and needs no Go toolchain or runtime download. TypeScript/JavaScript remain compiler-resolved; Go returns conservative proven bindings with the exclusions described in [parsing-and-resolution.md](parsing-and-resolution.md).
 
 ## Architecture
 
@@ -319,9 +314,7 @@ that generation and cannot be combined with `'latest'`.
 **Watch event.** `{ type: 'add' | 'change' | 'unlink', path: <repo-relative posix> }`, optionally
 carrying `source` (`mcp-runtime.mjs:95`, `tool-engine.mjs:129`).
 
-**Watched file set.** `SOURCE_EXTENSIONS = { .ts, .tsx, .js, .jsx, .mts, .cts, .mjs, .cjs }`
-(`source-policy.mjs:8`) plus `CONTROL_FILES = [.codegraphignore, .gitignore, jsconfig.json,
-tsconfig.json]` (`source-policy.mjs:9`). Closed sets — no registration hook exists.
+**Watched file set.** Registered analyzer extensions cover TypeScript/JavaScript and `.go`. Controls are `.codegraphignore`, `.gitignore`, `jsconfig.json`, `tsconfig.json`, `go.mod`, `go.work`, and `go.sum`. Analyzer metadata supplies the extension/control ownership.
 
 **CLI index format** (`cli.mjs:51-70`): `graph.bin` is `[n, m, fwd.offsets(n+1),
 fwd.target(m), fwd.line(m), fwd.call(m), rev.offsets(n+1), rev.target(m), rev.line(m),
@@ -355,7 +348,7 @@ args }`, with `<field>Before/After/Delta` for `rss heapUsed heapTotal external a
   the change being complete.
 - **Actors.** An MCP client (coding agent) calling `codegraph_refs`.
 - **Preconditions.** The server process is running; `root` resolves to an existing directory
-  (`mcp-server.mjs:111-124`); the repository contains at least one file matching `SOURCE_EXTENSIONS`.
+  (`mcp-server.mjs:111-124`); the repository contains at least one source file owned by a registered analyzer.
 - **Basic Course of Events.**
   1. Client sends `tools/call` with `{ name: 'codegraph_refs', arguments: { symbol, root } }`.
   2. `handle` registers an `AbortController` under the request id (`mcp-server.mjs:319`).
@@ -588,7 +581,7 @@ args }`, with `<field>Before/After/Delta` for `rss heapUsed heapTotal external a
 - **Preconditions.** At least one query has been served for `root`, so `queryEngineFor` installed
   a watcher and the successful call started background runtime hydration
   (`mcp-server.mjs:196-217`, `321-331`). The changed path satisfies `policy.acceptWatchPath`, i.e. its
-  extension is in `SOURCE_EXTENSIONS` or it is one of the four control files, it is not ignored,
+  extension is registered or it is a registered control file, it is not ignored,
   and no ancestor directory is a symlink (`source-policy.mjs:74`, `98-108`).
 - **Basic Course of Events.**
   1. A developer writes a `.ts` file inside `root`.

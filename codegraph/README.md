@@ -10,8 +10,15 @@ answers about references, callers, dependencies, and symbols. Agents spend their
 changes instead of reconstructing relationships.
 
 Its plugin system provides shared AI code search, a code graph, and a dependency visualizer across
-language-specific parsers. The current TypeScript and JavaScript plugin resolves declarations
-through imports, aliases, and files while a resident daemon updates the graph incrementally.
+language-specific parsers. TypeScript and JavaScript use compiler-resolved declarations; Go uses
+proven package, import, and declared receiver bindings. A resident daemon updates the graph incrementally.
+
+## Supported languages
+
+- JavaScript
+- TypeScript
+- React through JSX and TSX source files
+- Go
 
 ## MCP Setup
 
@@ -27,6 +34,19 @@ CodeGraph is not distributed through npm. Point your MCP client at `mcp.mjs` in 
   }
 }
 ```
+
+## Go repositories
+
+Use the same MCP tools and CLI commands with the Go repository as `root`. `codegraph_index` indexes
+Go-only and mixed Go/TypeScript repositories; targets such as `lib/run.go:Run` use the existing
+file-qualified syntax. Local module imports follow `go.mod` and `go.work`. The packaged WASM parser
+requires no Go compiler or runtime download.
+
+Go supplies symbols, proven references and calls, dependencies, and function control-flow metrics.
+One-file edits retain peer partitions and repair affected cached relationships. Resolution preserves
+shadowing and leaves ambiguous, dynamic/interface, promoted, and generic receiver bindings unresolved.
+Files with build constraints or cgo imports are excluded. Malformed syntax rejects the replacement
+generation. Go results do not claim compiler parity.
 
 ## Query Tools
 
@@ -180,7 +200,7 @@ graph without rescanning the repository or waiting for a full rebuild.
 
 | Capability | Result |
 | :--- | :--- |
-| Language plugins | TypeScript and JavaScript parsing today behind one graph, MCP interface, daemon, and visualizer |
+| Language plugins | TypeScript, JavaScript, React JSX/TSX, and Go behind one graph, MCP interface, daemon, and visualizer |
 | References and calls | Type-resolved incoming references, outgoing dependencies, and inverted call trees |
 | Code structure | Function-level control flow with cyclomatic complexity, branch count, and nesting depth |
 | Consistency | Published checker-validated generation snapshots with optional generation pinning |
@@ -262,6 +282,17 @@ Measured 2026-10-09 with Node 26.9.0 on AC power, compile cache enabled and thre
 | Cascade incremental update | 374.12 / 387.56 ms | 1 | 1 |
 | Full reindex | 5323.46 / 5579.53 ms | 877 | 877 |
 <!-- codegraph-performance:end -->
+
+### Go performance
+
+Measured 2026-10-13 on the Brain neuralnet project (`Brain/sslp-memory-test`): 102 Go files, 60,582 lines, 2.61 MB. Twenty body edits to `main.go` include durable validation; debounce is excluded. Node 26.9.0, parser budget three, compile cache disabled.
+
+| Execution | Cold indexing | Median edit | Maximum edit |
+| :--- | ---: | ---: | ---: |
+| Normal | 6.26 s | 65 ms | 149 ms |
+| CPU + heap profiling | 5.07 s | 48 ms | 69 ms |
+
+These are measured results, not guarantees. Each edit processed only the changed file. The 100 ms maximum target was not met: four of twenty normal edits exceeded 100 ms.
 
 ### Updating Performance Metrics
 

@@ -13,11 +13,10 @@ import './compile-cache.mjs'
 
 
 const direct = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)
-let CodeGraphEngine, SemanticCheckerWorker, McpProjectRuntime, DaemonQueryEngine, isFrameworkExport, qualifiedQuery, controlFileHashes, createSourcePolicy, fileContentHash, GraphStore, MmapQueryCache, prepareQueryViewCache, nativeMmapAdapter, createLanguageAnalyzers, createTypeScriptLanguageAnalyzer
+let CodeGraphEngine, McpProjectRuntime, DaemonQueryEngine, isFrameworkExport, qualifiedQuery, controlFileHashes, createSourcePolicy, fileContentHash, GraphStore, MmapQueryCache, prepareQueryViewCache, nativeMmapAdapter, createLanguageAnalyzers, defaultLanguageAnalyzers
 if (direct) await import('./mcp.mjs')
 else {
   ;({ CodeGraphEngine } = await import('./tool-engine.mjs'))
-  ;({ SemanticCheckerWorker } = await import('./semantic-checker-worker.mjs'))
   ;({ McpProjectRuntime } = await import('./mcp-runtime.mjs'))
   ;({ DaemonQueryEngine } = await import('./daemon-query-engine.mjs'))
   ;({ isFrameworkExport } = await import('./framework-exports.mjs'))
@@ -28,7 +27,7 @@ else {
   ;({ prepareQueryViewCache } = await import('./query-cache-schema.mjs'))
   ;({ nativeMmapAdapter } = await import('./native/mmap-adapter.mjs'))
   ;({ createLanguageAnalyzers } = await import('./language-analyzer.mjs'))
-  ;({ createTypeScriptLanguageAnalyzer } = await import('./typescript-language-analyzer.mjs'))
+  ;({ defaultLanguageAnalyzers } = await import('./language-semantic-worker.mjs'))
 }
 
 // Deliberately names no repository: hardcoding one made every description claim to be about
@@ -164,7 +163,7 @@ const resolveRoot = (a) => {
   if (!fs.existsSync(root) || !fs.statSync(root).isDirectory()) throw new Error(`"${root}" is not a valid directory — pass the repository root you are working in.`)
   return fs.realpathSync(root)
 }
-const analyzersFor = (root) => createLanguageAnalyzers(root, [createTypeScriptLanguageAnalyzer])
+const analyzersFor = (root) => createLanguageAnalyzers(root, defaultLanguageAnalyzers)
 const call = {}
 function descriptor(root, owner) {
   if (closed) throw new Error('CodeGraph service is closed')
@@ -216,7 +215,7 @@ async function activate(item, args = {}) {
   await deactivate()
   const engine = options.engineFactory ? await options.engineFactory(item.root, args) : new CodeGraphEngine(item.root, {
     queryCache: queryCacheFor(item.root), profile: args.profile,
-    validationWorkerFactory: () => new SemanticCheckerWorker({ structuralCount: workerBudget - 1 }),
+    semanticWorkerOptions: { structuralCount: workerBudget - 1 },
   })
   const runtime = new McpProjectRuntime(item.root, { engine, sharedWatcher: true })
   runtime.initialized = item.freshnessDone === true && !!engine.validatedGeneration
@@ -526,8 +525,11 @@ return {
   release(root, owner) { const item = roots.get(root); item?.owners.delete(owner); return cleanup() },
   status() {
     const checker = (heavy ?? retiringHeavy)?.runtime.engine.validationWorker
-    let observedWorkerCount = checker?.worker && checker.worker.threadId !== -1 ? 1 : 0
-    for (const apartment of checker?.parserPool?.workers ?? []) if (apartment.worker && apartment.worker.threadId !== -1) observedWorkerCount += 1
+    let observedWorkerCount = 0
+    for (const worker of checker?.workers?.values?.() ?? [checker]) {
+      if (worker?.worker?.threadId > 0) observedWorkerCount += 1
+      for (const apartment of (worker?.parserPool ?? worker?.pool)?.workers ?? []) if (apartment.worker?.threadId > 0) observedWorkerCount += 1
+    }
     return { servicePid: process.pid, workerBudget, observedWorkerCount, heavyRoot: heavy?.item.root ?? null, cacheOwners: [...roots.values()].filter(item => item.cache).length, roots: [...roots.values()].map(item => ({ root: item.root, watchers: item.watchRuntime?.watcher ? 1 : 0, activeQueries: item.reads, pendingHeavy: item.jobs.length, runtime: heavy?.item === item })), rssBytes: rss(), retentionHighWaterBytes, activeWork: !!running || !!closingHeavy }
   },
   async close() {

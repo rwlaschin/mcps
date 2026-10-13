@@ -18,13 +18,23 @@ const indexesFor = (partition) => {
   let indexes = partitionIndexes.get(partition)
   if (indexes) return indexes
   const bindings = new Map()
+  const membersByOwner = new Map()
   const stars = []
   for (const binding of partition.bindings ?? []) {
     if (binding.kind === 'star') stars.push(binding)
-    else if (!bindings.has(binding.name)) bindings.set(binding.name, binding)
+    else {
+      if (!bindings.has(binding.name)) bindings.set(binding.name, binding)
+      if (binding.kind === 'symbol' && binding.remote) {
+        const separator = binding.remote.indexOf('\0')
+        const classFacts = binding.remote.startsWith('static:')
+        const owner = classFacts ? binding.target : separator < 0 ? binding.remote : binding.remote.slice(0, separator)
+        if (!classFacts) bindings.set(`\0${binding.target}`, owner)
+        const facts = classFacts ? binding.remote.slice(7) : separator < 0 ? null : binding.remote.slice(separator + 1)
+        if (facts) for (const name of JSON.parse(facts)) membersByOwner.set(`static:${owner}\0${name}`, null)
+      }
+    }
   }
   const symbolsById = new Map()
-  const membersByOwner = new Map()
   for (const symbol of partition.symbols ?? []) {
     if (!symbolsById.has(symbol.id)) symbolsById.set(symbol.id, symbol)
     if (typeof symbol.qualifiedPath === 'string' && symbol.qualifiedPath !== '<module>') {
@@ -41,6 +51,24 @@ const indexesFor = (partition) => {
   return indexes
 }
 
+function receiverClass(name, declarations, symbolByName, seen, ts) {
+  seen.clear()
+  let instance = false
+  while (!seen.has(name)) {
+    seen.add(name)
+    const declaration = declarations.get(name)
+    if (declaration && ts.isClassDeclaration(declaration)) {
+      const rows = symbolByName.get(name)
+      return instance && rows?.length === 1 && rows[0].kind === 'class' ? rows[0] : null
+    }
+    const initializer = declaration?.initializer
+    if (initializer?.expression && initializer.kind === ts.SyntaxKind.NewExpression && ts.isIdentifier(initializer.expression)) { instance = true; name = initializer.expression.text }
+    else if (initializer && ts.isIdentifier(initializer)) name = initializer.text
+    else return null
+  }
+  return null
+}
+
 export function extractCachedBindings(sourceFile, symbols, ts, exportedIds = null, structuralCache = null) {
   const symbolByName = new Map()
   for (const symbol of symbols) if (symbol.qualifiedPath === '<module>') {
@@ -48,12 +76,30 @@ export function extractCachedBindings(sourceFile, symbols, ts, exportedIds = nul
     if (rows) rows.push(symbol)
     else symbolByName.set(symbol.name, [symbol])
   }
+  const declarations = new Map()
+  for (const statement of sourceFile.statements) {
+    if (ts.isClassDeclaration(statement) && statement.name) declarations.set(statement.name.text, statement)
+    else if (ts.isVariableStatement(statement)) for (const declaration of statement.declarationList.declarations) if (ts.isIdentifier(declaration.name)) declarations.set(declaration.name.text, declaration)
+  }
+  const receiverSeen = new Set()
   const direct = new Map()
   const bind = (local, name = local) => {
     const symbols = symbolByName.get(local)
     if (!symbols) return
     for (const symbol of symbols) exportedIds?.add(symbol.id)
-    direct.set(name, { kind: 'symbol', name, target: symbols[0].id })
+    const binding = { kind: 'symbol', name, target: symbols[0].id }
+    const receiver = symbols[0].kind === 'class' ? symbols[0] : symbols[0].kind === 'variable' ? receiverClass(local, declarations, symbolByName, receiverSeen, ts) : null
+    if (receiver) {
+      const key = `\0${receiver.name}`
+      let facts = declarations.get(key)
+      if (facts === undefined) {
+        const names = []
+        for (const member of declarations.get(receiver.name)?.members ?? []) if (ts.isMethodDeclaration(member) && member.modifiers?.some(modifier => modifier.kind === ts.SyntaxKind.StaticKeyword)) names.push(member.name.getText(sourceFile))
+        declarations.set(key, facts = JSON.stringify(names))
+      }
+      binding.remote = symbols[0].kind === 'class' ? `static:${facts}` : `${receiver.id}\0${facts}`
+    }
+    direct.set(name, binding)
   }
   const bindings = []
   const exportFacts = structuralCache ? structuralCache.exports ??= new WeakMap() : null
@@ -134,9 +180,13 @@ export function resolveCachedImport(files, fromFile, imported, property = null, 
   const target = imported.namespace ? { kind: 'namespace', file: module } : resolveExport(files, module, imported.remote, dependencies, seen)
   if (!property) return target?.kind === 'namespace' ? null : target
   if (target?.kind === 'namespace') return resolveExport(files, target.file, property, dependencies, seen)
-  if (target?.kind === 'class') {
+  if (target?.kind === 'class' || target?.kind === 'variable') {
     const partition = fileAt(files, target.file)
-    return partition ? indexesFor(partition).membersByOwner.get(`class:${target.name}\0${property}`) ?? null : null
+    if (!partition) return null
+    const indexes = indexesFor(partition)
+    const owner = target.kind === 'class' ? target : indexes.symbolsById.get(indexes.bindings.get(`\0${target.id}`))
+    if ((target.kind === 'variable' || imported.instance) && owner && indexes.membersByOwner.has(`static:${owner.id}\0${property}`)) return null
+    return owner?.kind === 'class' ? indexes.membersByOwner.get(`class:${owner.name}\0${property}`) ?? null : null
   }
   return null
 }
@@ -188,12 +238,87 @@ const classifyGraphRecord = (index, record) => {
   else if (!record.unresolved && unresolved) moveUnresolvedRecord(index, record, true)
   record.unresolved = unresolved
 }
+const publicationRecordOrder = (left, right) => left.patchKey === null
+  ? (left.ownerFile === right.ownerFile ? 0 : left.ownerFile.localeCompare(right.ownerFile)) || left.edgeOrdinal - right.edgeOrdinal || (left.edge.call === right.edge.call ? 0 : left.edge.call ? 1 : -1) || left.ordinal - right.ordinal
+  : (left.patchKey < right.patchKey ? -1 : left.patchKey > right.patchKey ? 1 : 0) || left.ordinal - right.ordinal
+const movePublicationRecord = (bucket, record, add) => {
+  const first = bucket.publicationFirst
+  if (!bucket.publicationRows) {
+    if (add) {
+      if (!first) bucket.publicationFirst = record
+      else { bucket.publicationRows = publicationRecordOrder(first, record) < 0 ? [first, record] : [record, first]; bucket.publicationFirst = null }
+    } else if (first === record) bucket.publicationFirst = null
+    return
+  }
+  const rows = bucket.publicationRows
+  let low = 0; let high = rows.length
+  while (low < high) { const middle = (low + high) >>> 1; if (publicationRecordOrder(rows[middle], record) < 0) low = middle + 1; else high = middle }
+  if (add) {
+    for (let cursor = rows.length; cursor > low; cursor--) rows[cursor] = rows[cursor - 1]
+    rows[low] = record
+  } else if (rows[low] === record) {
+    for (let cursor = low; cursor + 1 < rows.length; cursor++) rows[cursor] = rows[cursor + 1]
+    rows.length--
+    if (rows.length === 1) { bucket.publicationFirst = rows[0]; bucket.publicationRows = null }
+  }
+}
+const addGraphGroup = (groups, edge) => {
+  if (!edge) return
+  const key = `${edge.from}\0${edge.to}\0${edge.line}`
+  if (!groups.has(key)) groups.set(key, { from: edge.from, to: edge.to, line: edge.line })
+}
+const graphPatchGroups = (index, groups) => {
+  const rows = new Map(); const visited = new Set()
+  for (const group of groups.values()) { group.unresolvedRows = []; group.missingRows = [] }
+  for (const group of groups.values()) {
+    if (visited.has(group.from)) continue
+    visited.add(group.from)
+    const source = index.byEndpoint.get(group.from)
+    for (const record of source ?? []) {
+      if (!record.active || !record.unresolved || record.edge.from !== group.from) continue
+      const target = groups.get(`${record.edge.from}\0${record.edge.to}\0${record.edge.line}`)
+      if (target) (record.missing ? target.missingRows : target.unresolvedRows).push(record.unresolved)
+    }
+    const ordered = source?.publicationRows
+    const count = ordered?.length ?? (source?.publicationFirst ? 1 : 0)
+    for (let ordinal = 0; ordinal < count; ordinal++) {
+      const record = ordered ? ordered[ordinal] : source.publicationFirst
+      if (!record.active) continue
+      const key = `${record.edge.from}\0${record.edge.to}\0${record.edge.line}`
+      if (!groups.has(key)) continue
+      let bucket = rows.get(key)
+      if (!bucket) rows.set(key, bucket = [])
+      bucket.push(record)
+    }
+  }
+  return rows
+}
+const graphGroupRows = (index, group, patches) => {
+  const key = `${group.from}\0${group.to}\0${group.line}`
+  const bucket = (index.rawByKey.get(`${key}\0${0}`) ?? index.rawByKey.get(`${key}\0${1}`))?.publicationGroup
+  const rows = bucket?.publicationRows
+  const count = rows?.length ?? (bucket?.publicationFirst ? 1 : 0)
+  const edges = []
+  let removedCalls = index.removals.get(`${key}\0${1}`) ?? 0
+  let removedReferences = index.removals.get(`${key}\0${0}`) ?? 0
+  for (let ordinal = 0; ordinal < count; ordinal++) {
+    const record = rows ? rows[ordinal] : bucket.publicationFirst
+    if (record.edge.call && removedCalls) { removedCalls--; continue }
+    if (!record.edge.call && removedReferences) { removedReferences--; continue }
+    if (index.symbols.has(record.edge.from) && index.symbols.has(record.edge.to)) edges.push(record.edge)
+  }
+  for (const record of patches.get(key) ?? []) if (record.active && !record.missing && !record.unresolved) edges.push(record.edge)
+  const unresolved = group.unresolvedRows, missing = group.missingRows
+  delete group.unresolvedRows; delete group.missingRows
+  return { edges, unresolved, missing }
+}
 const addGraphRecord = (index, edge, missing = false, ownerFile = null, edgeOrdinal = null, patchKey = null) => {
   const record = { edge, missing, ownerFile, edgeOrdinal, patchKey, ordinal: index.nextOrdinal++, active: true, unresolved: null }
   for (const id of edge.from === edge.to ? [edge.from] : [edge.from, edge.to]) {
     let bucket = index.byEndpoint.get(id)
     if (!bucket) index.byEndpoint.set(id, bucket = new Set())
     bucket.add(record)
+    if (patchKey !== null && id === edge.from) movePublicationRecord(bucket, record, true)
   }
   if (!index.initializing) classifyGraphRecord(index, record)
   return record
@@ -204,6 +329,7 @@ const removeGraphRecord = (index, record) => {
   for (const id of record.edge.from === record.edge.to ? [record.edge.from] : [record.edge.from, record.edge.to]) {
     const bucket = index.byEndpoint.get(id)
     bucket.delete(record)
+    if (record.patchKey !== null && id === record.edge.from) movePublicationRecord(bucket, record, false)
     if (!bucket.size) index.byEndpoint.delete(id)
   }
 }
@@ -264,24 +390,35 @@ const addGraphFile = (index, file, partition, affected = null) => {
     records.push(record)
     const key = graphEdgeKey(edge)
     let bucket = index.rawByKey.get(key)
-    if (!bucket) index.rawByKey.set(key, bucket = new Set())
+    if (!bucket) {
+      index.rawByKey.set(key, bucket = new Set())
+      const paired = index.rawByKey.get(`${edge.from}\0${edge.to}\0${edge.line}\0${edge.call ? 0 : 1}`)
+      bucket.publicationGroup = paired?.publicationGroup ?? bucket
+    }
     bucket.add(record)
+    movePublicationRecord(bucket.publicationGroup, record, true)
     if (index.removals.has(key)) refreshRawKey(index, key)
   }
   index.graphByFile.set(file, { ids, records })
 }
 
-export function createCachedReferenceIndex(files, inheritedPatches = []) {
+export function createCachedReferenceIndex(files, inheritedPatches = [], graphOnly = false) {
   const index = { byDependency: new Map(), byFile: new Map(), graphByFile: new Map(), byEndpoint: new Map(), symbols: new Map(), rawByKey: new Map(), removals: new Map(), patches: new Map(), patchesByFile: new Map(), orderedPatches: [], unresolved: [], missingUnresolved: [], nextOrdinal: 0, graphRecordsVisited: 0, outputSlotMoves: 0, initializing: true }
   for (const [file, partition] of typeof files?.entries === 'function' ? files.entries() : Object.entries(files ?? {})) addGraphFile(index, file, partition)
   index.initializing = false
   for (const file of index.graphByFile.values()) for (const record of file.records) classifyGraphRecord(index, record)
   for (const patch of inheritedPatches) addPublicationPatch(index, patch)
-  for (const [file, partition] of typeof files?.entries === 'function' ? files.entries() : Object.entries(files ?? {})) {
+  if (!graphOnly) for (const [file, partition] of typeof files?.entries === 'function' ? files.entries() : Object.entries(files ?? {})) {
     const entries = (partition.references ?? []).map((reference, ordinal) => indexReference(index, files, file, reference, ordinal))
     if (entries.length) index.byFile.set(file, entries)
   }
   return index
+}
+
+export function normalizePublicationPatch(repair, previous) {
+  const missing = repair.edge ? null : repair.base ?? previous?.missing
+  const patch = { ...repair, base: previous ? previous.base : repair.base, ...(missing ? { missing } : {}) }
+  return !patch.base && !patch.edge && !patch.missing || patch.base && patch.edge && !patch.missing && graphEdgeKey(patch.base) === graphEdgeKey(patch.edge) ? null : patch
 }
 
 export function updateCachedGraphFacts(index, files, changedFile, repairs) {
@@ -290,64 +427,22 @@ export function updateCachedGraphFacts(index, files, changedFile, repairs) {
   const old = index.graphByFile.get(changedFile)
   const changed = fileAt(files, changedFile)
   const groups = new Map()
-  const addGroup = (edge) => {
-    if (!edge) return
-    const key = `${edge.from}\0${edge.to}\0${edge.line}`
-    if (!groups.has(key)) groups.set(key, { from: edge.from, to: edge.to, line: edge.line })
-  }
-  for (const record of old?.records ?? []) addGroup(record.edge)
-  for (const edge of changed?.edges ?? []) addGroup(edge)
+  for (const record of old?.records ?? []) addGraphGroup(groups, record.edge)
+  for (const edge of changed?.edges ?? []) addGraphGroup(groups, edge)
   for (const patch of index.patchesByFile.get(changedFile) ?? []) {
-    addGroup(patch.base); addGroup(patch.edge); addGroup(patch.missing)
+    addGraphGroup(groups, patch.base); addGraphGroup(groups, patch.edge); addGraphGroup(groups, patch.missing)
   }
   for (const repair of repairs) {
-    addGroup(repair.base); addGroup(repair.edge)
+    addGraphGroup(groups, repair.base); addGraphGroup(groups, repair.edge)
     const previous = index.patches.get(repair.key)
-    addGroup(previous?.base); addGroup(previous?.edge); addGroup(previous?.missing)
+    addGraphGroup(groups, previous?.base); addGraphGroup(groups, previous?.edge); addGraphGroup(groups, previous?.missing)
   }
   for (const id of old?.ids ?? []) affected.add(id)
   for (const symbol of changed?.symbols ?? []) affected.add(symbol.id)
-  for (const id of affected) for (const record of index.byEndpoint.get(id) ?? []) addGroup(record.edge)
-  const patchGroups = () => {
-    const rows = new Map(); const visited = new Set()
-    for (const group of groups.values()) {
-      if (visited.has(group.from)) continue
-      visited.add(group.from)
-      for (const record of index.byEndpoint.get(group.from) ?? []) if (record.patchKey !== null && record.active && record.edge.from === group.from) {
-        const key = `${record.edge.from}\0${record.edge.to}\0${record.edge.line}`
-        if (!groups.has(key)) continue
-        let bucket = rows.get(key)
-        if (!bucket) rows.set(key, bucket = [])
-        bucket.push(record)
-      }
-    }
-    return rows
-  }
-  const groupRows = (group, patches) => {
-    const records = []
-    for (const call of [false, true]) for (const record of index.rawByKey.get(graphEdgeKey({ ...group, call })) ?? []) records.push(record)
-    for (const record of patches.get(`${group.from}\0${group.to}\0${group.line}`) ?? []) records.push(record)
-    records.sort((left, right) => left.patchKey === null && right.patchKey === null ? left.ownerFile.localeCompare(right.ownerFile) || left.edgeOrdinal - right.edgeOrdinal : left.patchKey === null ? -1 : right.patchKey === null ? 1 : left.patchKey < right.patchKey ? -1 : left.patchKey > right.patchKey ? 1 : 0)
-    const edges = []; const unresolved = []; const missing = []
-    let removedCalls = index.removals.get(graphEdgeKey({ ...group, call: true })) ?? 0
-    let removedReferences = index.removals.get(graphEdgeKey({ ...group, call: false })) ?? 0
-    for (const record of records) {
-      if (record.active && record.unresolved) (record.missing ? missing : unresolved).push(record)
-      if (record.patchKey === null) {
-        if (record.edge.call && removedCalls) { removedCalls--; continue }
-        if (!record.edge.call && removedReferences) { removedReferences--; continue }
-        if (index.symbols.has(record.edge.from) && index.symbols.has(record.edge.to)) edges.push(record.edge)
-      } else if (record.active && !record.missing && !record.unresolved) edges.push(record.edge)
-    }
-    unresolved.sort((left, right) => left.ordinal - right.ordinal)
-    missing.sort((left, right) => left.ordinal - right.ordinal)
-    for (let ordinal = 0; ordinal < unresolved.length; ordinal++) unresolved[ordinal] = unresolved[ordinal].unresolved
-    for (let ordinal = 0; ordinal < missing.length; ordinal++) missing[ordinal] = missing[ordinal].unresolved
-    return { edges, unresolved, missing }
-  }
+  for (const id of affected) for (const record of index.byEndpoint.get(id) ?? []) addGraphGroup(groups, record.edge)
   const rawUnresolvedBeforeCount = index.unresolved.length
-  const beforePatches = patchGroups()
-  for (const group of groups.values()) group.before = groupRows(group, beforePatches)
+  const beforePatches = graphPatchGroups(index, groups)
+  for (const group of groups.values()) group.before = graphGroupRows(index, group, beforePatches)
   if (old) {
     for (const id of old.ids) {
       const count = index.symbols.get(id) - 1
@@ -359,6 +454,7 @@ export function updateCachedGraphFacts(index, files, changedFile, repairs) {
       removeGraphRecord(index, record)
       const key = graphEdgeKey(record.edge); const bucket = index.rawByKey.get(key)
       bucket.delete(record)
+      movePublicationRecord(bucket.publicationGroup, record, false)
       if (!bucket.size) index.rawByKey.delete(key)
       refreshRawKey(index, key)
     }
@@ -368,17 +464,15 @@ export function updateCachedGraphFacts(index, files, changedFile, repairs) {
   if (changed) addGraphFile(index, changedFile, changed, affected)
   for (const repair of repairs) {
     const previous = index.patches.get(repair.key)
-    const missing = repair.edge ? null : repair.base ?? previous?.missing
-    const patch = { ...repair, base: previous ? previous.base : repair.base, ...(missing ? { missing } : {}) }
+    const patch = normalizePublicationPatch(repair, previous)
     if (previous) removePublicationPatch(index, previous)
-    if (!patch.base && !patch.edge && !patch.missing || patch.base && patch.edge && !patch.missing && graphEdgeKey(patch.base) === graphEdgeKey(patch.edge)) continue
-    addPublicationPatch(index, patch)
+    if (patch) addPublicationPatch(index, patch)
   }
   const visited = new Set()
   for (const id of affected) for (const record of index.byEndpoint.get(id) ?? []) if (!visited.has(record)) { visited.add(record); classifyGraphRecord(index, record) }
-  const changedGroups = []; const afterPatches = patchGroups()
+  const changedGroups = []; const afterPatches = graphPatchGroups(index, groups)
   for (const group of groups.values()) {
-    group.after = groupRows(group, afterPatches)
+    group.after = graphGroupRows(index, group, afterPatches)
     let different = false
     for (const kind of ['edges', 'unresolved', 'missing']) {
       const before = group.before[kind], after = group.after[kind]

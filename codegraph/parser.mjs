@@ -107,6 +107,87 @@ function semanticSignature(node) {
   return `<${typeParameters}>(${parameters}):${returnType || declaredType}`
 }
 
+function recordCollectedSyntax(state, node, owner) {
+  const bucket = state.nodesByKind.get(node.getKind())
+  const isIdentifier = node.compilerNode.kind === SyntaxKind.Identifier
+  let fact = bucket ? state.syntaxFacts.get(node.compilerNode) : null
+  if (bucket && !fact) { fact = { name: nodeName(node), signature: semanticSignature(node) }; state.syntaxFacts.set(node.compilerNode, fact) }
+  if (bucket || isIdentifier) {
+    const line = state.lineCursor.lineAt(node.getStart())
+    if (bucket) bucket.push({ node, line, name: fact.name, signature: fact.signature })
+    if (isIdentifier) state.identifiers.push({ node, line, owner })
+  }
+  return fact?.name ? node.compilerNode : owner
+}
+
+function relevantCollectedNode(node) {
+  return declarationKinds.has(node.kind) || node.kind === SyntaxKind.Identifier
+}
+
+function replayCollectedSyntax(state, root, inherited) {
+  const owner = relevantCollectedNode(root) ? recordCollectedSyntax(state, state.file.session.wrap(root), inherited) : inherited
+  const retained = state.inventories.get(root)
+  if (retained) {
+    retained.currentSourceRoot = state.file.compilerNode
+    state.stats.reusedOwners += 1
+    for (const entry of retained.entries) {
+      const incoming = entry.owner ?? owner
+      if (entry.nested) replayCollectedSyntax(state, entry.node, incoming)
+      else recordCollectedSyntax(state, state.file.session.wrap(entry.node), incoming)
+    }
+    return
+  }
+  state.stats.rebuiltOwners += 1
+  const previousEntries = state.entries, previousRootOwner = state.rootOwner
+  const entries = []
+  state.entries = entries; state.rootOwner = owner
+  visitCollectedChildren(state, root, owner)
+  state.inventories.set(root, { entries, currentSourceRoot: state.file.compilerNode })
+  state.entries = previousEntries; state.rootOwner = previousRootOwner
+}
+
+function visitCollectedChildren(state, node, incoming) {
+  const previousOwner = state.owner, previousItems = state.items
+  const items = state.children ? [] : null
+  state.owner = incoming; state.items = items
+  ts.forEachChild(node, state.visitChild)
+  if (state.children) state.children.set(node, items)
+  state.owner = previousOwner; state.items = previousItems
+}
+
+function visitCollectedChild(state, child) {
+  const incoming = state.owner
+  if (!state.inventories) {
+    const owner = relevantCollectedNode(child) ? recordCollectedSyntax(state, state.file.session.wrap(child), incoming) : incoming
+    const previousOwner = state.owner
+    state.owner = owner
+    ts.forEachChild(child, state.visitChild)
+    state.owner = previousOwner
+    return
+  }
+  state.stats.visitedNodes += 1
+  if (state.children) state.items.push(state.file.session.wrap(child))
+  const savedOwner = incoming === state.rootOwner ? null : incoming
+  if (declarationKinds.has(child.kind) || ts.isFunctionLike(child) || child.kind === SyntaxKind.Block || child.kind === SyntaxKind.CatchClause || child.kind === SyntaxKind.ModuleBlock) {
+    state.entries.push({ node: child, owner: savedOwner, nested: true })
+    replayCollectedSyntax(state, child, incoming)
+    return
+  }
+  let owner = incoming
+  if (relevantCollectedNode(child)) {
+    state.entries.push({ node: child, owner: savedOwner })
+    owner = recordCollectedSyntax(state, state.file.session.wrap(child), incoming)
+  }
+  visitCollectedChildren(state, child, owner)
+}
+
+function pruneCollectedSyntax(state, root) {
+  const retained = state.inventories.get(root)
+  if (!retained || retained.currentSourceRoot === state.file.compilerNode) return
+  if (declarationKinds.has(root.kind) && state.byDeclaration?.delete(root)) state.stats.deletedDeclarations += 1
+  for (const entry of retained.entries) if (entry.nested) pruneCollectedSyntax(state, entry.node)
+}
+
 function collectFileSyntax(file, source, lineCursor, timing, preparedStructuralGraph, deferStructuralGraph = false, byDeclaration = null) {
   const started = performance.now()
   const nodesByKind = new Map([...declarationKinds.keys()].map((syntaxKind) => [syntaxKind, []]))
@@ -116,69 +197,17 @@ function collectFileSyntax(file, source, lineCursor, timing, preparedStructuralG
   const nativeTraversal = Boolean((preparedStructuralGraph || deferStructuralGraph) && file.compilerNode && file.session?.wrap)
   const children = nativeTraversal ? null : structuralCache ? structuralCache.children ??= new WeakMap() : new WeakMap()
   lineCursor.reset(source)
-  const record = (node, owner) => {
-    const bucket = nodesByKind.get(node.getKind())
-    const isIdentifier = (node?.compilerNode.kind === SyntaxKind.Identifier)
-    let fact = bucket ? syntaxFacts.get(node.compilerNode) : null
-    if (bucket && !fact) { fact = { name: nodeName(node), signature: semanticSignature(node) }; syntaxFacts.set(node.compilerNode, fact) }
-    if (bucket || isIdentifier) {
-      const line = lineCursor.lineAt(node.getStart())
-      if (bucket) bucket.push({ node, line, name: fact.name, signature: fact.signature })
-      if (isIdentifier) identifiers.push({ node, line, owner })
-    }
-    return fact?.name ? node.compilerNode : owner
-  }
+  const state = { file, nodesByKind, identifiers, syntaxFacts, lineCursor, children, byDeclaration, owner: null }
   if (structuralCache && file.session?.sourceFile === file.compilerNode) {
-    const inventories = structuralCache.inventories ??= new WeakMap()
-    const stats = structuralCache.inventoryStats = { rebuiltOwners: 0, reusedOwners: 0, visitedNodes: 0, deletedDeclarations: 0 }
-    const boundary = node => declarationKinds.has(node.kind) || ts.isFunctionLike(node) || node.kind === SyntaxKind.Block || node.kind === SyntaxKind.CatchClause || node.kind === SyntaxKind.ModuleBlock
-    const relevant = node => declarationKinds.has(node.kind) || node.kind === SyntaxKind.Identifier
-    const replay = (root, inherited) => {
-      const owner = relevant(root) ? record(file.session.wrap(root), inherited) : inherited
-      const retained = inventories.get(root)
-      if (retained) {
-        retained.currentSourceRoot = file.compilerNode
-        stats.reusedOwners += 1
-        for (const entry of retained.entries) {
-          const incoming = entry.owner ?? owner
-          if (entry.nested) replay(entry.node, incoming)
-          else record(file.session.wrap(entry.node), incoming)
-        }
-        return
-      }
-      stats.rebuiltOwners += 1
-      const entries = []
-      const visitChildren = (node, incoming) => {
-        const items = children ? [] : null
-        ts.forEachChild(node, child => {
-          stats.visitedNodes += 1
-          if (children) items.push(file.session.wrap(child))
-          const savedOwner = incoming === owner ? null : incoming
-          if (boundary(child)) { entries.push({ node: child, owner: savedOwner, nested: true }); replay(child, incoming); return }
-          let nextOwner = incoming
-          if (relevant(child)) { entries.push({ node: child, owner: savedOwner }); nextOwner = record(file.session.wrap(child), incoming) }
-          visitChildren(child, nextOwner)
-        })
-        if (children) children.set(node, items)
-      }
-      visitChildren(root, owner)
-      inventories.set(root, { entries, currentSourceRoot: file.compilerNode })
-    }
-    replay(file.compilerNode, null)
-    const prune = root => {
-      const retained = inventories.get(root)
-      if (!retained || retained.currentSourceRoot === file.compilerNode) return
-      if (declarationKinds.has(root.kind) && byDeclaration?.delete(root)) stats.deletedDeclarations += 1
-      for (const entry of retained.entries) if (entry.nested) prune(entry.node)
-    }
-    if (structuralCache.currentRoot) prune(structuralCache.currentRoot)
+    state.inventories = structuralCache.inventories ??= new WeakMap()
+    state.stats = structuralCache.inventoryStats = { rebuiltOwners: 0, reusedOwners: 0, visitedNodes: 0, deletedDeclarations: 0 }
+    state.visitChild = child => { visitCollectedChild(state, child) }
+    replayCollectedSyntax(state, file.compilerNode, null)
+    if (structuralCache.currentRoot) pruneCollectedSyntax(state, structuralCache.currentRoot)
     structuralCache.currentRoot = file.compilerNode
   } else if (nativeTraversal) {
-    const visit = (node, owner) => {
-      const nextOwner = declarationKinds.has(node.kind) || node.kind === SyntaxKind.Identifier ? record(file.session.wrap(node), owner) : owner
-      ts.forEachChild(node, child => { visit(child, nextOwner) })
-    }
-    ts.forEachChild(file.compilerNode, child => { visit(child, null) })
+    state.visitChild = child => { visitCollectedChild(state, child) }
+    ts.forEachChild(file.compilerNode, state.visitChild)
   } else {
     const emptyChildren = []
     const stack = [file]; const ownerStack = [null]; const building = [false]; let depth = 0
@@ -187,7 +216,7 @@ function collectFileSyntax(file, source, lineCursor, timing, preparedStructuralG
       while (stack[depth] !== parent) { if (!children.has(stack[depth].compilerNode)) children.set(stack[depth].compilerNode, emptyChildren); depth -= 1 }
       if (building[depth]) children.get(parent.compilerNode).push(node)
       else if (!children.has(parent.compilerNode)) { children.set(parent.compilerNode, [node]); building[depth] = true }
-      const owner = record(node, ownerStack[depth])
+      const owner = recordCollectedSyntax(state, node, ownerStack[depth])
       depth += 1; stack[depth] = node; ownerStack[depth] = owner; building[depth] = false
     })
     while (depth >= 0) { if (!children.has(stack[depth].compilerNode)) children.set(stack[depth].compilerNode, emptyChildren); depth -= 1 }
@@ -300,13 +329,14 @@ function identityForSymbol(symbol, context, identifierArgs) {
 }
 
 function callExpressionForIdentifier(ident) {
-  const parent = ident.getParent()
-  if ((parent?.compilerNode.kind === SyntaxKind.CallExpression) && parent.getExpression() === ident) return true
-  const grand = parent?.getParent()
-  return (parent?.compilerNode.kind === SyntaxKind.PropertyAccessExpression) && parent.getNameNode() === ident && (grand?.compilerNode.kind === SyntaxKind.CallExpression) && grand.getExpression() === parent
+  const node = ident.compilerNode
+  const parent = node.parent
+  if ((parent?.kind === SyntaxKind.CallExpression) && parent.expression === node) return true
+  const grand = parent?.parent
+  return (parent?.kind === SyntaxKind.PropertyAccessExpression) && parent.name === node && (grand?.kind === SyntaxKind.CallExpression) && grand.expression === parent
 }
 
-function resolveIdentifierEdges(identifiers, localByNode, context, identifierArgs, coverage, targetByIdentifier, resolveMissing = null, references = null) {
+function resolveIdentifierEdges(identifiers, localByNode, context, identifierArgs, coverage, targetByIdentifier, resolveMissing = null, references = null, cacheFirst = false) {
   const edges = []
 
   for (const identifier of identifiers) {
@@ -316,11 +346,14 @@ function resolveIdentifierEdges(identifiers, localByNode, context, identifierArg
     if (coverage === EDGE_COVERAGE.CALLS && !call) continue
     const from = owner ? localByNode.get(owner) : null
     if (!from) { identifierArgs.noOwner += 1; continue }
-    let symbol = ident.getSymbol?.()
-    if (!symbol) { targetByIdentifier.set(ident.compilerNode, null); identifierArgs.symbolMissing += 1; continue }
-    const cached = resolveMissing ? resolveMissing(ident, symbol) : null
+    const parent = ident.compilerNode.parent
+    const probeCached = cacheFirst && resolveMissing && parent?.kind === SyntaxKind.PropertyAccessExpression && parent.name === ident.compilerNode
+    let cached = probeCached ? resolveMissing(ident, null) : null
+    let symbol = cached?.target ? null : ident.getSymbol?.()
+    if (!probeCached) cached = resolveMissing ? resolveMissing(ident, symbol) : null
     if (cached?.call) call = true
     if (cached?.reference) { cached.reference.from = from.id; cached.reference.line = line; cached.reference.call = call; references.push(cached.reference) }
+    if (!symbol && !cached?.target) { targetByIdentifier.set(ident.compilerNode, null); identifierArgs.symbolMissing += 1; continue }
     let target = cached?.target ?? null
     if (!target) {
       const alias = expandAliasSymbol(symbol)
@@ -341,6 +374,50 @@ function resolveIdentifierEdges(identifiers, localByNode, context, identifierArg
 function expandAliasSymbol(symbol) {
   if (!(symbol.getFlags() & ts.SymbolFlags.Alias)) return symbol
   try { return symbol.getAliasedSymbol() ?? symbol } catch { return symbol }
+}
+
+function cachedReceiverFor(node, file, imports, receiverFacts) {
+  if (!node) return null
+  if (receiverFacts.has(node)) return receiverFacts.get(node)
+  receiverFacts.set(node, null)
+  let receiver = null
+  if (ts.isIdentifier(node)) {
+    const declarations = file.session.symbolAt(node)?.getDeclarations?.()
+    if (declarations?.length === 1) {
+      const declaration = declarations[0].compilerNode
+      const imported = imports.get(node.text)
+      if (imported && declaration.getStart() >= imported.start && declaration.end <= imported.end) receiver = imported
+      else if (ts.isVariableDeclaration(declaration)) receiver = cachedReceiverFor(declaration.initializer, file, imports, receiverFacts)
+    }
+  } else if (ts.isNewExpression(node)) {
+    const constructor = cachedReceiverFor(node.expression, file, imports, receiverFacts)
+    if (constructor) receiver = { ...constructor, instance: true }
+  }
+  else if (ts.isParenthesizedExpression(node) || ts.isNonNullExpression(node)) receiver = cachedReceiverFor(node.expression, file, imports, receiverFacts)
+  else if (ts.isPropertyAccessExpression(node)) {
+    const base = cachedReceiverFor(node.expression, file, imports, receiverFacts)
+    if (base?.namespace) receiver = { specifier: base.specifier, remote: node.name.text }
+    else if (node.name.text === 'current' && ts.isIdentifier(node.expression)) {
+      const declarations = file.session.symbolAt(node.expression)?.getDeclarations?.()
+      const initializer = declarations?.length === 1 ? declarations[0].compilerNode.initializer : null
+      const factory = initializer && ts.isCallExpression(initializer) ? cachedReceiverFor(initializer.expression, file, imports, receiverFacts) : null
+      if (factory?.specifier === 'react' && factory.remote === 'useRef' && initializer.typeArguments?.length === 1) {
+        const type = initializer.typeArguments[0]
+        let named = null
+        if (ts.isTypeReferenceNode(type)) named = type
+        else if (ts.isUnionTypeNode(type)) for (const member of type.types) {
+          if (ts.isTypeReferenceNode(member)) { if (named) { named = null; break }; named = member }
+          else if (!(ts.isLiteralTypeNode(member) && member.literal.kind === SyntaxKind.NullKeyword)) { named = null; break }
+        }
+        if (named && ts.isIdentifier(named.typeName)) {
+          const target = cachedReceiverFor(named.typeName, file, imports, receiverFacts)
+          if (target) receiver = { ...target, instance: true }
+        }
+      }
+    }
+  }
+  receiverFacts.set(node, receiver)
+  return receiver
 }
 
 export function parsePartition(rel, source, knownFiles, context, profiler = null, edgeCoverage = EDGE_COVERAGE.COMPLETE, includeInternals = true, retainAnalysis = false, cachedPartitions = null) {
@@ -374,18 +451,32 @@ export function parsePartition(rel, source, knownFiles, context, profiler = null
     }
   } else visitImportBindings(file.compilerNode, ts, (name, specifier, remote, namespace, start, end) => imports.set(name, namespace ? { specifier, namespace: true, start, end } : { specifier, remote, start, end }))
   const references = []
+  const receiverFacts = new WeakMap()
   const resolveMissing = (ident, symbol) => {
-    const parent = ident.getParent()
-    if ((parent?.compilerNode.kind === SyntaxKind.PropertyAccessExpression) && parent.getNameNode() === ident) return null
+    const node = ident.compilerNode
+    const parent = node.parent
+    if ((parent?.kind === SyntaxKind.PropertyAccessExpression) && parent.name === node) {
+      if (!cachedPartitions && symbol) {
+        const declarations = symbol.getDeclarations()
+        let eligible = declarations.length === 0
+        for (const declaration of declarations) if (context.eligibleFiles.has(declaration.compilerNode.getSourceFile().fileName)) { eligible = true; break }
+        if (!eligible) return null
+      }
+      const receiver = cachedReceiverFor(parent.expression, file, imports, receiverFacts)
+      if (!receiver) return null
+      const reference = { specifier: receiver.specifier, remote: receiver.remote, namespace: Boolean(receiver.namespace), property: parent.name.getText(file.compilerNode) }
+      if (receiver.instance) reference.instance = true
+      return { target: cachedPartitions && resolveCachedImport(cachedPartitions, rel, reference, reference.property), reference }
+    }
     const imported = imports.get(ident.getText())
     if (!imported) return null
-    const declaration = symbol.getDeclarations?.().find((node) => node.getStart() >= imported.start && node.getEnd() <= imported.end)
+    let declaration = null
+    for (const candidate of symbol?.getDeclarations?.() ?? []) if (candidate.getStart() >= imported.start && candidate.getEnd() <= imported.end) { declaration = candidate; break }
     if (!declaration) return null
-    const propertyAccess = (parent?.compilerNode.kind === SyntaxKind.PropertyAccessExpression) && parent.getExpression() === ident ? parent : null
-    const property = propertyAccess?.getName() ?? null
-    const reference = { specifier: imported.specifier, remote: imported.remote, namespace: Boolean(imported.namespace), property }
-    const target = cachedPartitions && resolveCachedImport(cachedPartitions, rel, reference, property)
-    return { target, call: propertyAccess ? (propertyAccess.getParent()?.compilerNode.kind === SyntaxKind.CallExpression) : false, reference }
+    const propertyAccess = (parent?.kind === SyntaxKind.PropertyAccessExpression) && parent.expression === node ? parent : null
+    const reference = { specifier: imported.specifier, remote: imported.remote, namespace: Boolean(imported.namespace), property: null }
+    const target = cachedPartitions && resolveCachedImport(cachedPartitions, rel, reference)
+    return { target, call: propertyAccess ? (propertyAccess.parent?.kind === SyntaxKind.CallExpression) : false, reference }
   }
   const localByNode = new Map(rows.map(({ node, identity }) => [node.compilerNode, identity]))
   const targetByIdentifier = new Map()
@@ -393,7 +484,7 @@ export function parsePartition(rel, source, knownFiles, context, profiler = null
   const identifierProfile = profiler?.begin('identifiers-symbol-resolution', identifierArgs)
   started = performance.now()
   nestedStarted = context.semanticTiming && context.semanticTiming.syntaxCollectionMs + context.semanticTiming.structuralCfgMs
-  const edges = resolveIdentifierEdges(analysis.identifiers, localByNode, context, identifierArgs, requireCoverage(edgeCoverage), targetByIdentifier, resolveMissing, references)
+  const edges = resolveIdentifierEdges(analysis.identifiers, localByNode, context, identifierArgs, requireCoverage(edgeCoverage), targetByIdentifier, resolveMissing, references, Boolean(cachedPartitions))
   if (context.semanticTiming) context.semanticTiming.identifierResolutionMs += Math.max(0, performance.now() - started - (context.semanticTiming.syntaxCollectionMs + context.semanticTiming.structuralCfgMs - nestedStarted))
   if (identifierProfile) profiler.end(identifierProfile)
   const dependencies = []; const unresolved = []

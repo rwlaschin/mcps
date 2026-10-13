@@ -1,0 +1,118 @@
+{
+  "root": "/workspace/project",
+  "capacityBytes": 65536,
+  "calls": {
+    "generation": "fixture-v3-calls",
+    "edgeCoverage": "calls",
+    "files": [
+      "src/a.ts",
+      "src/é.ts"
+    ],
+    "symbols": [
+      {
+        "id": "caller-id",
+        "file": "src/a.ts",
+        "name": "caller",
+        "kind": "function",
+        "line": 2,
+        "qualifiedPath": "<module>",
+        "signature": "<>():",
+        "ordinal": 0,
+        "exported": true
+      },
+      {
+        "id": "target-id",
+        "file": "src/é.ts",
+        "name": "é😀",
+        "kind": "function",
+        "line": 7,
+        "qualifiedPath": "<module>",
+        "signature": "<>():number",
+        "ordinal": 0,
+        "exported": true
+      }
+    ],
+    "edges": [
+      {
+        "from": "caller-id",
+        "to": "target-id",
+        "line": 2,
+        "call": true
+      },
+      {
+        "from": "caller-id",
+        "to": "target-id",
+        "line": 2,
+        "call": true
+      }
+    ],
+    "unresolvedEdges": [
+      {
+        "from": "caller-id",
+        "to": "missing-id",
+        "line": 3,
+        "reason": "unresolved target"
+      }
+    ]
+  },
+  "complete": {
+    "generation": "fixture-v3-complete",
+    "edgeCoverage": "complete",
+    "files": [
+      "src/a.ts",
+      "src/é.ts"
+    ],
+    "symbols": [
+      {
+        "id": "caller-id",
+        "file": "src/a.ts",
+        "name": "caller",
+        "kind": "function",
+        "line": 2,
+        "qualifiedPath": "<module>",
+        "signature": "<>():",
+        "ordinal": 0,
+        "exported": true
+      },
+      {
+        "id": "target-id",
+        "file": "src/é.ts",
+        "name": "é😀",
+        "kind": "function",
+        "line": 7,
+        "qualifiedPath": "<module>",
+        "signature": "<>():number",
+        "ordinal": 0,
+        "exported": true
+      }
+    ],
+    "edges": [
+      {
+        "from": "caller-id",
+        "to": "target-id",
+        "line": 2,
+        "call": true
+      },
+      {
+        "from": "caller-id",
+        "to": "target-id",
+        "line": 2,
+        "call": true
+      },
+      {
+        "from": "caller-id",
+        "to": "target-id",
+        "line": 4,
+        "call": false
+      }
+    ],
+    "unresolvedEdges": [
+      {
+        "from": "caller-id",
+        "to": "missing-id",
+        "line": 3,
+        "reason": "unresolved target"
+      }
+    ]
+  }
+}
