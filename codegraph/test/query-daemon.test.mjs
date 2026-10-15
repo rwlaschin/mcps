@@ -184,12 +184,18 @@ test('equivalence partition: connectQueryDaemon uses an existing daemon without 
   openDaemons.add(daemon)
   await daemon.start()
 
-  const client = await connectQueryDaemon(root, { ...transport, startDaemon: async () => { starts += 1 } })
+  let diagnostic = ''
+  const originalWrite = process.stderr.write
+  process.stderr.write = (chunk) => { diagnostic += String(chunk); return true }
+  let client
+  try {
+    client = await connectQueryDaemon(root, { ...transport, startDaemon: async () => { starts += 1 } })
+  } finally { process.stderr.write = originalWrite }
   openClients.add(client)
   const rows = []
   for await (const row of client.query({ type: 'graph' })) rows.push(row)
 
-  assert.deepEqual({ starts, rows }, { starts: 0, rows: [{ source: 'existing' }] })
+  assert.deepEqual({ starts, rows, diagnostic }, { starts: 0, rows: [{ source: 'existing' }], diagnostic: `CodeGraph: reusing existing daemon at ${transport.endpoint.host}:${transport.endpoint.port} for root ${root}\n` })
 })
 
 test('equivalence partition: connectQueryDaemon starts one daemon when the project socket is absent', { timeout: 20000 }, async () => {

@@ -18,6 +18,47 @@ if (profileAt >= 0 && (!args[profileAt + 1] || args[profileAt + 1].startsWith('-
 }
 const profile = profileAt >= 0 ? path.resolve(args[profileAt + 1]) : undefined
 const command = args[0]
+
+const writeCliIndex = async (engine, generation) => {
+  const [graph] = await engine.queryBatch({ type: 'graph', generation, limit: 1 })
+  if (!graph || !Array.isArray(graph.files) || !Array.isArray(graph.symbols) || !Array.isArray(graph.edges)) throw new Error('build returned an invalid graph')
+  const files = graph.files
+  const fileIndexes = new Map(files.map((file, index) => [file, index]))
+  const symbolIndexes = new Map(graph.symbols.map((symbol, index) => [symbol.id, index]))
+  const n = graph.symbols.length
+  const forward = Array.from({ length: n }, () => [])
+  const reverse = Array.from({ length: n }, () => [])
+  for (const edge of graph.edges) {
+    const from = symbolIndexes.get(edge.from), to = symbolIndexes.get(edge.to)
+    if (from === undefined || to === undefined) throw new Error('build returned an invalid graph edge')
+    const value = { target: to, line: edge.line, call: edge.call ? 1 : 0 }
+    forward[from].push(value); reverse[to].push({ ...value, target: from })
+  }
+  const csr = (rows) => {
+    const offsets = new Int32Array(n + 1); let length = 0
+    for (let index = 0; index < n; index += 1) { length += rows[index].length; offsets[index + 1] = length }
+    const target = new Int32Array(length), line = new Int32Array(length), call = new Int32Array(length)
+    let at = 0
+    for (const row of rows) for (const edge of row) { target[at] = edge.target; line[at] = edge.line; call[at] = edge.call; at += 1 }
+    return { offsets, target, line, call }
+  }
+  const fwd = csr(forward), rev = csr(reverse), m = fwd.target.length
+  const words = new Int32Array(2 + (n + 1) + m + m + m + (n + 1) + m + m + m)
+  let at = 0
+  words[at++] = n; words[at++] = m
+  for (const part of [fwd.offsets, fwd.target, fwd.line, fwd.call, rev.offsets, rev.target, rev.line, rev.call]) { words.set(part, at); at += part.length }
+  const maxMtimeMs = files.reduce((max, file) => Math.max(max, fs.statSync(path.join(root, file)).mtimeMs), 0)
+  const meta = {
+    files,
+    symbols: graph.symbols.map((symbol) => ({ name: symbol.name, file: fileIndexes.get(symbol.file), line: symbol.line, kind: symbol.kind, exp: symbol.exported })),
+    maxMtimeMs,
+  }
+  const output = path.join(root, '.codegraph')
+  fs.mkdirSync(output, { recursive: true })
+  fs.writeFileSync(path.join(output, 'graph.bin'), Buffer.from(words.buffer))
+  fs.writeFileSync(path.join(output, 'meta.json'), JSON.stringify(meta))
+}
+
 let engine = null
 if (command !== 'daemon') {
   const { connectQueryDaemon } = await import('./query-daemon.mjs')
@@ -38,7 +79,9 @@ const write = (record) => {
 }
 
 if (command === 'build') {
-  await write(await engine.build())
+  const result = await engine.build()
+  await writeCliIndex(engine, result.generation)
+  await write(result)
   await engine.dispose()
   process.exit(0)
 } else if (command === 'incremental') {

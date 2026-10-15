@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Queries the prebuilt symbol graph. No type checker at query time — dense symbol ids
 // index straight into CSR adjacency, so lookups are array reads.
-// Rebuild with `npm run graph index` after changing source.
+// Rebuild with `npm run index` after changing source.
 import fs from 'node:fs'
 import path from 'node:path'
 import { execFileSync } from 'node:child_process'

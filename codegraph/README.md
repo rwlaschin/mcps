@@ -22,14 +22,15 @@ proven package, import, and declared receiver bindings. A resident daemon update
 
 ## MCP Setup
 
-CodeGraph is not distributed through npm. Point your MCP client at `mcp.mjs` in your local clone:
+CodeGraph is not distributed through npm. Point your MCP client at `mcp.mjs` in your local clone,
+using the 8192 MB Node heap limit:
 
 ```json
 {
   "mcpServers": {
     "codegraph": {
       "command": "node",
-      "args": ["/absolute/path/to/mcps/codegraph/mcp.mjs"]
+      "args": ["--max-old-space-size=8192", "/absolute/path/to/mcps/codegraph/mcp.mjs"]
     }
   }
 }
@@ -222,12 +223,16 @@ Run `node visualizer.mjs --root /path/to/repo --port 7331`. Each view also serve
 
 ## Commands
 
+For large repositories, use the heap-configured commands below. The direct MCP invocation is
+equivalent to `npm run mcp`.
+
 | Script | Command | Purpose |
 | :--- | :--- | :--- |
 | `npm run visualize` | `node visualizer.mjs` | Start the visualizer on port 7331 |
 | `npm run dev` | `node --watch-path=... visualizer.mjs` | Start the visualizer with live reload |
-| `npm run index` | `node tool.mjs build` | Force a full repository index |
-| `npm run mcp` | `node mcp.mjs` | Start the MCP server over stdio |
+| `npm run index` | `node --max-old-space-size=8192 tool.mjs build` | Force a full repository index |
+| `npm run mcp` | `node --max-old-space-size=8192 mcp.mjs` | Start the MCP server over stdio |
+| Direct MCP | `node --max-old-space-size=8192 /absolute/path/to/mcps/codegraph/mcp.mjs` | Start the MCP server over stdio |
 | `npm test` | `node --test` | Run the unit and end-to-end tests |
 | `npm run performance -- --root /path/to/repository --symbol symbolName` | `node scripts/codegraph.performance.mjs` | Measure CodeGraph performance |
 

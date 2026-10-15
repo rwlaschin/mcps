@@ -66,7 +66,7 @@ function readinessError(root, cause, receipts = []) {
 }
 async function connectAfterStart(root, startDaemon, endpoint, deadline, startup) {
   const receipts = startup.receipts
-  try { return await connectSocket(endpoint) } catch (firstError) {
+  try { return { socket: await connectSocket(endpoint), reused: true } } catch (firstError) {
     if (!startDaemon) throw firstError
     const key = `${endpoint.host}:${endpoint.port}`
     if (!startupBySocket.has(key)) startupBySocket.set(key, Promise.resolve().then(startDaemon).catch(error => { throw readinessError(root, error) }))
@@ -74,7 +74,7 @@ async function connectAfterStart(root, startDaemon, endpoint, deadline, startup)
     const receipt = await startup.promise
     if (receipt && !receipts.includes(receipt)) receipts.push(receipt)
     while (Date.now() < deadline) {
-      try { return await connectSocket(endpoint) } catch {}
+      try { return { socket: await connectSocket(endpoint), reused: false } } catch {}
       if (receipts.some(launch => launch.error || launch.signal || launch.exitCode !== null)) {
         try { return await connectSocket(endpoint) } catch { throw firstError }
       }
@@ -267,8 +267,9 @@ export class QueryDaemonClient {
       try {
         while (true) {
           try {
-            const socket = await connectAfterStart(this.root, this.startDaemon, this.endpoint, deadline, startup)
-            this._attach(socket)
+            const connection = await connectAfterStart(this.root, this.startDaemon, this.endpoint, deadline, startup)
+            if (connection.reused) process.stderr.write(`CodeGraph: reusing existing daemon at ${this.endpoint.host}:${this.endpoint.port} for root ${this.root}\n`)
+            this._attach(connection.socket)
             let timer
             try {
               await Promise.race([

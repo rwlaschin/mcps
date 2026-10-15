@@ -47,8 +47,8 @@
   "scripts": {
     "install": "node native/build-optional.mjs",
     "build:native": "node-gyp rebuild",
-    "index": "node tool.mjs build",
-    "mcp": "node mcp.mjs",
+    "index": "node --max-old-space-size=8192 tool.mjs build",
+    "mcp": "node --max-old-space-size=8192 mcp.mjs",
     "watch": "node mcp.mjs",
     "visualize": "node visualizer.mjs",
     "visualize:watch": "node --watch-path=visualizer.mjs --watch-path=visualizer-graph.mjs --watch-path=indexer.mjs --watch-path=query-client.mjs --watch-path=tool.mjs visualizer.mjs",

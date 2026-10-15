@@ -41,9 +41,10 @@ let poolDebugSequence = 0
 const debugPool = (event, detail) => {
   if (DEBUG_POOL) process.stderr.write(`${JSON.stringify({ timestamp: new Date().toISOString(), epochMs: Date.now(), monotonicMs: performance.now(), pid: process.pid, threadId, side: 'main', event, ...detail })}\n`)
 }
-const createPartitionPool = () => {
-  const buffer = new SharedArrayBuffer(POOL_BYTES)
+const createPartitionPool = (buffer = null) => {
+  buffer ??= new SharedArrayBuffer(POOL_BYTES)
   const metadata = new Int32Array(buffer, 0, POOL_HEADER_BYTES / 4)
+  metadata.fill(0)
   const payload = new Uint8Array(buffer, POOL_HEADER_BYTES)
   return { buffer, metadata, payload, memoryBuffer: payload, insertionPointer: 0, oldestActivePartition: 0, debugId: DEBUG_POOL ? `${process.pid}:${Date.now()}:${++poolDebugSequence}` : null }
 }
@@ -182,6 +183,7 @@ export class CodeGraphEngine {
     this.activeValidation = null
     this.pendingValidation = null
     this.activePartitionPool = null
+    this.partitionPoolBuffer = null
   }
   build() { return this.#enqueueOperation(() => this.#build()) }
   incremental(events, prefetched = null) { return this.#enqueueOperation(() => this.#incremental(events, prefetched)) }
@@ -203,7 +205,8 @@ export class CodeGraphEngine {
     {
       const expectedFiles = [...sources.keys()].sort()
       const engineReceipts = new Map()
-      buildPool = createPartitionPool()
+      buildPool = createPartitionPool(this.partitionPoolBuffer)
+      this.partitionPoolBuffer = buildPool.buffer
       this.activePartitionPool = buildPool
       let persistenceMs = 0
       const onPartition = ({ partitions: completed, poolBatch }) => {
@@ -843,7 +846,8 @@ export class CodeGraphEngine {
         for (const [file, id] of Object.entries(base.partitions)) persistedPartitions[file] = this.store.readPartition(id)
         this.#cacheValidationPartitions(base, persistedPartitions)
       }
-      validationPool = createPartitionPool()
+      validationPool = createPartitionPool(this.partitionPoolBuffer)
+      this.partitionPoolBuffer = validationPool.buffer
       this.activePartitionPool = validationPool
       const payload = { revision: request.revision, root: this.root, cacheDir: path.relative(this.root, this.store.dir), baseGeneration: base.generation, changes, ...(!this.validationWorkerHydrated ? { changedFiles, baseAnalyzers: base.analyzers, baseSourceBlobs: this.validatedSourceBlobs, basePartitionIds: base.partitions, baseEdgePatches: base.edgePatches ?? [], baseInternalFingerprints: internalFingerprints(this.store, base), partitionDir: this.store.partitions } : {}), sourceDir: this.store.sources, partitionPool: validationPool.buffer, ...(validationPool.debugId ? { partitionPoolDebugId: validationPool.debugId } : {}) }
       this.validationPayloadObserver?.(payload)
