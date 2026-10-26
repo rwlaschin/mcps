@@ -100,6 +100,15 @@ test("E2E: visualizer server serves Layered Call Flow UI HTML and valid client s
   }, "Client JavaScript inside <script> must have valid syntax without errors")
 })
 
+test("E2E: layered edge markup exposes traceable endpoints and full node metadata", async () => {
+  const server = createVisualizerServer("/test/root")
+  const res = await simulateRequest(server, "/")
+  assert.match(res.body, /g\.dataset\.from = e\.from/)
+  assert.match(res.body, /g\.dataset\.to = e\.to/)
+  assert.match(res.body, /aria-label.*calls/)
+  assert.match(res.body, /tooltip\.textContent = n\.name \+ " \(" \+ n\.file/)
+})
+
 test("E2E: generated visualizer HTML defines the spin keyframes used by the loading spinner", async () => {
   const server = createVisualizerServer("/test/root")
   const res = await simulateRequest(server, "/")

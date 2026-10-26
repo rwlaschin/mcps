@@ -105,6 +105,22 @@ test('equivalence partition: sequential queries reuse one warm engine instance f
   assert.deepEqual({ engineCreations, first, second }, { engineCreations: 1, first: [{ name: 'first' }], second: [{ name: 'second' }] })
 })
 
+test('error guessing: a purged token directory is restored on the next connection so clients can authenticate', { timeout: 20000 }, async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-daemon-token-'))
+  temporaryRoots.add(root)
+  const transport = await reserveTransport(root)
+  const daemon = new QueryDaemon(root, { ...transport, engineFactory: () => ({ query: async function * () {}, dispose: async () => {} }) })
+  openDaemons.add(daemon)
+  await daemon.start()
+  fs.rmSync(path.dirname(transport.tokenPath), { recursive: true })
+
+  const socket = net.createConnection(transport.endpoint)
+  await once(socket, 'connect')
+  for (let tick = 0; tick < 100 && !fs.existsSync(transport.tokenPath); tick++) await new Promise((resolve) => setImmediate(resolve))
+  await authenticate(socket, root, transport.tokenPath)
+  socket.destroy()
+})
+
 test('error guessing: cancelling one request aborts that engine signal without cancelling a concurrent request', { timeout: 20000 }, async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-daemon-cancel-'))
   temporaryRoots.add(root)

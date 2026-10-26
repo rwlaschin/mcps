@@ -1809,6 +1809,10 @@ const page = `<!doctype html>
       const d = "M " + x1 + " " + y1 + " C " + x1 + " " + midY + ", " + x2 + " " + midY + ", " + x2 + " " + y2;
 
       const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
+      g.dataset.from = e.from;
+      g.dataset.to = e.to;
+      g.dataset.edgeId = e.id || "";
+      g.setAttribute("aria-label", (nodeMap.get(e.from)?.name || e.from) + " calls " + (nodeMap.get(e.to)?.name || e.to));
 
       const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
       path.setAttribute("d", d);
@@ -1828,6 +1832,12 @@ const page = `<!doctype html>
 
       path.onclick = clickHandler;
       hitbox.onclick = clickHandler;
+
+      const tooltip = document.createElementNS("http://www.w3.org/2000/svg", "title");
+      const source = nodeMap.get(e.from);
+      const target = nodeMap.get(e.to);
+      tooltip.textContent = (source?.name || e.from) + " → " + (target?.name || e.to) + (e.line ? " (line " + e.line + ")" : "");
+      g.appendChild(tooltip);
 
       g.appendChild(path);
       g.appendChild(hitbox);

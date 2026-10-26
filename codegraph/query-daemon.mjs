@@ -103,7 +103,7 @@ export class QueryDaemon {
       if (stat.isSymbolicLink() || !stat.isDirectory() || process.platform !== 'win32' && (stat.mode & 0o077 || process.getuid && stat.uid !== process.getuid())) throw new Error('insecure CodeGraph service token path')
       if (fs.lstatSync(this.tokenPath, { throwIfNoEntry: false })) tokenAt(this.tokenPath)
       this.token = crypto.randomBytes(32).toString('hex')
-      fs.writeFileSync(this.tokenPath, this.token, { mode: 0o600 })
+      this.#writeToken()
       if (this.options.engineFactory) this.engine = await this.options.engineFactory()
       else if (this.options.serviceFactory) this.engine = await this.options.serviceFactory(this.root)
       else {
@@ -113,8 +113,14 @@ export class QueryDaemon {
       this.markReady()
     } catch (error) { this.markReady(); await this.close(); throw error }
   }
+  #writeToken() {
+    fs.mkdirSync(path.dirname(this.tokenPath), { recursive: true, mode: 0o700 })
+    fs.writeFileSync(this.tokenPath, this.token, { mode: 0o600 })
+  }
   #accept(socket) {
     if (this.stopping) { socket.destroy(); return }
+    // $TMPDIR can be purged under a long-lived daemon; without the token file every client fails auth.
+    if (this.token && !fs.existsSync(this.tokenPath)) try { this.#writeToken() } catch {}
     this.sockets.add(socket); socket.setEncoding('utf8')
     const state = { authenticated: false, root: this.root, requests: new Map(), mcpRequests: new Map(), subscriptions: new Map(), roots: new Set() }
     socket.once('error', () => {})
